@@ -1,0 +1,83 @@
+### ⚠️ 语义变更(M5 起):read_file / list_dir / write_file 的 path 一律【相对本任务工作区】
+### 解析,并被遏制在工作区内(.. 上爬 / 绝对路径会被拒)。因此下面 M1/M2 那几个"读本仓库
+### 源码(src/main/java/...)"的老示例【已失效】——工作区是每任务独立的空目录,读不到仓库源码。
+### 留作历史参照;要看真·编码闭环跑 M5 那一段。
+
+### ===== M1 验收(历史,已失效见上):让 agent 自己 list_dir + read_file 完成任务 =====
+### (在 IntelliJ 里点这一段左边的绿色三角即可发送)
+
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "看看当前目录(.)下有哪些文件和文件夹,然后读一下 pom.xml,用一句话告诉我这是个什么项目。"
+}
+
+### 另一个例子:读源码并解释
+
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "读取 src/main/java/com/reagent/core/AgentRunner.java,简要说明它的核心逻辑。"
+}
+
+
+### ===== M2 验收 =====
+
+### 1) 提交一个多步任务(返回里会带 taskId,记下它)
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "逐个读取 src/main/java/com/reagent 下 core、persist、tool、llm 四个子包里的所有 .java 文件,然后总结这个 agent 运行时的完整架构。"
+}
+
+### 2) 查任务状态(把 {{taskId}} 换成上面返回的 id)
+GET http://localhost:8080/api/tasks/{{taskId}}
+
+### 3) 手动恢复一个 RUNNING 任务(平时由启动时自动恢复触发,这里方便手测)
+POST http://localhost:8080/api/tasks/{{taskId}}/resume
+
+### ===== 崩溃恢复演示(M2 重头戏)=====
+### 步骤:
+###   a. 发送上面【1】提交一个多步任务,看 IDE 控制台开始一步步跑(--- 第 N 步 ---)。
+###   b. 趁它没跑完,点 IDE 的红色 ■ Stop 按钮,强杀应用 = 模拟崩溃。
+###   c. 用【2】或数据库看:该任务 status 仍是 RUNNING,tool_call 表里部分已 DONE。
+###   d. 重新 Run ReAgentApplication。启动日志会打印
+###      "启动检查:发现 N 个未完成任务,后台恢复中......",并出现
+###      "幂等命中,跳过重复执行: xxx"(已做过的工具被跳过),最终任务变 COMPLETED。
+
+
+### ===== M3 验收:工具并发执行 =====
+
+### 1) 让模型同一轮发起两个 sleep(各 2 秒)——并发应 ≈2s,串行会 ≈4s。
+###    看控制台:"并发执行本轮 2 个工具调用",两条"工具返回: sleep_ms ..."几乎同时出现。
+###    想对照串行:把 application.yml 的 reagent.tool.concurrent 改成 false 再重发。
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "请同时调用两次 sleep_ms 工具,一次睡 2000 毫秒、一次睡 2000 毫秒,都完成后告诉我总共大概等了多久。"
+}
+
+### 2) 超时验证:让它睡得比 reagent.tool.timeout-ms(默认 30s)更久 —— 会被中断,
+###    模型收到"执行超时,已被中断"的结果。可临时把 timeout-ms 调小(如 1000)再睡 3000 更快看到。
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "调用 sleep_ms 睡 3000 毫秒,然后告诉我结果。"
+}
+
+
+### ===== M5 薄片:自包含编码闭环(write_file + run_command + per-task workspace)=====
+### agent 在自己的工作区里:写 Python 函数 -> 写测试 -> 在沙箱里跑测试 -> 失败就改,直到通过。
+### 全程不依赖外部仓库;所有文件读写都遏制在 /var/reagent/workspaces/<taskId> 内。
+### 跑完去 ls 那个目录能看到 solution.py / test_solution.py / __pycache__(= python 真在里头跑过)。
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "请在你的工作区里用测试驱动的方式实现一个 Python 函数,并确保自测通过。步骤:1) 用 write_file 创建 solution.py,实现函数 group_anagrams(words),把互为字母异位词的词分到同一组,返回分组列表(组内、组间顺序不限)。2) 用 write_file 创建 test_solution.py,从 solution 导入该函数,写至少 3 个 assert 用例(普通分组、空列表、含重复词;比较时忽略各组先后顺序)。3) 用 run_command 执行 `python3 test_solution.py` 跑测试。4) 若失败,读报错、改 solution.py 后重跑,直到全过。最后一句话告诉我:是否通过、迭代了几轮。"
+}

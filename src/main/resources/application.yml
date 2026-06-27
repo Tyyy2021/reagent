@@ -1,0 +1,76 @@
+server:
+  port: 8080
+
+spring:
+  # ====== M2:MySQL 数据库 ======
+  #   数据落 MySQL 的 reagent 库,进程重启不丢 -> 才能演示"断点续跑"
+  #   连接信息也可用环境变量覆盖,避免把密码写死进代码库
+  datasource:
+    url: jdbc:mysql://localhost:3306/reagent?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:root}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update      # 由实体自动建表/改表(学习期省事;以后上生产再换 Flyway 管理)
+    show-sql: false
+    open-in-view: false
+
+reagent:
+  # 崩溃恢复总开关:做无关开发、不想每次启动自动续跑(会调用 LLM 花钱)时可设 false
+  recovery:
+    enabled: true
+    # 单个任务最多自动恢复几次;超过则止损判 FAILED,避免"确定性崩溃"任务每次启动都重跑、反复烧 LLM
+    max-attempts: 3
+  # ====== M3:工具执行(并发 + 超时)======
+  tool:
+    # 同一轮多个 tool_call 是否并发执行(JDK21 虚拟线程);设 false 退回串行做对照
+    concurrent: true
+    # 单个工具执行的【外层兜底超时】(毫秒)。注意:这是 executor 层用 future 超时 + 中断的“软”机制。
+    # 对走沙箱的工具(run_command),真正的硬超时由 sandbox.timeout-ms 在 OS 层强杀负责;
+    # 这里【必须 > sandbox.timeout-ms】(留 grace),否则外层会先于沙箱触发、抢着 interrupt,反而杀不干净。
+    timeout-ms: 35000
+  # ====== M3:工具沙箱(run_command 在隔离环境里执行 + 硬杀 + 限额)======
+  sandbox:
+    # 用哪种沙箱:subprocess(默认,无需 Docker、当场可跑) / docker(隔离最强:cgroup+断网+独立 rootfs)
+    type: subprocess
+    # 【内层真超时】(毫秒):命令跑超过此值被 OS 级强杀(死循环也停得下来,区别于线程 interrupt)。
+    # 必须 < tool.timeout-ms(外层兜底),让沙箱先完成强杀、executor 兜底只在沙箱自己卡死时才兜。
+    timeout-ms: 30000
+    # 内存上限(MB):失控代码吃爆内存也拖不垮主服务
+    memory-mb: 256
+    # CPU 上限(核数,可小数,如 0.5)
+    cpus: 1.0
+    # 是否允许沙箱内命令联网(默认否,断网更安全)
+    network-enabled: false
+    # stdout/stderr 各自的截断上限(字节),防超大输出撑爆内存/上下文
+    max-output-bytes: 65536
+    # 每任务工作区的宿主根目录;每个 task 在其下有独立子目录(按 taskId),作 cwd/挂载点
+    # —— 把 rm -rf 的爆炸半径锁死在该任务副本里,放稳定目录(非 /tmp)以便崩溃续跑找回
+    workspace-root: /var/reagent/workspaces
+    docker:
+      # 跑命令所用镜像(需自带 sh;Coding Agent 跑 Python 用 python:3.x-slim)
+      image: python:3.12-slim
+  llm:
+    # ====== 当前启用:DeepSeek(国内,OpenAI 兼容,工具调用稳,便宜)======
+    #   1. 去 https://platform.deepseek.com 注册并实名
+    #   2. 左侧「API keys」-> 创建一个,复制(只显示一次!)
+    #   3. 充值几块钱(新户常有赠送额度,够测很久)
+    #   4. 把 key 填到下面 api-key,或设环境变量 DEEPSEEK_API_KEY
+    base-url: https://api.deepseek.com/v1
+    api-key: ${DEEPSEEK_API_KEY:在此粘贴你的DeepSeek-key}
+    model: deepseek-chat
+
+    # ====== 备选 A:通义千问(阿里 DashScope,新户有免费额度)======
+    #   base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    #   api-key: ${DASHSCOPE_API_KEY:你的key}
+    #   model: qwen-plus
+
+    # ====== 备选 B:本地 Ollama(免费离线,以后想用再切)======
+    #   base-url: http://localhost:11434/v1
+    #   api-key: ollama
+    #   model: qwen2.5
+
+logging:
+  level:
+    com.reagent: INFO
