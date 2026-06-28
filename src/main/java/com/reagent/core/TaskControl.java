@@ -53,6 +53,9 @@ public class TaskControl {
         if (h == null) return false;
         h.force = force;
         h.signal = Signal.CANCEL;
+        if (force) {
+            h.driver.interrupt();   // 3b 硬杀:打断驱动线程 -> 正在执行的沙箱据中断 kill -9 子进程组 / 杀容器
+        }
         return true;
     }
 

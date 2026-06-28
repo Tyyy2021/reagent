@@ -319,6 +319,12 @@ public class AgentRunner {
             results.putAll(executor.executeConcurrently(toRun, toolCtx));
         }
 
+        // 3b:执行期间收到 force-cancel(硬杀)?清中断位(免后续落库被打断),刚跑的工具按"被中途打断"处理
+        boolean forced = taskControl.signalOf(taskId) == TaskControl.Signal.CANCEL && taskControl.isForced(taskId);
+        if (forced) {
+            Thread.interrupted();
+        }
+
         // 3. 按【原始顺序】串行落库 + 写回上下文
         Set<String> ran = new HashSet<>();
         for (ToolCall c : toRun) {
@@ -326,11 +332,20 @@ public class AgentRunner {
         }
         for (ToolCall call : calls) {
             if (ran.contains(call.id())) {
-                String result = results.get(call.id());
-                stateStore.recordToolResult(taskId, call, result);   // 账本 DONE + tool 消息
-                ctx.addToolResult(call.id(), result);
-                bus.publish(taskId, TaskEvent.Type.TOOL_RESULT,
-                        Map.of("id", call.id(), "name", call.name(), "result", String.valueOf(result)));
+                if (forced && !canSafelyReplay(call)) {
+                    // 3b 硬杀:非幂等工具被 force-cancel 中途打断,不谎报 DONE——留在 markInProgress 的 IN_PROGRESS
+                    // (=in-doubt,等同"崩在执行中途");任务随后被标 CANCELLED,绝不重放副作用(复用 exactly-once)。
+                    log.warn("force-cancel 中途打断 SIDE_EFFECTFUL 工具,留 IN_PROGRESS(in-doubt)、不记 DONE: {}", call.name());
+                    bus.publish(taskId, TaskEvent.Type.TOOL_RESULT, Map.of(
+                            "id", call.id(), "name", call.name(),
+                            "result", "(被 force 取消中途打断,副作用是否生效未知=in-doubt)", "inDoubt", true));
+                } else {
+                    String result = results.get(call.id());
+                    stateStore.recordToolResult(taskId, call, result);   // 账本 DONE + tool 消息
+                    ctx.addToolResult(call.id(), result);
+                    bus.publish(taskId, TaskEvent.Type.TOOL_RESULT,
+                            Map.of("id", call.id(), "name", call.name(), "result", String.valueOf(result)));
+                }
             } else if (reconciled.containsKey(call.id())) {
                 String msg = reconciled.get(call.id());
                 stateStore.recordToolResult(taskId, call, msg);      // L3 对账:账本 DONE + tool 消息(不重放副作用)

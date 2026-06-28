@@ -111,8 +111,9 @@ public class ToolExecutor {
             // execute 内部已兜底,正常到不了这;纯防御
             return "工具 '" + call.name() + "' 执行异常:" + ee.getCause();
         } catch (InterruptedException ie) {
+            future.cancel(true);   // 3b 硬杀:取消该工具的虚拟线程 -> 沙箱据中断杀掉子进程/容器(并发路径)
             Thread.currentThread().interrupt();
-            return "工具 '" + call.name() + "' 被中断。";
+            return "工具 '" + call.name() + "' 被强制取消打断。";
         }
     }
 
