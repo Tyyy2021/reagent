@@ -6,6 +6,8 @@ import com.reagent.persist.TaskEntity;
 import com.reagent.persist.ToolCallStatus;
 import com.reagent.sandbox.RunJournal;
 import com.reagent.sandbox.WorkspaceManager;
+import com.reagent.stream.TaskEvent;
+import com.reagent.stream.TaskEventBus;
 import com.reagent.tool.IdempotencyClass;
 import com.reagent.tool.Tool;
 import com.reagent.tool.ToolContext;
@@ -59,10 +61,12 @@ public class AgentRunner {
     private final ShutdownState shutdownState;
     private final WorkspaceManager workspaceManager;
     private final InFlightTasks inFlight;
+    private final TaskEventBus bus;
 
     public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
-                       WorkspaceManager workspaceManager, InFlightTasks inFlight) {
+                       WorkspaceManager workspaceManager, InFlightTasks inFlight,
+                       TaskEventBus bus) {
         this.llm = llm;
         this.registry = registry;
         this.executor = executor;
@@ -70,14 +74,34 @@ public class AgentRunner {
         this.shutdownState = shutdownState;
         this.workspaceManager = workspaceManager;
         this.inFlight = inFlight;
+        this.bus = bus;
     }
 
-    /** 提交一个新任务:落库后从头跑。返回任务 id 与最终结果。 */
+    /** 提交一个新任务:落库后从头跑(同步,阻塞到跑完)。M4:仅 `POST /api/tasks?sync=true` 与单测走这条。 */
     public RunResult run(String goal) {
         log.info("====== 新任务:{} ======", goal);
         TaskEntity task = stateStore.createTask(goal, SYSTEM_PROMPT);
         String answer = drive(task);
         return new RunResult(task.getId(), answer);
+    }
+
+    /**
+     * M4:异步提交。落库后把驱动丢到一根虚拟线程上跑,立即返回 taskId;过程经 {@link TaskEventBus}
+     * 以 SSE 流式推给订阅者。任务<b>不绑 HTTP 连接</b>——客户端断开/重连都不影响它(本就持久可恢复)。
+     */
+    public String submit(String goal) {
+        log.info("====== 新任务(异步):{} ======", goal);
+        TaskEntity task = stateStore.createTask(goal, SYSTEM_PROMPT);
+        String taskId = task.getId();
+        Thread.ofVirtual().name("agent-" + taskId).start(() -> {
+            try {
+                drive(task);
+            } catch (RuntimeException ex) {
+                // drive 内部已分流(shutdown 保 RUNNING / 真错判 FAILED);此处兜底,防虚拟线程静默吞异常
+                log.error("异步任务 {} 驱动异常", taskId, ex);
+            }
+        });
+        return taskId;
     }
 
     /** 恢复一个半截任务:从库里重建上下文接着跑(崩溃恢复 / 手动续跑都走这里)。 */
@@ -113,7 +137,9 @@ public class AgentRunner {
         ToolContext toolCtx = new ToolContext(taskId, workspaceManager.workspaceFor(taskId));
 
         try {
+            bus.publish(taskId, TaskEvent.Type.TASK_STARTED, Map.of());
             for (int step = 1; step <= MAX_STEPS; step++) {
+                bus.publish(taskId, TaskEvent.Type.STEP, Map.of("step", step));
                 // 1. 崩溃残留 / 上一轮未完的工具调用,先补跑
                 List<ToolCall> pending = ctx.pendingToolCalls();
                 if (!pending.isEmpty()) {
@@ -131,6 +157,7 @@ public class AgentRunner {
                     stateStore.appendAssistant(taskId, decision.getAssistantMessage());
                     ctx.addAssistant(decision.getAssistantMessage());
                     stateStore.completeTask(taskId, decision.getAnswer());
+                    bus.publish(taskId, TaskEvent.Type.COMPLETED, Map.of("result", String.valueOf(decision.getAnswer())));
                     log.info("====== 任务完成 ======\n{}", decision.getAnswer());
                     return decision.getAnswer();
                 }
@@ -138,12 +165,17 @@ public class AgentRunner {
                 // 4. 大脑要调工具:先落库 assistant(顺带登记 PENDING 账本),再执行
                 stateStore.appendAssistant(taskId, decision.getAssistantMessage());
                 ctx.addAssistant(decision.getAssistantMessage());
+                for (ToolCall call : decision.getToolCalls()) {
+                    bus.publish(taskId, TaskEvent.Type.TOOL_CALL,
+                            Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                }
                 executeTools(toolCtx, ctx, decision.getToolCalls());
             }
 
             log.warn("达到最大步数 {},任务未在限定步数内完成。", MAX_STEPS);
             String msg = "达到最大步数(" + MAX_STEPS + "),任务未能完成。";
             stateStore.failTask(taskId, msg);
+            bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", msg));
             return msg;
 
         } catch (RuntimeException ex) {
@@ -158,6 +190,7 @@ public class AgentRunner {
             }
             log.error("任务 {} 执行异常,标记 FAILED", taskId, ex);
             stateStore.failTask(taskId, "执行异常: " + ex.getMessage());
+            bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", String.valueOf(ex.getMessage())));
             return "任务执行失败:" + ex.getMessage();
         }
     }
@@ -240,14 +273,20 @@ public class AgentRunner {
                 String result = results.get(call.id());
                 stateStore.recordToolResult(taskId, call, result);   // 账本 DONE + tool 消息
                 ctx.addToolResult(call.id(), result);
+                bus.publish(taskId, TaskEvent.Type.TOOL_RESULT,
+                        Map.of("id", call.id(), "name", call.name(), "result", String.valueOf(result)));
             } else if (reconciled.containsKey(call.id())) {
                 String msg = reconciled.get(call.id());
                 stateStore.recordToolResult(taskId, call, msg);      // L3 对账:账本 DONE + tool 消息(不重放副作用)
                 ctx.addToolResult(call.id(), msg);
+                bus.publish(taskId, TaskEvent.Type.TOOL_RESULT,
+                        Map.of("id", call.id(), "name", call.name(), "result", msg, "reconciled", true));
             } else if (inDoubt.containsKey(call.id())) {
                 String msg = inDoubt.get(call.id());
                 stateStore.markInDoubt(taskId, call, msg);            // 账本 IN_DOUBT + tool 消息
                 ctx.addToolResult(call.id(), msg);
+                bus.publish(taskId, TaskEvent.Type.TOOL_RESULT,
+                        Map.of("id", call.id(), "name", call.name(), "result", msg, "inDoubt", true));
             }
             // else: 终态,跳过(结果已在历史 / ctx)
         }
