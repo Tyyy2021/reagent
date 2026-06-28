@@ -24,7 +24,9 @@ public record TaskEvent(String taskId, long seq, Type type, Object data, Instant
         TOOL_CALL,      // 要调某工具
         TOOL_RESULT,    // 某工具返回
         COMPLETED,      // 任务完成(终态)
-        FAILED          // 任务失败(终态)
+        FAILED,         // 任务失败(终态)
+        CANCELLED,      // 用户取消(终态)
+        PAUSED          // 用户暂停(非任务终态,但本次 run 的事件流到此为止)
     }
 
     /** 便捷工厂:补上当前时刻。 */
@@ -32,8 +34,9 @@ public record TaskEvent(String taskId, long seq, Type type, Object data, Instant
         return new TaskEvent(taskId, seq, type, data, Instant.now());
     }
 
-    /** 终态事件:之后该任务不再有新事件,SSE 端可据此收尾。 */
+    /** 本次 run 的收尾事件:之后该 run 不再有新事件,SSE 端据此收尾。注意 PAUSED 非任务终态(可 resume),但对"本次 SSE 流"而言已结束。 */
     public boolean isTerminal() {
-        return type == Type.COMPLETED || type == Type.FAILED;
+        return type == Type.COMPLETED || type == Type.FAILED
+                || type == Type.CANCELLED || type == Type.PAUSED;
     }
 }

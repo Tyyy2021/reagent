@@ -1,6 +1,7 @@
 package com.reagent.api;
 
 import com.reagent.core.AgentRunner;
+import com.reagent.core.TaskControl;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
@@ -34,11 +35,13 @@ public class TaskController {
     private final AgentRunner runner;
     private final StateStore stateStore;
     private final TaskEventBus bus;
+    private final TaskControl taskControl;
 
-    public TaskController(AgentRunner runner, StateStore stateStore, TaskEventBus bus) {
+    public TaskController(AgentRunner runner, StateStore stateStore, TaskEventBus bus, TaskControl taskControl) {
         this.runner = runner;
         this.stateStore = stateStore;
         this.bus = bus;
+        this.taskControl = taskControl;
     }
 
     /**
@@ -117,11 +120,42 @@ public class TaskController {
                 "result", t.getResult() == null ? "" : t.getResult());
     }
 
-    /** 手动恢复一个 RUNNING 任务(平时由启动时崩溃恢复自动触发,这里方便手测) */
+    /** M4:取消任务。默认优雅(当前工具跑完后于安全点停);?force=true 硬杀(Stage3b)。 */
+    @PostMapping("/{id}/cancel")
+    public ResponseEntity<Map<String, String>> cancel(@PathVariable String id,
+                                                      @RequestParam(defaultValue = "false") boolean force) {
+        boolean ok = taskControl.requestCancel(id, force);
+        if (!ok) {
+            return ResponseEntity.status(409).body(Map.of(
+                    "taskId", id, "message", "任务不在运行中(可能已结束),无法取消"));
+        }
+        return ResponseEntity.accepted().body(Map.of("taskId", id,
+                "message", force ? "已请求取消(force 硬杀)" : "已请求取消(优雅:当前工具跑完后停)"));
+    }
+
+    /** M4:暂停任务(优雅,留下可 resume 的干净状态)。 */
+    @PostMapping("/{id}/pause")
+    public ResponseEntity<Map<String, String>> pause(@PathVariable String id) {
+        boolean ok = taskControl.requestPause(id);
+        if (!ok) {
+            return ResponseEntity.status(409).body(Map.of(
+                    "taskId", id, "message", "任务不在运行中,无法暂停"));
+        }
+        return ResponseEntity.accepted().body(Map.of("taskId", id,
+                "message", "已请求暂停(当前工具跑完后停)"));
+    }
+
+    /** 续跑一个 PAUSED 任务(异步,过程经 /stream 跟)。RUNNING 也放行(InFlightTasks 挡双驱动);终态拒绝。 */
     @PostMapping("/{id}/resume")
-    public Map<String, String> resume(@PathVariable String id) {
-        String result = runner.resume(id);
-        return Map.of("taskId", id, "result", result);
+    public ResponseEntity<Map<String, String>> resume(@PathVariable String id) {
+        TaskEntity t = stateStore.getTask(id);
+        if (t.getStatus() != TaskStatus.PAUSED && t.getStatus() != TaskStatus.RUNNING) {
+            return ResponseEntity.status(409).body(Map.of("taskId", id,
+                    "status", t.getStatus().name(), "message", "仅 PAUSED 任务可续跑"));
+        }
+        runner.resumeAsync(id);
+        return ResponseEntity.accepted().body(Map.of("taskId", id,
+                "status", "RUNNING", "message", "已异步续跑,可用 /stream 跟进"));
     }
 
     /** 给 SSE 推一条"当前最终态"快照并收尾(用于已终态任务 / 竞态补播)。 */

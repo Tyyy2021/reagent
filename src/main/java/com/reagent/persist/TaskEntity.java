@@ -26,7 +26,11 @@ public class TaskEntity {
     @Column(length = 1_000_000)
     private String goal;
 
+    // 显式 length=32 让 Hibernate 生成 varchar(32) 而非 MySQL 原生 enum——否则 EnumType.STRING 在 MySQL 上
+    // 会建成 enum('RUNNING','COMPLETED','FAILED'),后加 CANCELLED/PAUSED 写入即报 "Data truncated",
+    // 且 ddl-auto=update 不改已存在列(与 tool_call.status 同源的坑)。运行库已 ALTER ... MODIFY status VARCHAR(32)。
     @Enumerated(EnumType.STRING)
+    @Column(length = 32)
     private TaskStatus status;
 
     /** 最终回答;失败时存错误信息 */
@@ -65,6 +69,25 @@ public class TaskEntity {
     public void fail(String error) {
         this.status = TaskStatus.FAILED;
         this.result = error;
+        this.updatedAt = Instant.now();
+    }
+
+    /** M4:用户取消(终态)。 */
+    public void cancel(String note) {
+        this.status = TaskStatus.CANCELLED;
+        this.result = note;
+        this.updatedAt = Instant.now();
+    }
+
+    /** M4:用户暂停(非终态;result 不动,留待 resume 后真正完成时再写)。 */
+    public void pause() {
+        this.status = TaskStatus.PAUSED;
+        this.updatedAt = Instant.now();
+    }
+
+    /** M4:PAUSED -> RUNNING(resume 续跑前调用)。 */
+    public void markRunning() {
+        this.status = TaskStatus.RUNNING;
         this.updatedAt = Instant.now();
     }
 

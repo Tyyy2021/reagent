@@ -3,6 +3,7 @@ package com.reagent.core;
 import com.reagent.llm.LlmClient;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
+import com.reagent.persist.TaskStatus;
 import com.reagent.persist.ToolCallStatus;
 import com.reagent.sandbox.RunJournal;
 import com.reagent.sandbox.WorkspaceManager;
@@ -62,11 +63,12 @@ public class AgentRunner {
     private final WorkspaceManager workspaceManager;
     private final InFlightTasks inFlight;
     private final TaskEventBus bus;
+    private final TaskControl taskControl;
 
     public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
                        WorkspaceManager workspaceManager, InFlightTasks inFlight,
-                       TaskEventBus bus) {
+                       TaskEventBus bus, TaskControl taskControl) {
         this.llm = llm;
         this.registry = registry;
         this.executor = executor;
@@ -75,6 +77,7 @@ public class AgentRunner {
         this.workspaceManager = workspaceManager;
         this.inFlight = inFlight;
         this.bus = bus;
+        this.taskControl = taskControl;
     }
 
     /** 提交一个新任务:落库后从头跑(同步,阻塞到跑完)。M4:仅 `POST /api/tasks?sync=true` 与单测走这条。 */
@@ -107,7 +110,22 @@ public class AgentRunner {
     /** 恢复一个半截任务:从库里重建上下文接着跑(崩溃恢复 / 手动续跑都走这里)。 */
     public String resume(String taskId) {
         log.info("====== 恢复任务:{} ======", taskId);
-        return drive(stateStore.getTask(taskId));
+        TaskEntity task = stateStore.getTask(taskId);
+        if (task.getStatus() == TaskStatus.PAUSED) {
+            stateStore.markRunning(taskId);   // 暂停的任务:先 PAUSED -> RUNNING 再续跑
+        }
+        return drive(task);
+    }
+
+    /** M4:异步恢复(给 resume 端点用)——在虚拟线程上续跑、立即返回,过程经 SSE 流式推。 */
+    public void resumeAsync(String taskId) {
+        Thread.ofVirtual().name("agent-resume-" + taskId).start(() -> {
+            try {
+                resume(taskId);
+            } catch (RuntimeException ex) {
+                log.error("异步恢复任务 {} 异常", taskId, ex);
+            }
+        });
     }
 
     /**
@@ -123,9 +141,11 @@ public class AgentRunner {
             log.warn("任务 {} 已在本进程内执行中,跳过本次重复驱动。", taskId);
             return "任务已在执行中,本次重复驱动已跳过。";
         }
+        taskControl.begin(taskId);   // 登记驱动线程 + 打断信号槽(M4 Stage3)
         try {
             return driveLoop(taskId);
         } finally {
+            taskControl.end(taskId);
             inFlight.end(taskId);
         }
     }
@@ -139,6 +159,10 @@ public class AgentRunner {
         try {
             bus.publish(taskId, TaskEvent.Type.TASK_STARTED, Map.of());
             for (int step = 1; step <= MAX_STEPS; step++) {
+                // 安全点①(步与步之间):被取消/暂停则在此干净停止,不打断任何 in-flight 工具
+                String interrupted = checkInterrupt(taskId);
+                if (interrupted != null) return interrupted;
+
                 bus.publish(taskId, TaskEvent.Type.STEP, Map.of("step", step));
                 // 1. 崩溃残留 / 上一轮未完的工具调用,先补跑
                 List<ToolCall> pending = ctx.pendingToolCalls();
@@ -151,6 +175,10 @@ public class AgentRunner {
                 // 2. 问大脑:下一步干什么
                 log.info("--- 第 {} 步:询问模型 ---", step);
                 Decision decision = llm.chat(ctx, registry.toOpenAiSpec());
+
+                // 安全点②(LLM 调用可能耗时,期间若被取消/暂停,在启动工具【之前】停)
+                interrupted = checkInterrupt(taskId);
+                if (interrupted != null) return interrupted;
 
                 // 3. 大脑认为任务完成了
                 if (decision.isFinal()) {
@@ -193,6 +221,34 @@ public class AgentRunner {
             bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", String.valueOf(ex.getMessage())));
             return "任务执行失败:" + ex.getMessage();
         }
+    }
+
+    /**
+     * 安全点检查打断信号(M4 Stage3a):
+     *  - CANCEL -> 落库 CANCELLED + publish,返回收尾消息;
+     *  - PAUSE  -> 落库 PAUSED + publish,返回收尾消息(留下可 resume 的干净状态);
+     *  - NONE   -> 返回 null(继续跑)。
+     *
+     * <p>只在"无 in-flight 工具"的安全点被调用(循环顶 / LLM 调用后),故优雅 drain 自然成立:
+     * 取消/暂停若在工具执行期间到达,当前批次先跑完,下一轮循环顶才在此停。</p>
+     */
+    private String checkInterrupt(String taskId) {
+        TaskControl.Signal sig = taskControl.signalOf(taskId);
+        if (sig == TaskControl.Signal.CANCEL) {
+            String msg = "任务已被用户取消。";
+            stateStore.cancelTask(taskId, msg);
+            bus.publish(taskId, TaskEvent.Type.CANCELLED, Map.of("status", "CANCELLED"));
+            log.info("任务 {} 在安全点被取消,停止。", taskId);
+            return msg;
+        }
+        if (sig == TaskControl.Signal.PAUSE) {
+            String msg = "任务已暂停,可通过 resume 续跑。";
+            stateStore.pauseTask(taskId);
+            bus.publish(taskId, TaskEvent.Type.PAUSED, Map.of("status", "PAUSED"));
+            log.info("任务 {} 在安全点被暂停。", taskId);
+            return msg;
+        }
+        return null;
     }
 
     /**

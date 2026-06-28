@@ -75,6 +75,30 @@ public class StateStore {
         taskRepo.save(t);
     }
 
+    /** M4:用户取消(终态)。 */
+    @Transactional
+    public void cancelTask(String taskId, String note) {
+        TaskEntity t = getTask(taskId);
+        t.cancel(note);
+        taskRepo.save(t);
+    }
+
+    /** M4:用户暂停(非终态,仅显式 resume 续跑)。 */
+    @Transactional
+    public void pauseTask(String taskId) {
+        TaskEntity t = getTask(taskId);
+        t.pause();
+        taskRepo.save(t);
+    }
+
+    /** M4:PAUSED -> RUNNING(resume 续跑前)。 */
+    @Transactional
+    public void markRunning(String taskId) {
+        TaskEntity t = getTask(taskId);
+        t.markRunning();
+        taskRepo.save(t);
+    }
+
     /** 崩溃恢复:把该任务的恢复计数 +1 并持久化,返回新的计数值(这是第几次恢复)。 */
     @Transactional
     public int incrementRecoveryCount(String taskId) {
