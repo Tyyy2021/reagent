@@ -174,7 +174,8 @@ public class AgentRunner {
 
                 // 2. 问大脑:下一步干什么
                 log.info("--- 第 {} 步:询问模型 ---", step);
-                Decision decision = llm.chat(ctx, registry.toOpenAiSpec());
+                Decision decision = llm.chatStream(ctx, registry.toOpenAiSpec(),
+                        token -> bus.publish(taskId, TaskEvent.Type.TOKEN, Map.of("text", token)));
 
                 // 安全点②(LLM 调用可能耗时,期间若被取消/暂停,在启动工具【之前】停)
                 interrupted = checkInterrupt(taskId);

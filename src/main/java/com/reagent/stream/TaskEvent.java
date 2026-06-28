@@ -20,7 +20,8 @@ public record TaskEvent(String taskId, long seq, Type type, Object data, Instant
     public enum Type {
         TASK_STARTED,   // 任务开跑
         STEP,           // 进入第 N 步
-        ASSISTANT,      // 模型一条 assistant 决策(Stage2 起其文本会先以 TOKEN 增量流出)
+        ASSISTANT,      // 模型一条 assistant 决策(其文本以 TOKEN 增量先行流出)
+        TOKEN,          // 模型回答的一个文本增量(Stage2 token 级流式)
         TOOL_CALL,      // 要调某工具
         TOOL_RESULT,    // 某工具返回
         COMPLETED,      // 任务完成(终态)
