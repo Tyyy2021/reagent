@@ -81,3 +81,40 @@ Content-Type: application/json
 {
   "goal": "请在你的工作区里用测试驱动的方式实现一个 Python 函数,并确保自测通过。步骤:1) 用 write_file 创建 solution.py,实现函数 group_anagrams(words),把互为字母异位词的词分到同一组,返回分组列表(组内、组间顺序不限)。2) 用 write_file 创建 test_solution.py,从 solution 导入该函数,写至少 3 个 assert 用例(普通分组、空列表、含重复词;比较时忽略各组先后顺序)。3) 用 run_command 执行 `python3 test_solution.py` 跑测试。4) 若失败,读报错、改 solution.py 后重跑,直到全过。最后一句话告诉我:是否通过、迭代了几轮。"
 }
+
+
+### ===== M4 验收:SSE 流式 + 打断 + 可恢复(断线重连续播)=====
+### 说明:这些是 SSE 长连接 / 异步端点,建议配合 curl 看效果(IntelliJ HTTP Client 也支持 SSE)。
+
+### 1) 异步提交:立即返回 {taskId,status:RUNNING}(不再阻塞到跑完)。记下 taskId。
+POST http://localhost:8080/api/tasks
+Content-Type: application/json
+
+{
+  "goal": "请在工作区里用 TDD 实现 Python 函数 group_anagrams(words):用 write_file 写 solution.py 和 test_solution.py,再用 run_command 跑 python3 test_solution.py 直到通过,最后给出简短结论。"
+}
+
+### 2) 订阅事件流(SSE):实时看 STEP / TOKEN(逐字)/ TOOL_CALL / TOOL_RESULT / COMPLETED。
+###    持久事件带 id:(= event 表行 id);TOKEN 不带 id(高频易逝、live-only)。
+###    任务与连接解耦:Ctrl-C 断开本连接,任务在虚拟线程上照跑(连接死 ≠ 任务死)。
+GET http://localhost:8080/api/tasks/{{taskId}}/stream
+Accept: text/event-stream
+
+### 3) 断线重连续播(Stage4):带 Last-Event-ID(填上一步看到的最后一个 id:N),
+###    服务从 event 表精确补播 id>N 的事件、再无缝转 live —— 不漏不重、追平 COMPLETED。
+###    对照:不带 Last-Event-ID(或填 0)= 从头补播该任务全部历史事件。
+GET http://localhost:8080/api/tasks/{{taskId}}/stream
+Accept: text/event-stream
+Last-Event-ID: 5
+
+### 4) 优雅取消:当前工具跑完后在安全点停(账本不留 IN_DOUBT,任务 -> CANCELLED)。
+POST http://localhost:8080/api/tasks/{{taskId}}/cancel
+
+### 4') 硬杀:?force=true 立刻中断在途工具;非幂等副作用 -> IN_PROGRESS(in-doubt),绝不重放(复用 exactly-once)。
+POST http://localhost:8080/api/tasks/{{taskId}}/cancel?force=true
+
+### 5) 暂停 / 续跑:pause 留下可 resume 的干净状态;resume 异步续跑,过程经 /stream 跟。
+POST http://localhost:8080/api/tasks/{{taskId}}/pause
+
+###
+POST http://localhost:8080/api/tasks/{{taskId}}/resume

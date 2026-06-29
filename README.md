@@ -22,7 +22,8 @@ ReAgent 把 Agent 的每一步都**事件溯源式落库**,进程崩溃/重启�
 | **M3 工具执行层** | 虚拟线程并发 + 每工具超时 + **子进程 / Docker 双沙箱**(OS 级硬杀、cgroup 限额、断网) | ✅ |
 | **M5 编码闭环** | per-task workspace + 文件工具遏制,自包含 TDD 闭环(写码 → 跑测试 → 读真实报错 → 改) | ✅ |
 | **exactly-once 副作用** | 账本状态机 + fail-closed 幂等分级 + sandbox journal 对账(L1–L3) | ✅ |
-| M4 / M6 / M7 | SSE 流式 + 打断 · OpenTelemetry 全链路 trace · 多 worker 分布式调度 | 规划中 |
+| **M4 流式 + 打断 + 可恢复 SSE** | 事件级 / token 级 SSE 流式;协作式取消(优雅 drain + 硬杀)+ 暂停 / 续跑;事件溯源 `event` 表 + `Last-Event-ID` 断线重连续播 | ✅ |
+| M6 / M7 | OpenTelemetry 全链路 trace · 多 worker 分布式调度 | 规划中 |
 
 ## 核心设计(难点密度)
 
@@ -45,6 +46,11 @@ ReAgent 把 Agent 的每一步都**事件溯源式落库**,进程崩溃/重启�
 
 ### 4. 工具并发
 同一轮模型要求的多个工具调用在虚拟线程上**并发执行 + 各自超时**;落库与上下文写回仍串行按原序——`message.seq` 与 `Context` 非线程安全,串行落库很轻,既拿并发收益又天然避开账本/seq 的并发写竞争。
+
+### 5. 流式执行 · 可打断 · 可恢复 SSE
+任务在虚拟线程上运行、**与 SSE 连接解耦**:客户端断线 / 重连任务都不中断(本就持久可恢复)。事件经进程内 `TaskEventBus` 发布订阅,`GET /{id}/stream` 以 SSE 推送;模型回答**逐 token 流式**(`chatStream` 解析 DeepSeek SSE delta,跨帧分片的 tool_call arguments 按 `index` 拼装)。
+- **打断 = 协作式受控崩溃**:取消(优雅 drain 默认 + `?force` 硬杀升级)/ 暂停 / 续跑在安全点检查;硬杀中途的工具副作用**直接复用 exactly-once 的 in-doubt / journal 对账**,白捡"不重放"的正确性。
+- **可恢复 SSE**:非 TOKEN 事件事件溯源式落 `event` 表(自增 id = durable 游标);重连带 `Last-Event-ID` 从断点**精确补播**再无缝转 live——补播与 live 经同一 sink、完全同构,由**每任务锁**保证不漏不重。`message` 表喂模型、`event` 表喂客户端 = **CQRS 读写分离**。
 
 ## 架构
 
@@ -85,12 +91,14 @@ com.reagent
 │   ├── Context / Decision / ToolCall
 │   ├── CrashRecovery            启动扫 RUNNING,虚拟线程自动续跑
 │   ├── ShutdownState            区分优雅关闭 vs 真失败
-│   └── InFlightTasks            单机护栏:同一任务不并发驱动
+│   ├── InFlightTasks            单机护栏:同一任务不并发驱动
+│   └── TaskControl              打断信号:取消(优雅 / 硬杀)/ 暂停 / 续跑
 ├── persist/                     ★ 持久化 + 状态机
 │   ├── StateStore               每步落库 + 重建上下文 + 幂等账本
 │   ├── TaskEntity/Status/Repository
 │   ├── MessageEntity/Repository
-│   └── ToolCallEntity/Status/Repository   (PENDING/IN_PROGRESS/DONE/IN_DOUBT)
+│   ├── ToolCallEntity/Status/Repository   (PENDING/IN_PROGRESS/DONE/IN_DOUBT)
+│   └── EventEntity/Repository             事件流投影(Stage4 可恢复 SSE 的 durable 游标)
 ├── sandbox/                     ★ 工具沙箱
 │   ├── Sandbox / SandboxSpec / SandboxResult / SandboxType / SandboxProperties
 │   ├── SubprocessSandbox        setsid 进程组硬杀 + ulimit
@@ -102,9 +110,14 @@ com.reagent
 │   ├── Tool / ToolRegistry / ToolExecutor / ToolContext / ToolProperties
 │   ├── IdempotencyClass         READ_ONLY / IDEMPOTENT / SIDE_EFFECTFUL
 │   └── impl/                    read_file / list_dir / write_file / run_command / sleep_ms
+├── stream/                      ★ SSE 流式 + 可恢复(M4)
+│   ├── TaskEvent                事件信封(eventId = durable 游标;TOKEN 无 id)
+│   ├── TaskEventBus             进程内发布订阅 + 每任务锁补播(replay / live 不漏不重)
+│   └── EventStore / JpaEventStore   事件溯源:event 表读写,replay 与 live 同构
 └── llm/                         模型接入
-    ├── LlmClient                接口(屏蔽厂商差异)
+    ├── LlmClient                接口(chat / chatStream,屏蔽厂商差异)
     ├── OpenAiCompatibleClient   OpenAI 协议实现(通吃 DeepSeek / Ollama / 中转)
+    ├── StreamingDecisionAssembler  流式 delta 拼回 Decision(分片 tool_call 按 index 续拼)
     └── LlmProperties
 ```
 
@@ -134,11 +147,12 @@ mvn spring-boot:run
 - **自包含编码闭环(M5 杀手 demo)**:提交一个 TDD 任务,Agent 在自己的 workspace 里 `write_file` 写函数 + 写测试 → `run_command` 跑 `python3` 测试 → 失败就读真实报错改对,直到通过。
 - **崩溃恢复**:提交多步任务 → 趁它在跑强杀进程 → 重启,启动日志打印「发现 N 个未完成任务,后台恢复中」并自动续跑到完成。
 - **工具并发**:同一轮两个 `sleep_ms` 各 2s,并发 ≈2s(对照串行 ≈4s)。
+- **流式 + 打断 + 重连**:`POST /api/tasks` 立返 taskId;`GET /{id}/stream` 看实时 token / 事件流;`POST /{id}/cancel`(`?force` 硬杀)/ `pause` / `resume`;断开后带 `Last-Event-ID` 重连,精确补播断点之后的事件。
 
 ## 验证
 
-39 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写)+ **崩溃注入 e2e**:伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑。
+48 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写 / 流式 delta 拼装 / **事件总线补播不漏不重并发压测**)+ 两条 e2e:① **崩溃注入**——伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑;② **断线重连续播**——首连收若干事件后断开,带 `Last-Event-ID` 重连,精确补播断点之后的每个事件、不漏不重、追平 `COMPLETED`。
 
 ## 路线图
 
-M4 SSE 流式 + 中途打断 · M6 OpenTelemetry 全链路 trace(Jaeger 可视化)· M7 多 worker + 租约/心跳/故障转移的分布式可恢复。
+M6 OpenTelemetry 全链路 trace(Jaeger 可视化)· M7 多 worker + 租约/心跳/故障转移的分布式可恢复。

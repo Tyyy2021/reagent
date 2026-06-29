@@ -5,6 +5,7 @@ import com.reagent.core.TaskControl;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
+import com.reagent.stream.TaskEvent;
 import com.reagent.stream.TaskEventBus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -62,49 +64,43 @@ public class TaskController {
     }
 
     /**
-     * 订阅某任务的实时事件流(SSE)。已终态的任务直接补播最终态并收尾(实时流不会再来)。
-     * SseEmitter 超时(1h)只是断开"视图",任务在虚拟线程上照跑——这正是执行/连接解耦。
+     * 订阅某任务的事件流(SSE),支持<b>断点续播</b>(M4 Stage4)。
+     *
+     * <p>可带 {@code Last-Event-ID} 头(浏览器 EventSource 重连自动带、curl 用 {@code -H} 指定):服务端先从
+     * {@code event} 表补播 id 大于该游标的历史事件、再无缝转 live —— 补播与 live 经【同一个 sink】发出、
+     * 完全同构,且由 {@link TaskEventBus} 的每任务锁保证二者不漏不重(见该类说明)。缺省 / 脏值游标 = 0 = 从头补播。</p>
+     *
+     * <p>已终态任务:补播里就含终态事件,sink 发完即收尾——不再需要单发合成快照。SseEmitter 超时(1h)只断开
+     * "视图",任务在虚拟线程上照跑,这正是执行 / 连接解耦。</p>
      */
     @GetMapping(value = "/{id}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@PathVariable String id) {
-        TaskEntity task = stateStore.getTask(id);          // 找不到 -> IllegalArgumentException
+    public SseEmitter stream(@PathVariable String id,
+                             @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
+        stateStore.getTask(id);                          // 不存在 -> IllegalArgumentException(避免给瞎 id 建流)
+        long cursor = parseCursor(lastEventId);
         SseEmitter emitter = new SseEmitter(3_600_000L);
+        AtomicBoolean done = new AtomicBoolean(false);   // 防终态事件重复收尾
 
-        // 已终态:从 DB 补播一条最终事件后收尾,不订阅
-        if (task.getStatus() != TaskStatus.RUNNING) {
-            sendSnapshotAndComplete(emitter, task);
+        // 单一 sink:补播(从 event 表重建的历史事件)与 live(实时事件)走完全相同的发送路径
+        TaskEventBus.EventSink sink = event -> sendEvent(emitter, event, done);
+
+        // HELLO:立即冲响应头让客户端确认连上;不带 id,不影响 Last-Event-ID 游标
+        try {
+            emitter.send(SseEmitter.event().name("HELLO")
+                    .data(Map.of("taskId", id, "fromEventId", cursor), MediaType.APPLICATION_JSON));
+        } catch (IOException | IllegalStateException e) {
+            emitter.completeWithError(e);
             return emitter;
         }
 
-        // RUNNING:订阅实时事件;done 防"终态事件 + 竞态补播"重复收尾
-        AtomicBoolean done = new AtomicBoolean(false);
-        TaskEventBus.Subscription sub = bus.subscribe(id, event -> {
-            try {
-                emitter.send(SseEmitter.event()
-                        .id(String.valueOf(event.seq()))
-                        .name(event.type().name())
-                        .data(event.data(), MediaType.APPLICATION_JSON));
-                if (event.isTerminal() && done.compareAndSet(false, true)) {
-                    emitter.complete();
-                }
-            } catch (IOException | IllegalStateException e) {
-                emitter.completeWithError(e);               // 客户端断开 -> onError -> 退订
-            }
-        });
-        emitter.onCompletion(sub::close);
-        emitter.onTimeout(() -> { sub.close(); emitter.complete(); });
-        emitter.onError(e -> sub.close());
-
-        // 发 hello;再 double-check:若刚好在"查状态→订阅"窗口里完成了,补播终态收尾(防漏最后事件)
-        try {
-            emitter.send(SseEmitter.event().name("HELLO")
-                    .data(Map.of("taskId", id, "status", "RUNNING"), MediaType.APPLICATION_JSON));
-            TaskEntity again = stateStore.getTask(id);
-            if (again.getStatus() != TaskStatus.RUNNING && done.compareAndSet(false, true)) {
-                sendSnapshotAndComplete(emitter, again);
-            }
-        } catch (IOException | IllegalStateException e) {
-            emitter.completeWithError(e);
+        // 原子地:补播 id>cursor 的历史 -> 挂 live sink(期间 publish 被同一把每任务锁挡住 = 不漏不重)
+        TaskEventBus.Subscription sub = bus.subscribeWithReplay(id, cursor, sink);
+        if (done.get()) {
+            sub.close();   // 补播里已含终态、emitter 已收尾:立即退订,不留悬挂订阅
+        } else {
+            emitter.onCompletion(sub::close);
+            emitter.onTimeout(() -> { sub.close(); emitter.complete(); });
+            emitter.onError(e -> sub.close());
         }
         return emitter;
     }
@@ -158,17 +154,38 @@ public class TaskController {
                 "status", "RUNNING", "message", "已异步续跑,可用 /stream 跟进"));
     }
 
-    /** 给 SSE 推一条"当前最终态"快照并收尾(用于已终态任务 / 竞态补播)。 */
-    private void sendSnapshotAndComplete(SseEmitter emitter, TaskEntity t) {
+    /**
+     * 把一个事件发到 SSE 连接。成功返回 {@code true};客户端断开 / IO 异常返回 {@code false}
+     * (供 {@link TaskEventBus} 摘除该失效订阅 / 停止补播)。补播与 live 共用本方法 = 同构。
+     */
+    private boolean sendEvent(SseEmitter emitter, TaskEvent event, AtomicBoolean done) {
         try {
-            emitter.send(SseEmitter.event()
-                    .name(t.getStatus().name())
-                    .data(Map.of("status", t.getStatus().name(),
-                                 "result", t.getResult() == null ? "" : t.getResult()),
-                          MediaType.APPLICATION_JSON));
-            emitter.complete();
+            SseEmitter.SseEventBuilder b = SseEmitter.event()
+                    .name(event.type().name())
+                    .data(event.data(), MediaType.APPLICATION_JSON);
+            if (event.eventId() != null) {
+                b.id(String.valueOf(event.eventId()));   // 持久事件带 durable 行 id(客户端据此续播);TOKEN 无 id
+            }
+            emitter.send(b);
+            if (event.isTerminal() && done.compareAndSet(false, true)) {
+                emitter.complete();
+            }
+            return true;
         } catch (IOException | IllegalStateException e) {
-            emitter.completeWithError(e);
+            emitter.completeWithError(e);                 // 客户端断开 -> onError/onCompletion -> 退订
+            return false;
+        }
+    }
+
+    /** 解析 Last-Event-ID 头为游标;缺省 / 空 / 脏值都退回 0(= 从头补播)。 */
+    private static long parseCursor(String lastEventId) {
+        if (lastEventId == null || lastEventId.isBlank()) {
+            return 0L;
+        }
+        try {
+            return Long.parseLong(lastEventId.trim());
+        } catch (NumberFormatException e) {
+            return 0L;
         }
     }
 
