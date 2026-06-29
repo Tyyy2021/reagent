@@ -21,6 +21,19 @@
         <java.version>21</java.version>
     </properties>
 
+    <dependencyManagement>
+        <dependencies>
+            <!-- M6:OpenTelemetry,用官方 BOM 统一版本(覆盖 spring-boot 默认带的 OTel 版本,避免混用串版) -->
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-bom</artifactId>
+                <version>1.43.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!-- Web + REST + 内置 Jackson(JSON 处理) -->
         <dependency>
@@ -55,10 +68,25 @@
             <artifactId>docker-java-transport-httpclient5</artifactId>
             <version>3.3.6</version>
         </dependency>
+        <!-- M6:OpenTelemetry 全链路 trace —— 手动 SDK + OTLP 导出(到 Jaeger),版本由上面 BOM 统一管理 -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+        </dependency>
         <!-- M3:单元测试(JUnit5),验证沙箱“硬杀/截断”等行为,不依赖 LLM、免费可重复 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- M6:OTel 测试 —— InMemorySpanExporter 验证 span 树 / 跨虚拟线程传播,不依赖 Jaeger -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>

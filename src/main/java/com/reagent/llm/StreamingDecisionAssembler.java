@@ -30,6 +30,8 @@ public class StreamingDecisionAssembler {
     private final Consumer<String> onToken;
     private final StringBuilder content = new StringBuilder();
     private final TreeMap<Integer, ToolCallAcc> toolCalls = new TreeMap<>();  // index -> 累积中(TreeMap 保序)
+    private long promptTokens = -1;       // M6:usage(stream_options.include_usage=true 时末尾 chunk 带);-1=未拿到
+    private long completionTokens = -1;
 
     public StreamingDecisionAssembler(Consumer<String> onToken) {
         this.onToken = onToken == null ? t -> { } : onToken;
@@ -72,6 +74,34 @@ public class StreamingDecisionAssembler {
                 }
             }
         }
+    }
+
+    /**
+     * 吃 chunk 顶层的 {@code usage}(M6):开启 {@code stream_options.include_usage} 后,流末尾会多一个
+     * {@code choices:[]} 但带 usage 的 chunk。对端不支持时本方法收不到、保持 -1,只是缺这条属性、不报错。
+     */
+    public void acceptUsage(JsonNode usage) {
+        if (usage == null || !usage.isObject() || usage.isEmpty()) {
+            return;
+        }
+        JsonNode in = usage.get("prompt_tokens");
+        JsonNode out = usage.get("completion_tokens");
+        if (in != null && in.isNumber()) {
+            promptTokens = in.asLong();
+        }
+        if (out != null && out.isNumber()) {
+            completionTokens = out.asLong();
+        }
+    }
+
+    /** 输入(prompt)token 数;-1 = 本次未取到。 */
+    public long getPromptTokens() {
+        return promptTokens;
+    }
+
+    /** 输出(completion)token 数;-1 = 本次未取到。 */
+    public long getCompletionTokens() {
+        return completionTokens;
     }
 
     /** 收尾:有 tool_calls -> Decision.tools;否则 -> Decision.finalAnswer。 */

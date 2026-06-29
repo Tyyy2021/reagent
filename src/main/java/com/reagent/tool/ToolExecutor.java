@@ -3,6 +3,12 @@ package com.reagent.tool;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.ToolCall;
+import com.reagent.obs.Trace;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -34,31 +40,48 @@ public class ToolExecutor {
     private final ToolRegistry registry;
     private final ObjectMapper mapper;
     private final ToolProperties props;
+    private final Tracer tracer;
 
-    public ToolExecutor(ToolRegistry registry, ObjectMapper mapper, ToolProperties props) {
+    public ToolExecutor(ToolRegistry registry, ObjectMapper mapper, ToolProperties props, Tracer tracer) {
         this.registry = registry;
         this.mapper = mapper;
         this.props = props;
+        this.tracer = tracer;
     }
 
     /** 执行单个工具调用。任何异常都兜底成可读字符串,绝不抛出。 */
     public String execute(ToolCall call, ToolContext ctx) {
         Tool tool = registry.get(call.name());
-        if (tool == null) {
-            return "错误:不存在名为 '" + call.name() + "' 的工具。";
+        // M6:工具 span(parent = 当前 agent.step;并发路径下由 executeConcurrently 跨虚拟线程把 context 传好)
+        Span span = tracer.spanBuilder("execute_tool " + call.name())
+                .setAttribute(Trace.TOOL_NAME, call.name())
+                .setAttribute(Trace.TOOL_CALL_ID, call.id())
+                .startSpan();
+        if (tool != null) {
+            span.setAttribute(Trace.IDEMPOTENCY, tool.idempotency().name());
         }
-        try {
-            // 模型传来的参数是字符串形式的 JSON,先解析成节点
-            String rawArgs = (call.arguments() == null || call.arguments().isBlank())
-                    ? "{}" : call.arguments();
-            JsonNode args = mapper.readTree(rawArgs);
-            // 绑定本次调用的 idempotencyKey(=tool_call_id),供 run_command 等把 key 下推给副作用做幂等
-            String result = tool.execute(args, ctx.forCall(call.id()));
-            log.info("工具返回: {} -> {}", call.name(), preview(result));
-            return result;
-        } catch (Exception e) {
-            log.warn("工具 '{}' 执行失败: {}", call.name(), e.toString());
-            return "工具 '" + call.name() + "' 执行失败:" + e.getMessage();
+        try (Scope ignored = span.makeCurrent()) {
+            if (tool == null) {
+                span.setStatus(StatusCode.ERROR, "unknown tool");
+                return "错误:不存在名为 '" + call.name() + "' 的工具。";
+            }
+            try {
+                // 模型传来的参数是字符串形式的 JSON,先解析成节点
+                String rawArgs = (call.arguments() == null || call.arguments().isBlank())
+                        ? "{}" : call.arguments();
+                JsonNode args = mapper.readTree(rawArgs);
+                // 绑定本次调用的 idempotencyKey(=tool_call_id),供 run_command 等把 key 下推给副作用做幂等
+                String result = tool.execute(args, ctx.forCall(call.id()));
+                log.info("工具返回: {} -> {}", call.name(), preview(result));
+                return result;
+            } catch (Exception e) {
+                span.recordException(e);
+                span.setStatus(StatusCode.ERROR);
+                log.warn("工具 '{}' 执行失败: {}", call.name(), e.toString());
+                return "工具 '" + call.name() + "' 执行失败:" + e.getMessage();
+            }
+        } finally {
+            span.end();
         }
     }
 
@@ -79,16 +102,24 @@ public class ToolExecutor {
 
         if (calls.size() <= 1 || !props.isConcurrent()) {
             for (ToolCall c : calls) {
-                results.put(c.id(), execute(c, ctx));
+                results.put(c.id(), execute(c, ctx));   // 串行:同线程,execute_tool span 自动挂当前 step span
             }
             return results;
         }
 
+        // M6:OTel context 是 ThreadLocal,跨不过下面 pool.submit 的虚拟线程边界 —— 提交【前】捕获当前 context
+        // (此刻 = step span),在每个工具线程里 makeCurrent 恢复,execute 开的 execute_tool span 才会正确挂到
+        // step span 下。这与当初 ToolContext 选「显式捕获传参而非 ThreadLocal」是同一问题、同一解法。
+        Context otelContext = Context.current();
         // JDK21:每任务一根虚拟线程;try-with-resources 关闭时等所有任务结束
         try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
             Map<ToolCall, Future<String>> futures = new LinkedHashMap<>();
             for (ToolCall c : calls) {
-                futures.put(c, pool.submit(() -> execute(c, ctx)));
+                futures.put(c, pool.submit(() -> {
+                    try (Scope ignored = otelContext.makeCurrent()) {
+                        return execute(c, ctx);
+                    }
+                }));
             }
             for (Map.Entry<ToolCall, Future<String>> e : futures.entrySet()) {
                 ToolCall c = e.getKey();

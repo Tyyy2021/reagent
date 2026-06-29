@@ -122,4 +122,38 @@ class StreamingDecisionAssemblerTest {
         assertEquals("{}", d.getToolCalls().get(0).arguments());   // 兜底成 {} 而非空串
         assertNull(d.getAnswer());                                  // tools 决策无 answer
     }
+
+    // ====== M6:token usage(stream_options.include_usage=true 时,流末尾会多一个 choices 为空、带 usage 的 chunk)======
+
+    private JsonNode usageNode(int prompt, int completion) {
+        ObjectNode u = mapper.createObjectNode();
+        u.put("prompt_tokens", prompt);
+        u.put("completion_tokens", completion);
+        u.put("total_tokens", prompt + completion);
+        return u;
+    }
+
+    @Test
+    void acceptUsage_解析token数_供span上报() {
+        StreamingDecisionAssembler asm = new StreamingDecisionAssembler(null);
+        asm.acceptDelta(contentDelta("hi"));
+        asm.acceptUsage(usageNode(120, 8));   // 模拟流末尾的 usage chunk
+
+        Decision d = asm.build();
+        assertTrue(d.isFinal());
+        assertEquals(120L, asm.getPromptTokens());
+        assertEquals(8L, asm.getCompletionTokens());
+    }
+
+    @Test
+    void 没有usage时token返回负一_优雅降级不报错() {
+        StreamingDecisionAssembler asm = new StreamingDecisionAssembler(null);
+        asm.acceptDelta(contentDelta("hi"));
+        asm.acceptUsage(mapper.createObjectNode());   // 空 usage(对端没开 include_usage)
+        asm.acceptUsage(null);                          // 防御:null 也不炸
+
+        asm.build();
+        assertEquals(-1L, asm.getPromptTokens());
+        assertEquals(-1L, asm.getCompletionTokens());
+    }
 }

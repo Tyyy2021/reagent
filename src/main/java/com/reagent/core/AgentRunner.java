@@ -1,6 +1,7 @@
 package com.reagent.core;
 
 import com.reagent.llm.LlmClient;
+import com.reagent.obs.Trace;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
@@ -14,6 +15,11 @@ import com.reagent.tool.Tool;
 import com.reagent.tool.ToolContext;
 import com.reagent.tool.ToolExecutor;
 import com.reagent.tool.ToolRegistry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -64,11 +70,12 @@ public class AgentRunner {
     private final InFlightTasks inFlight;
     private final TaskEventBus bus;
     private final TaskControl taskControl;
+    private final Tracer tracer;
 
     public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
                        WorkspaceManager workspaceManager, InFlightTasks inFlight,
-                       TaskEventBus bus, TaskControl taskControl) {
+                       TaskEventBus bus, TaskControl taskControl, Tracer tracer) {
         this.llm = llm;
         this.registry = registry;
         this.executor = executor;
@@ -78,6 +85,7 @@ public class AgentRunner {
         this.inFlight = inFlight;
         this.bus = bus;
         this.taskControl = taskControl;
+        this.tracer = tracer;
     }
 
     /** 提交一个新任务:落库后从头跑(同步,阻塞到跑完)。M4:仅 `POST /api/tasks?sync=true` 与单测走这条。 */
@@ -142,9 +150,28 @@ public class AgentRunner {
             return "任务已在执行中,本次重复驱动已跳过。";
         }
         taskControl.begin(taskId);   // 登记驱动线程 + 打断信号槽(M4 Stage3)
-        try {
+        // M6:任务 root span —— 用 taskId 派生 traceId,新任务与每次恢复都落在【同一条 trace】下(跨崩溃可视);
+        // root 不继承 HTTP 请求的 trace(任务与连接解耦、活得比连接长),与 M4 解耦一脉相承。
+        Span taskSpan = tracer.spanBuilder("agent.task")
+                .setParent(Trace.logicalRootContext(taskId))
+                .setSpanKind(SpanKind.INTERNAL)
+                .setAttribute(Trace.TASK_ID, taskId)
+                .setAttribute(Trace.GOAL, preview(task.getGoal()))
+                .setAttribute(Trace.RECOVERY_COUNT, (long) task.getRecoveryCount())
+                .startSpan();
+        try (Scope ignored = taskSpan.makeCurrent()) {
             return driveLoop(taskId);
+        } catch (RuntimeException ex) {
+            taskSpan.recordException(ex);
+            taskSpan.setStatus(StatusCode.ERROR);
+            throw ex;
         } finally {
+            try {
+                taskSpan.setAttribute(Trace.TASK_STATUS, stateStore.getTask(taskId).getStatus().name());
+            } catch (RuntimeException ignore) {
+                // 读终态失败不影响收尾
+            }
+            taskSpan.end();
             taskControl.end(taskId);
             inFlight.end(taskId);
         }
@@ -159,46 +186,55 @@ public class AgentRunner {
         try {
             bus.publish(taskId, TaskEvent.Type.TASK_STARTED, Map.of());
             for (int step = 1; step <= MAX_STEPS; step++) {
-                // 安全点①(步与步之间):被取消/暂停则在此干净停止,不打断任何 in-flight 工具
-                String interrupted = checkInterrupt(taskId);
-                if (interrupted != null) return interrupted;
+                // M6:每步一个 span(parent = 当前 agent.task span);span scope 内开的 llm/tool span 自动挂其下
+                Span stepSpan = tracer.spanBuilder("agent.step")
+                        .setAttribute(Trace.STEP_NUMBER, (long) step)
+                        .startSpan();
+                try (Scope ignored = stepSpan.makeCurrent()) {
+                    // 安全点①(步与步之间):被取消/暂停则在此干净停止,不打断任何 in-flight 工具
+                    String interrupted = checkInterrupt(taskId);
+                    if (interrupted != null) return interrupted;
 
-                bus.publish(taskId, TaskEvent.Type.STEP, Map.of("step", step));
-                // 1. 崩溃残留 / 上一轮未完的工具调用,先补跑
-                List<ToolCall> pending = ctx.pendingToolCalls();
-                if (!pending.isEmpty()) {
-                    log.info("--- 第 {} 步:补跑 {} 个未完成的工具调用 ---", step, pending.size());
-                    executeTools(toolCtx, ctx, pending);
-                    continue;
-                }
+                    bus.publish(taskId, TaskEvent.Type.STEP, Map.of("step", step));
+                    // 1. 崩溃残留 / 上一轮未完的工具调用,先补跑
+                    List<ToolCall> pending = ctx.pendingToolCalls();
+                    if (!pending.isEmpty()) {
+                        stepSpan.setAttribute(Trace.STEP_PENDING, true);
+                        log.info("--- 第 {} 步:补跑 {} 个未完成的工具调用 ---", step, pending.size());
+                        executeTools(toolCtx, ctx, pending);
+                        continue;
+                    }
 
-                // 2. 问大脑:下一步干什么
-                log.info("--- 第 {} 步:询问模型 ---", step);
-                Decision decision = llm.chatStream(ctx, registry.toOpenAiSpec(),
-                        token -> bus.publish(taskId, TaskEvent.Type.TOKEN, Map.of("text", token)));
+                    // 2. 问大脑:下一步干什么
+                    log.info("--- 第 {} 步:询问模型 ---", step);
+                    Decision decision = llm.chatStream(ctx, registry.toOpenAiSpec(),
+                            token -> bus.publish(taskId, TaskEvent.Type.TOKEN, Map.of("text", token)));
 
-                // 安全点②(LLM 调用可能耗时,期间若被取消/暂停,在启动工具【之前】停)
-                interrupted = checkInterrupt(taskId);
-                if (interrupted != null) return interrupted;
+                    // 安全点②(LLM 调用可能耗时,期间若被取消/暂停,在启动工具【之前】停)
+                    interrupted = checkInterrupt(taskId);
+                    if (interrupted != null) return interrupted;
 
-                // 3. 大脑认为任务完成了
-                if (decision.isFinal()) {
+                    // 3. 大脑认为任务完成了
+                    if (decision.isFinal()) {
+                        stateStore.appendAssistant(taskId, decision.getAssistantMessage());
+                        ctx.addAssistant(decision.getAssistantMessage());
+                        stateStore.completeTask(taskId, decision.getAnswer());
+                        bus.publish(taskId, TaskEvent.Type.COMPLETED, Map.of("result", String.valueOf(decision.getAnswer())));
+                        log.info("====== 任务完成 ======\n{}", decision.getAnswer());
+                        return decision.getAnswer();
+                    }
+
+                    // 4. 大脑要调工具:先落库 assistant(顺带登记 PENDING 账本),再执行
                     stateStore.appendAssistant(taskId, decision.getAssistantMessage());
                     ctx.addAssistant(decision.getAssistantMessage());
-                    stateStore.completeTask(taskId, decision.getAnswer());
-                    bus.publish(taskId, TaskEvent.Type.COMPLETED, Map.of("result", String.valueOf(decision.getAnswer())));
-                    log.info("====== 任务完成 ======\n{}", decision.getAnswer());
-                    return decision.getAnswer();
+                    for (ToolCall call : decision.getToolCalls()) {
+                        bus.publish(taskId, TaskEvent.Type.TOOL_CALL,
+                                Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                    }
+                    executeTools(toolCtx, ctx, decision.getToolCalls());
+                } finally {
+                    stepSpan.end();
                 }
-
-                // 4. 大脑要调工具:先落库 assistant(顺带登记 PENDING 账本),再执行
-                stateStore.appendAssistant(taskId, decision.getAssistantMessage());
-                ctx.addAssistant(decision.getAssistantMessage());
-                for (ToolCall call : decision.getToolCalls()) {
-                    bus.publish(taskId, TaskEvent.Type.TOOL_CALL,
-                            Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
-                }
-                executeTools(toolCtx, ctx, decision.getToolCalls());
             }
 
             log.warn("达到最大步数 {},任务未在限定步数内完成。", MAX_STEPS);
@@ -385,6 +421,14 @@ public class AgentRunner {
     private static String inDoubtMessage(ToolCall call) {
         return "⚠️ 工具 " + call.name() + " 在上次执行中已开始、但进程崩溃前未确认完成,其副作用是否已生效【未知】。"
                 + "为避免重复副作用,系统未自动重试。如有需要,请先用只读方式核对当前状态,再决定是否重新执行。";
+    }
+
+    /** goal 等放进 span 属性前截断,避免超大属性。 */
+    private static String preview(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.length() > 200 ? s.substring(0, 200) + "…" : s;
     }
 
     /** 提交任务的返回:任务 id(可据此查状态 / 手动恢复)+ 最终结果 */

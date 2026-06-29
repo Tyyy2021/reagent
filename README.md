@@ -23,7 +23,8 @@ ReAgent 把 Agent 的每一步都**事件溯源式落库**,进程崩溃/重启�
 | **M5 编码闭环** | per-task workspace + 文件工具遏制,自包含 TDD 闭环(写码 → 跑测试 → 读真实报错 → 改) | ✅ |
 | **exactly-once 副作用** | 账本状态机 + fail-closed 幂等分级 + sandbox journal 对账(L1–L3) | ✅ |
 | **M4 流式 + 打断 + 可恢复 SSE** | 事件级 / token 级 SSE 流式;协作式取消(优雅 drain + 硬杀)+ 暂停 / 续跑;事件溯源 `event` 表 + `Last-Event-ID` 断线重连续播 | ✅ |
-| M6 / M7 | OpenTelemetry 全链路 trace · 多 worker 分布式调度 | 规划中 |
+| **M6 可观测** | OpenTelemetry 全链路 trace(task → step → chat / tool → sandbox),OTLP → Jaeger;跨虚拟线程传 OTel context、taskId 派生 traceId(一个任务一条 trace、跨重启) | ✅ |
+| M7 | 多 worker + 租约 / 心跳 / 故障转移的分布式可恢复 | 规划中 |
 
 ## 核心设计(难点密度)
 
@@ -51,6 +52,11 @@ ReAgent 把 Agent 的每一步都**事件溯源式落库**,进程崩溃/重启�
 任务在虚拟线程上运行、**与 SSE 连接解耦**:客户端断线 / 重连任务都不中断(本就持久可恢复)。事件经进程内 `TaskEventBus` 发布订阅,`GET /{id}/stream` 以 SSE 推送;模型回答**逐 token 流式**(`chatStream` 解析 DeepSeek SSE delta,跨帧分片的 tool_call arguments 按 `index` 拼装)。
 - **打断 = 协作式受控崩溃**:取消(优雅 drain 默认 + `?force` 硬杀升级)/ 暂停 / 续跑在安全点检查;硬杀中途的工具副作用**直接复用 exactly-once 的 in-doubt / journal 对账**,白捡"不重放"的正确性。
 - **可恢复 SSE**:非 TOKEN 事件事件溯源式落 `event` 表(自增 id = durable 游标);重连带 `Last-Event-ID` 从断点**精确补播**再无缝转 live——补播与 live 经同一 sink、完全同构,由**每任务锁**保证不漏不重。`message` 表喂模型、`event` 表喂客户端 = **CQRS 读写分离**。
+
+### 6. 全链路 trace(可观测)
+手动装配 OpenTelemetry SDK(非 starter,只要业务 span),`task → step → {chat | execute_tool → sandbox.run}` 一棵 span 树经 OTLP 导出 Jaeger;命名 / 属性对齐 OTel **GenAI 语义约定**(`chat {model}`、`gen_ai.usage.*` token、`execute_tool {name}`)。两个真正的难点:
+- **跨虚拟线程传 context**:OTel `Context` 是 ThreadLocal,跨不过并发工具的 `pool.submit`——提交前捕获、子线程里 `makeCurrent` 恢复,`execute_tool` span 才挂得回 step span(与显式 `ToolContext` 传任务身份同一问题、同一解)。
+- **跨崩溃恢复关联**:**taskId(UUID)派生 traceId**(去横杠 = 32 hex),新任务与每次恢复都以同一"逻辑根"为 parent → **一个可恢复任务无论重启多少次都是同一条 trace**,Jaeger 里直接看断点续跑(对标 Temporal)。零持久化、零特例分支。
 
 ## 架构
 
@@ -114,11 +120,14 @@ com.reagent
 │   ├── TaskEvent                事件信封(eventId = durable 游标;TOKEN 无 id)
 │   ├── TaskEventBus             进程内发布订阅 + 每任务锁补播(replay / live 不漏不重)
 │   └── EventStore / JpaEventStore   事件溯源:event 表读写,replay 与 live 同构
-└── llm/                         模型接入
-    ├── LlmClient                接口(chat / chatStream,屏蔽厂商差异)
-    ├── OpenAiCompatibleClient   OpenAI 协议实现(通吃 DeepSeek / Ollama / 中转)
-    ├── StreamingDecisionAssembler  流式 delta 拼回 Decision(分片 tool_call 按 index 续拼)
-    └── LlmProperties
+├── llm/                         模型接入
+│   ├── LlmClient                接口(chat / chatStream,屏蔽厂商差异)
+│   ├── OpenAiCompatibleClient   OpenAI 协议实现(通吃 DeepSeek / Ollama / 中转)
+│   ├── StreamingDecisionAssembler  流式 delta 拼回 Decision(分片 tool_call 按 index 续拼)
+│   └── LlmProperties
+└── obs/                         ★ 可观测(M6)
+    ├── OpenTelemetryConfig      手动装配 SDK(TracerProvider + OTLP→Jaeger;noop 开关)
+    └── Trace                    taskId 派生 traceId + 逻辑根 Context + 属性 key 常量
 ```
 
 ## 怎么跑
@@ -151,8 +160,8 @@ mvn spring-boot:run
 
 ## 验证
 
-48 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写 / 流式 delta 拼装 / **事件总线补播不漏不重并发压测**)+ 两条 e2e:① **崩溃注入**——伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑;② **断线重连续播**——首连收若干事件后断开,带 `Last-Event-ID` 重连,精确补播断点之后的每个事件、不漏不重、追平 `COMPLETED`。
+54 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写 / 流式 delta 拼装 + token usage / **事件总线补播不漏不重并发压测** / **跨虚拟线程 trace context 传播** / taskId 派生 traceId)+ 两条 e2e:① **崩溃注入**——伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑;② **断线重连续播**——首连收若干事件后断开,带 `Last-Event-ID` 重连,精确补播断点之后的每个事件、不漏不重、追平 `COMPLETED`。
 
 ## 路线图
 
-M6 OpenTelemetry 全链路 trace(Jaeger 可视化)· M7 多 worker + 租约/心跳/故障转移的分布式可恢复。
+M7 多 worker + 租约 / 心跳 / 故障转移的分布式可恢复(`W3CTraceContextPropagator` 已为跨 worker 传 trace 留缝)。

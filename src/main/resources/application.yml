@@ -17,6 +17,12 @@ spring:
     open-in-view: false
 
 reagent:
+  # ====== M6:可观测(OpenTelemetry 全链路 trace -> OTLP -> Jaeger)======
+  tracing:
+    # 关掉(false)则用 no-op:不连 Jaeger 也能跑、开发无关功能时省心
+    enabled: true
+    otlp-endpoint: http://localhost:4318/v1/traces   # Jaeger all-in-one 默认收 OTLP/HTTP 在 4318
+    service-name: reagent
   # 崩溃恢复总开关:做无关开发、不想每次启动自动续跑(会调用 LLM 花钱)时可设 false
   recovery:
     enabled: true
