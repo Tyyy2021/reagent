@@ -15,6 +15,12 @@ spring:
       ddl-auto: update      # 由实体自动建表/改表(学习期省事;以后上生产再换 Flyway 管理)
     show-sql: false
     open-in-view: false
+  # ====== M7 Stage5:Redis(仅 reagent.streaming.transport=redis 时才连;in-process 模式不碰)======
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
 
 reagent:
   # ====== M7:分布式 worker 身份 + 租约 ======
@@ -32,6 +38,13 @@ reagent:
     scan-ms: 10000
     # M7 Stage2:每轮扫描最多接管多少个,防一个 worker 一次抢太多(其余留给下一轮 / 别的 worker)。
     scan-batch: 50
+  # ====== M7 Stage5:事件流传输层 ======
+  streaming:
+    # in-process(默认):进程内总线 + event 表补播,单 worker / demo 零中间件、不依赖 Redis。
+    # redis:Redis Streams 当跨机 live 总线 —— 多 worker 下客户端连任意 worker 都能看任意任务的实时流(含 token)。
+    transport: ${REAGENT_STREAMING_TRANSPORT:in-process}
+    # redis 模式下每个 task 的 Stream key 前缀;任务终态后给 key 设此 TTL(秒)自动清理,内存不涨。
+    redis-stream-ttl-sec: 3600
   # ====== M6:可观测(OpenTelemetry 全链路 trace -> OTLP -> Jaeger)======
   tracing:
     # 关掉(false)则用 no-op:不连 Jaeger 也能跑、开发无关功能时省心

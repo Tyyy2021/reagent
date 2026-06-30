@@ -6,7 +6,7 @@ import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
 import com.reagent.stream.TaskEvent;
-import com.reagent.stream.TaskEventBus;
+import com.reagent.stream.StreamTransport;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -36,10 +36,10 @@ public class TaskController {
 
     private final AgentRunner runner;
     private final StateStore stateStore;
-    private final TaskEventBus bus;
+    private final StreamTransport bus;
     private final TaskControl taskControl;
 
-    public TaskController(AgentRunner runner, StateStore stateStore, TaskEventBus bus, TaskControl taskControl) {
+    public TaskController(AgentRunner runner, StateStore stateStore, StreamTransport bus, TaskControl taskControl) {
         this.runner = runner;
         this.stateStore = stateStore;
         this.bus = bus;
@@ -68,7 +68,7 @@ public class TaskController {
      *
      * <p>可带 {@code Last-Event-ID} 头(浏览器 EventSource 重连自动带、curl 用 {@code -H} 指定):服务端先从
      * {@code event} 表补播 id 大于该游标的历史事件、再无缝转 live —— 补播与 live 经【同一个 sink】发出、
-     * 完全同构,且由 {@link TaskEventBus} 的每任务锁保证二者不漏不重(见该类说明)。缺省 / 脏值游标 = 0 = 从头补播。</p>
+     * 完全同构、不漏不重(in-process 由每任务锁、redis 由 XREAD-from-cursor 保证,见各 {@link StreamTransport} 实现)。缺省 / 脏值游标 = 从头补播。</p>
      *
      * <p>已终态任务:补播里就含终态事件,sink 发完即收尾——不再需要单发合成快照。SseEmitter 超时(1h)只断开
      * "视图",任务在虚拟线程上照跑,这正是执行 / 连接解耦。</p>
@@ -77,12 +77,13 @@ public class TaskController {
     public SseEmitter stream(@PathVariable String id,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
         stateStore.getTask(id);                          // 不存在 -> IllegalArgumentException(避免给瞎 id 建流)
-        long cursor = parseCursor(lastEventId);
+        // opaque 游标:规整成非 null 串传给 transport 自解释(in-process=event 表 id,redis=stream id);缺省/空=从头
+        String cursor = (lastEventId == null || lastEventId.isBlank()) ? "0" : lastEventId.trim();
         SseEmitter emitter = new SseEmitter(3_600_000L);
         AtomicBoolean done = new AtomicBoolean(false);   // 防终态事件重复收尾
 
         // 单一 sink:补播(从 event 表重建的历史事件)与 live(实时事件)走完全相同的发送路径
-        TaskEventBus.EventSink sink = event -> sendEvent(emitter, event, done);
+        StreamTransport.EventSink sink = event -> sendEvent(emitter, event, done);
 
         // HELLO:立即冲响应头让客户端确认连上;不带 id,不影响 Last-Event-ID 游标
         try {
@@ -94,7 +95,7 @@ public class TaskController {
         }
 
         // 原子地:补播 id>cursor 的历史 -> 挂 live sink(期间 publish 被同一把每任务锁挡住 = 不漏不重)
-        TaskEventBus.Subscription sub = bus.subscribeWithReplay(id, cursor, sink);
+        StreamTransport.Subscription sub = bus.subscribeWithReplay(id, cursor, sink);
         if (done.get()) {
             sub.close();   // 补播里已含终态、emitter 已收尾:立即退订,不留悬挂订阅
         } else {
@@ -174,7 +175,7 @@ public class TaskController {
                     .name(event.type().name())
                     .data(event.data(), MediaType.APPLICATION_JSON);
             if (event.eventId() != null) {
-                b.id(String.valueOf(event.eventId()));   // 持久事件带 durable 行 id(客户端据此续播);TOKEN 无 id
+                b.id(event.eventId());   // 持久事件带 durable 游标(客户端据此续播);TOKEN 无 id
             }
             emitter.send(b);
             if (event.isTerminal() && done.compareAndSet(false, true)) {
@@ -184,18 +185,6 @@ public class TaskController {
         } catch (IOException | IllegalStateException e) {
             emitter.completeWithError(e);                 // 客户端断开 -> onError/onCompletion -> 退订
             return false;
-        }
-    }
-
-    /** 解析 Last-Event-ID 头为游标;缺省 / 空 / 脏值都退回 0(= 从头补播)。 */
-    private static long parseCursor(String lastEventId) {
-        if (lastEventId == null || lastEventId.isBlank()) {
-            return 0L;
-        }
-        try {
-            return Long.parseLong(lastEventId.trim());
-        } catch (NumberFormatException e) {
-            return 0L;
         }
     }
 

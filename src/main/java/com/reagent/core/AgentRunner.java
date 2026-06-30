@@ -9,7 +9,7 @@ import com.reagent.persist.ToolCallStatus;
 import com.reagent.sandbox.RunJournal;
 import com.reagent.sandbox.WorkspaceManager;
 import com.reagent.stream.TaskEvent;
-import com.reagent.stream.TaskEventBus;
+import com.reagent.stream.StreamTransport;
 import com.reagent.tool.IdempotencyClass;
 import com.reagent.tool.Tool;
 import com.reagent.tool.ToolContext;
@@ -69,7 +69,7 @@ public class AgentRunner {
     private final ShutdownState shutdownState;
     private final WorkspaceManager workspaceManager;
     private final InFlightTasks inFlight;
-    private final TaskEventBus bus;
+    private final StreamTransport bus;
     private final TaskControl taskControl;
     private final Tracer tracer;
     private final WorkerIdentity workerIdentity;   // M7:本 worker 身份(span 属性 / 日志)
@@ -78,7 +78,7 @@ public class AgentRunner {
     public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
                        WorkspaceManager workspaceManager, InFlightTasks inFlight,
-                       TaskEventBus bus, TaskControl taskControl, Tracer tracer,
+                       StreamTransport bus, TaskControl taskControl, Tracer tracer,
                        WorkerIdentity workerIdentity,
                        @Value("${reagent.recovery.max-attempts:3}") int maxAttempts) {
         this.llm = llm;

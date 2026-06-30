@@ -13,10 +13,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
- * {@link TaskEventBus} 续播逻辑单测(M4 Stage4)。注入内存假 {@link EventStore},脱离 DB 验证总线的
- * "先补播 id&gt;游标 的历史、再无缝转 live"以及最值钱的【不漏不重】并发不变量。
+ * {@link TaskEventBus}(in-process {@link StreamTransport})续播逻辑单测(M4 Stage4)。注入内存假 {@link EventStore},
+ * 脱离 DB 验证总线的"先补播 id&gt;游标 的历史、再无缝转 live"以及最值钱的【不漏不重】并发不变量。
  *
- * <p>DB 层(event 表读写)的正确性由 e2e 兜底,与本项目既有风格一致(持久层不写 DB 单测)。</p>
+ * <p>DB 层(event 表)与 Redis 层({@link RedisStreamTransport})的正确性由 e2e 兜底,与本项目既有风格一致
+ * (持久层 / 中间件层不写单测)。M7 Stage5 起 eventId 改 opaque String,本测断言相应改为字符串游标。</p>
  */
 class TaskEventBusReplayTest {
 
@@ -39,15 +40,15 @@ class TaskEventBusReplayTest {
             List<TaskEvent> out = new ArrayList<>();
             for (Row r : rows) {
                 if (r.taskId().equals(taskId) && r.id() > afterEventId) {
-                    out.add(new TaskEvent(taskId, r.id(), r.type(), r.data(), Instant.now()));
+                    out.add(new TaskEvent(taskId, String.valueOf(r.id()), r.type(), r.data(), Instant.now()));
                 }
             }
             return out;
         }
     }
 
-    private static List<Long> ids(List<TaskEvent> events) {
-        List<Long> out = new ArrayList<>();
+    private static List<String> ids(List<TaskEvent> events) {
+        List<String> out = new ArrayList<>();
         for (TaskEvent e : events) {
             out.add(e.eventId());
         }
@@ -62,18 +63,18 @@ class TaskEventBusReplayTest {
         bus.publish("t", TaskEvent.Type.STEP, Map.of("step", 3));   // id 3
 
         List<TaskEvent> got = Collections.synchronizedList(new ArrayList<>());
-        TaskEventBus.Subscription sub = bus.subscribeWithReplay("t", 1, e -> {
+        StreamTransport.Subscription sub = bus.subscribeWithReplay("t", "1", e -> {
             got.add(e);
             return true;
         });
-        assertEquals(List.of(2L, 3L), ids(got), "cursor=1:补播应只给 id>1 的历史");
+        assertEquals(List.of("2", "3"), ids(got), "cursor=1:补播应只给 id>1 的历史");
 
         bus.publish("t", TaskEvent.Type.STEP, Map.of("step", 4));   // live, id 4
-        assertEquals(List.of(2L, 3L, 4L), ids(got), "补播后无缝转 live");
+        assertEquals(List.of("2", "3", "4"), ids(got), "补播后无缝转 live");
 
         sub.close();
         bus.publish("t", TaskEvent.Type.STEP, Map.of("step", 5));   // 已退订
-        assertEquals(List.of(2L, 3L, 4L), ids(got), "退订后不再收到");
+        assertEquals(List.of("2", "3", "4"), ids(got), "退订后不再收到");
     }
 
     @Test
@@ -82,7 +83,7 @@ class TaskEventBusReplayTest {
         TaskEventBus bus = new TaskEventBus(store);
 
         List<TaskEvent> live = Collections.synchronizedList(new ArrayList<>());
-        bus.subscribeWithReplay("t", 0, e -> {
+        bus.subscribeWithReplay("t", "0", e -> {
             live.add(e);
             return true;
         });
@@ -90,17 +91,17 @@ class TaskEventBusReplayTest {
         bus.publish("t", TaskEvent.Type.TOKEN, Map.of("text", "hi"));  // live-only
 
         assertEquals(2, live.size(), "live 两个都收到");
-        assertEquals(1L, live.get(0).eventId());
+        assertEquals("1", live.get(0).eventId());
         assertNull(live.get(1).eventId(), "TOKEN 不带 durable id");
         assertEquals(TaskEvent.Type.TOKEN, live.get(1).type());
 
         // 新订阅 cursor=0:只补播到持久的 STEP(TOKEN 没落库)
         List<TaskEvent> replay = new ArrayList<>();
-        bus.subscribeWithReplay("t", 0, e -> {
+        bus.subscribeWithReplay("t", "0", e -> {
             replay.add(e);
             return true;
         });
-        assertEquals(List.of(1L), ids(replay), "TOKEN 不入 event 表 -> 不被补播");
+        assertEquals(List.of("1"), ids(replay), "TOKEN 不入 event 表 -> 不被补播");
     }
 
     @Test
@@ -122,7 +123,7 @@ class TaskEventBusReplayTest {
             publisher.start();
             publishedSome.await();
             // cursor=0 中途加入:补播拿到此刻已 commit 的 1..m,其余 m+1..n 走 live
-            TaskEventBus.Subscription sub = bus.subscribeWithReplay("t", 0, e -> {
+            StreamTransport.Subscription sub = bus.subscribeWithReplay("t", "0", e -> {
                 got.add(e);
                 return true;
             });
@@ -130,10 +131,10 @@ class TaskEventBusReplayTest {
             sub.close();
 
             // 不变量:收到的 id 恰为 1..n 各一次、严格升序(锁保证不漏不重)
-            List<Long> ids = ids(got);
+            List<String> ids = ids(got);
             assertEquals(n, ids.size(), "round " + round + ":期望 " + n + " 个,实得 " + ids.size());
             for (int i = 0; i < n; i++) {
-                assertEquals((long) (i + 1), ids.get(i), "round " + round + ":第 " + i + " 个 id 不连续(漏或重)");
+                assertEquals(String.valueOf(i + 1), ids.get(i), "round " + round + ":第 " + i + " 个 id 不连续(漏或重)");
             }
         }
     }
@@ -146,7 +147,7 @@ class TaskEventBusReplayTest {
         }
 
         List<TaskEvent> got = new ArrayList<>();
-        TaskEventBus.Subscription sub = bus.subscribeWithReplay("t", 0, e -> {
+        StreamTransport.Subscription sub = bus.subscribeWithReplay("t", "0", e -> {
             got.add(e);
             return got.size() < 2;     // 收到第 2 个就"断开"(返回 false)
         });

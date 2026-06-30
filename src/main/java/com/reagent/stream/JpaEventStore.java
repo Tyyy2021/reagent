@@ -43,7 +43,7 @@ public class JpaEventStore implements EventStore {
         List<EventEntity> rows = repo.findByTaskIdAndIdGreaterThanOrderByIdAsc(taskId, afterEventId);
         List<TaskEvent> events = new ArrayList<>(rows.size());
         for (EventEntity row : rows) {
-            events.add(new TaskEvent(taskId, row.getId(),
+            events.add(new TaskEvent(taskId, String.valueOf(row.getId()),
                     TaskEvent.Type.valueOf(row.getType()), fromJson(row.getData()), row.getCreatedAt()));
         }
         return events;

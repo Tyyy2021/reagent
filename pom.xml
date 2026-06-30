@@ -45,6 +45,11 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
+        <!-- M7 Stage5:跨 worker 流式 —— Spring Data Redis(Redis Streams 当跨机 live 总线;仅 transport=redis 时启用) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
         <!-- M2:MySQL 驱动(数据落地,进程重启不丢 -> 才能演示"断点续跑") -->
         <dependency>
             <groupId>com.mysql</groupId>
