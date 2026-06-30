@@ -3,7 +3,7 @@
 > 自研一个支持**长时任务、工具并发编排、崩溃断点续跑**的 Agent 运行时,挂一个自包含编码闭环作为 demo。
 > 本质是一个**领域专用的 durable execution engine**——恢复模型对齐 Temporal 的「workflow replay + idempotent activity」,聚焦 LLM Agent 场景。
 
-`Java 21` · `Spring Boot 3` · `Spring Data JPA` · `MySQL` · `docker-java` · `JDK21 虚拟线程`
+`Java 21` · `Spring Boot 3` · `Spring Data JPA` · `MySQL` · `Redis` · `docker-java` · `JDK21 虚拟线程`
 
 ---
 
@@ -24,7 +24,7 @@ ReAgent 把 Agent 的每一步都**事件溯源式落库**,进程崩溃/重启�
 | **exactly-once 副作用** | 账本状态机 + fail-closed 幂等分级 + sandbox journal 对账(L1–L3) | ✅ |
 | **M4 流式 + 打断 + 可恢复 SSE** | 事件级 / token 级 SSE 流式;协作式取消(优雅 drain + 硬杀)+ 暂停 / 续跑;事件溯源 `event` 表 + `Last-Event-ID` 断线重连续播 | ✅ |
 | **M6 可观测** | OpenTelemetry 全链路 trace(task → step → chat / tool → sandbox),OTLP → Jaeger;跨虚拟线程传 OTel context、taskId 派生 traceId(一个任务一条 trace、跨重启) | ✅ |
-| M7 | 多 worker + 租约 / 心跳 / 故障转移的分布式可恢复 | 规划中 |
+| **M7 分布式多 worker** | 租约失败转移 + fencing(epoch 栅栏)+ 跨 worker 控制面 / 流式(Redis Streams)/ 工作区抽象 | ✅ |
 
 ## 核心设计(难点密度)
 
@@ -57,6 +57,16 @@ ReAgent 把 Agent 的每一步都**事件溯源式落库**,进程崩溃/重启�
 手动装配 OpenTelemetry SDK(非 starter,只要业务 span),`task → step → {chat | execute_tool → sandbox.run}` 一棵 span 树经 OTLP 导出 Jaeger;命名 / 属性对齐 OTel **GenAI 语义约定**(`chat {model}`、`gen_ai.usage.*` token、`execute_tool {name}`)。两个真正的难点:
 - **跨虚拟线程传 context**:OTel `Context` 是 ThreadLocal,跨不过并发工具的 `pool.submit`——提交前捕获、子线程里 `makeCurrent` 恢复,`execute_tool` span 才挂得回 step span(与显式 `ToolContext` 传任务身份同一问题、同一解)。
 - **跨崩溃恢复关联**:**taskId(UUID)派生 traceId**(去横杠 = 32 hex),新任务与每次恢复都以同一"逻辑根"为 parent → **一个可恢复任务无论重启多少次都是同一条 trace**,Jaeger 里直接看断点续跑(对标 Temporal)。零持久化、零特例分支。
+
+### 7. 多 worker 分布式(M7)
+
+单机可恢复升级到**集群可恢复**:多 worker 共享 MySQL,任一 worker 崩了它的在跑任务被别的 worker 接管续跑。
+- **租约 + 原子 claim**:`task` 加 `owner_id` / `lease_expires_at` / `lease_epoch`。`claim` 是一条条件 `UPDATE`(`status=RUNNING 且 无主 / 是我 / 租约过期` 才占到)= 跨进程 CAS,MySQL 行锁保证两 worker 抢同一任务只有一个赢。worker 身份默认 `主机名:端口`(重启稳定 → 秒认领自己崩前的任务,k8s 可填 Pod 名)。
+- **心跳续租 + 失效扫描接管**:在跑任务由独立调度线程周期续租(与任务执行解耦,长工具也不假过期);每个 worker 周期扫「`RUNNING` 且租约过期」的孤儿并 `claim` 接管 = 真·故障转移。`lease_expires_at` 用 `TIMESTAMP_UTC` 强制 UTC 存取,跨时区 worker 不误判。
+- **fencing(epoch 栅栏)**:GC 停顿 / 网络分区可能让两 worker 同时自以为持有任务。`lease_epoch` 每次 claim 单调 +1 作 fencing token:心跳带 epoch 续租,被接管的旧 owner 续租落空 → 打 `FENCED`、安全点干净停手且**绝不改状态**;终态写带 `WHERE owner=me AND epoch=myEpoch` 守卫,旧 owner 跑到终点也写 0 行被挡 —— 杜绝脑裂双写。
+- **跨 worker 控制面**:`cancel` / `pause` 落 DB `control_signal` 列,任意 worker 受理、当前 owner 在安全点消费 —— **位置透明**(任务在 A 跑、请求打到 B 也生效)。
+- **跨 worker 流式(Redis Streams)**:`StreamTransport` 抽象,in-process(默认、零中间件)/ redis 二选一。redis 模式每任务一个 Redis Stream,`XREAD BLOCK from cursor` 让 **replay 历史与 live 是同一个游标读的连续** —— 客户端连任意 worker 都能看任意任务的实时 token 流,断线重连从游标续读不丢(比 pub/sub 强,且消掉了进程内那套补播 / live handoff)。
+- **工作区抽象**:`WorkspaceStore`(checkout + commit),shared-fs 实现 = 所有 worker 挂同一共享盘(NFS/EFS/PVC),失败转移后接管 worker 看得到原 worker 写的文件;留 git / 对象存储 drop-in 缝。
 
 ## 架构
 
@@ -98,10 +108,14 @@ com.reagent
 │   ├── CrashRecovery            启动扫 RUNNING,虚拟线程自动续跑
 │   ├── ShutdownState            区分优雅关闭 vs 真失败
 │   ├── InFlightTasks            单机护栏:同一任务不并发驱动
-│   └── TaskControl              打断信号:取消(优雅 / 硬杀)/ 暂停 / 续跑
+│   ├── TaskControl              打断信号:取消(优雅 / 硬杀)/ 暂停 / 续跑(+M7 FENCED)
+│   ├── WorkerIdentity           ★M7 worker 稳定身份(租约 owner)
+│   ├── LeaseHeartbeat           ★M7 心跳续租 + fence 检测(@Scheduled)
+│   ├── FailoverScanner          ★M7 扫租约过期的孤儿任务(@Scheduled)
+│   └── FailoverService          ★M7 接管入口(虚拟线程 recover)
 ├── persist/                     ★ 持久化 + 状态机
 │   ├── StateStore               每步落库 + 重建上下文 + 幂等账本
-│   ├── TaskEntity/Status/Repository
+│   ├── TaskEntity/Status/Repository       (+M7 租约 owner_id / lease_expires_at / lease_epoch + control_signal)
 │   ├── MessageEntity/Repository
 │   ├── ToolCallEntity/Status/Repository   (PENDING/IN_PROGRESS/DONE/IN_DOUBT)
 │   └── EventEntity/Repository             事件流投影(Stage4 可恢复 SSE 的 durable 游标)
@@ -110,15 +124,17 @@ com.reagent
 │   ├── SubprocessSandbox        setsid 进程组硬杀 + ulimit
 │   ├── DockerSandbox            docker-java 一次性容器 + cgroup + 断网
 │   ├── SandboxRouter            按配置路由两实现
-│   ├── WorkspaceManager         per-task workspace(锁死爆炸半径)
+│   ├── WorkspaceStore / SharedFsWorkspaceStore  per-task workspace 抽象(锁死爆炸半径;★M7 留 git / 对象存储 drop-in 缝)
 │   └── RunJournal               L3 完成日志:布局 / 读取 / 注入沙箱的 shell 片段
 ├── tool/                        工具层
 │   ├── Tool / ToolRegistry / ToolExecutor / ToolContext / ToolProperties
 │   ├── IdempotencyClass         READ_ONLY / IDEMPOTENT / SIDE_EFFECTFUL
 │   └── impl/                    read_file / list_dir / write_file / run_command / sleep_ms
-├── stream/                      ★ SSE 流式 + 可恢复(M4)
-│   ├── TaskEvent                事件信封(eventId = durable 游标;TOKEN 无 id)
-│   ├── TaskEventBus             进程内发布订阅 + 每任务锁补播(replay / live 不漏不重)
+├── stream/                      ★ SSE 流式 + 可恢复(M4)+ 跨 worker(M7)
+│   ├── TaskEvent                事件信封(eventId = opaque durable 游标;TOKEN 无 id)
+│   ├── StreamTransport          ★M7 事件流传输抽象(in-process / redis 二选一)
+│   ├── TaskEventBus             in-process 实现:进程内发布订阅 + 每任务锁补播(不漏不重)
+│   ├── RedisStreamTransport     ★M7 Redis Streams 跨 worker live 总线(XREAD-from-cursor 连续读)
 │   └── EventStore / JpaEventStore   事件溯源:event 表读写,replay 与 live 同构
 ├── llm/                         模型接入
 │   ├── LlmClient                接口(chat / chatStream,屏蔽厂商差异)
@@ -151,6 +167,17 @@ mvn spring-boot:run
 # 看到 "Started ReAgentApplication" + "启动检查:..." 即成功(端口 8080)
 ```
 
+**多 worker 模式(M7)**:装 Redis(`redis-server`),起多个实例连同库同 Redis:
+
+```bash
+# worker A
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8080 --reagent.streaming.transport=redis --reagent.worker.id=A"
+# worker B(另一终端)
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081 --reagent.streaming.transport=redis --reagent.worker.id=B"
+```
+
+强杀 A,它在跑的任务被 B 在租约过期后自动 `claim` 接管续跑;客户端连 B 的 `/stream` 能看到在 A(或接管后)跑的任务**实时 token 流**。workspace-root 指向所有 worker 共享挂载的盘(本地同机天然共享;生产用 NFS/EFS)。
+
 **验收**:见 `requests.http`——
 
 - **自包含编码闭环(M5 杀手 demo)**:提交一个 TDD 任务,Agent 在自己的 workspace 里 `write_file` 写函数 + 写测试 → `run_command` 跑 `python3` 测试 → 失败就读真实报错改对,直到通过。
@@ -160,8 +187,8 @@ mvn spring-boot:run
 
 ## 验证
 
-54 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写 / 流式 delta 拼装 + token usage / **事件总线补播不漏不重并发压测** / **跨虚拟线程 trace context 传播** / taskId 派生 traceId)+ 两条 e2e:① **崩溃注入**——伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑;② **断线重连续播**——首连收若干事件后断开,带 `Last-Event-ID` 重连,精确补播断点之后的每个事件、不漏不重、追平 `COMPLETED`。
+54 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写 / 流式 delta 拼装 + token usage / **事件总线补播不漏不重并发压测** / **跨虚拟线程 trace context 传播** / taskId 派生 traceId)+ 两条 e2e:① **崩溃注入**——伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑;② **断线重连续播**——首连收若干事件后断开,带 `Last-Event-ID` 重连,精确补播断点之后的每个事件、不漏不重、追平 `COMPLETED`;③ **M7 跨 worker**(真机双 worker 同库同 Redis)——A `submit` 的任务事件经 Redis Streams 被 B 进程**实时收到**(token 级跨机),接管 worker `checkout` 到同一 workspace;另以 SQL 镜像 / HTTP 端到端验 claim CAS、fence epoch 守卫、跨机 cancel 落 DB 信号。
 
 ## 路线图
 
-M7 多 worker + 租约 / 心跳 / 故障转移的分布式可恢复(`W3CTraceContextPropagator` 已为跨 worker 传 trace 留缝)。
+M1–M7 已落地。后续可选硬化方向:`WorkspaceStore` 的 git / 对象存储后端(去共享盘依赖)、DAG 工具依赖调度、生产化(Flyway 迁移、k8s 部署 + Pod 名作 worker id、跨 worker 传 OTel trace —— `W3CTraceContextPropagator` 已留缝)。
