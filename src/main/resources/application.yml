@@ -45,6 +45,11 @@ reagent:
     transport: ${REAGENT_STREAMING_TRANSPORT:in-process}
     # redis 模式下每个 task 的 Stream key 前缀;任务终态后给 key 设此 TTL(秒)自动清理,内存不涨。
     redis-stream-ttl-sec: 3600
+  # ====== M7 C:工作区存储(失败转移后接管 worker 要能拿到同一份 per-task 工作区)======
+  workspace:
+    # shared(默认):所有 worker 挂同一共享盘(NFS/EFS/PVC)到 sandbox.workspace-root,写入实时互见、commit 为 no-op。
+    # 预留 git / 对象存储(s3)实现:本地副本 + commit 推回远端,接管 worker checkout 拉最新(drop-in,后补)。
+    store: shared
   # ====== M6:可观测(OpenTelemetry 全链路 trace -> OTLP -> Jaeger)======
   tracing:
     # 关掉(false)则用 no-op:不连 Jaeger 也能跑、开发无关功能时省心

@@ -7,7 +7,7 @@ import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
 import com.reagent.persist.ToolCallStatus;
 import com.reagent.sandbox.RunJournal;
-import com.reagent.sandbox.WorkspaceManager;
+import com.reagent.sandbox.WorkspaceStore;
 import com.reagent.stream.TaskEvent;
 import com.reagent.stream.StreamTransport;
 import com.reagent.tool.IdempotencyClass;
@@ -67,7 +67,7 @@ public class AgentRunner {
     private final ToolExecutor executor;
     private final StateStore stateStore;
     private final ShutdownState shutdownState;
-    private final WorkspaceManager workspaceManager;
+    private final WorkspaceStore workspaceStore;
     private final InFlightTasks inFlight;
     private final StreamTransport bus;
     private final TaskControl taskControl;
@@ -77,7 +77,7 @@ public class AgentRunner {
 
     public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
-                       WorkspaceManager workspaceManager, InFlightTasks inFlight,
+                       WorkspaceStore workspaceStore, InFlightTasks inFlight,
                        StreamTransport bus, TaskControl taskControl, Tracer tracer,
                        WorkerIdentity workerIdentity,
                        @Value("${reagent.recovery.max-attempts:3}") int maxAttempts) {
@@ -86,7 +86,7 @@ public class AgentRunner {
         this.executor = executor;
         this.stateStore = stateStore;
         this.shutdownState = shutdownState;
-        this.workspaceManager = workspaceManager;
+        this.workspaceStore = workspaceStore;
         this.inFlight = inFlight;
         this.bus = bus;
         this.taskControl = taskControl;
@@ -221,7 +221,7 @@ public class AgentRunner {
     private String driveLoop(String taskId, long myEpoch) {
         Context ctx = stateStore.loadContext(taskId);
         // 本任务的工具执行上下文:taskId + 独立工作目录(沙箱 cwd / 挂载点),一次解析、全程复用
-        ToolContext toolCtx = new ToolContext(taskId, workspaceManager.workspaceFor(taskId));
+        ToolContext toolCtx = new ToolContext(taskId, workspaceStore.checkout(taskId));
 
         try {
             bus.publish(taskId, TaskEvent.Type.TASK_STARTED, Map.of());
@@ -242,6 +242,7 @@ public class AgentRunner {
                         stepSpan.setAttribute(Trace.STEP_PENDING, true);
                         log.info("--- 第 {} 步:补跑 {} 个未完成的工具调用 ---", step, pending.size());
                         executeTools(toolCtx, ctx, pending);
+                        workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
                         continue;
                     }
 
@@ -276,6 +277,7 @@ public class AgentRunner {
                                 Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
                     }
                     executeTools(toolCtx, ctx, decision.getToolCalls());
+                    workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
                 } finally {
                     stepSpan.end();
                 }
