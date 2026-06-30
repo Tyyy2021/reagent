@@ -22,6 +22,7 @@ import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -71,11 +72,15 @@ public class AgentRunner {
     private final TaskEventBus bus;
     private final TaskControl taskControl;
     private final Tracer tracer;
+    private final WorkerIdentity workerIdentity;   // M7:本 worker 身份(span 属性 / 日志)
+    private final int maxAttempts;                 // M7 Stage2:单任务自动恢复次数上限(止损)
 
     public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
                        WorkspaceManager workspaceManager, InFlightTasks inFlight,
-                       TaskEventBus bus, TaskControl taskControl, Tracer tracer) {
+                       TaskEventBus bus, TaskControl taskControl, Tracer tracer,
+                       WorkerIdentity workerIdentity,
+                       @Value("${reagent.recovery.max-attempts:3}") int maxAttempts) {
         this.llm = llm;
         this.registry = registry;
         this.executor = executor;
@@ -86,13 +91,15 @@ public class AgentRunner {
         this.bus = bus;
         this.taskControl = taskControl;
         this.tracer = tracer;
+        this.workerIdentity = workerIdentity;
+        this.maxAttempts = maxAttempts;
     }
 
     /** 提交一个新任务:落库后从头跑(同步,阻塞到跑完)。M4:仅 `POST /api/tasks?sync=true` 与单测走这条。 */
     public RunResult run(String goal) {
         log.info("====== 新任务:{} ======", goal);
         TaskEntity task = stateStore.createTask(goal, SYSTEM_PROMPT);
-        String answer = drive(task);
+        String answer = drive(task, false);
         return new RunResult(task.getId(), answer);
     }
 
@@ -106,7 +113,7 @@ public class AgentRunner {
         String taskId = task.getId();
         Thread.ofVirtual().name("agent-" + taskId).start(() -> {
             try {
-                drive(task);
+                drive(task, false);
             } catch (RuntimeException ex) {
                 // drive 内部已分流(shutdown 保 RUNNING / 真错判 FAILED);此处兜底,防虚拟线程静默吞异常
                 log.error("异步任务 {} 驱动异常", taskId, ex);
@@ -122,7 +129,18 @@ public class AgentRunner {
         if (task.getStatus() == TaskStatus.PAUSED) {
             stateStore.markRunning(taskId);   // 暂停的任务:先 PAUSED -> RUNNING 再续跑
         }
-        return drive(task);
+        return drive(task, false);
+    }
+
+    /**
+     * ★ M7 Stage2:自动恢复 / 失败转移入口。与 {@link #resume}(用户手动)的区别:走 autoRecovery 路径 ——
+     * 计恢复次数并止损。由 {@link FailoverService} 在虚拟线程上调用;claim 落败者会被 {@link #drive} 内部
+     * 干净跳过(不计数、不驱动),所以多 worker 同时盯同一孤儿任务也安全。
+     */
+    public String recover(String taskId) {
+        log.info("====== 接管 / 恢复任务:{} ======", taskId);
+        TaskEntity task = stateStore.getTask(taskId);
+        return drive(task, true);
     }
 
     /** M4:异步恢复(给 resume 端点用)——在虚拟线程上续跑、立即返回,过程经 SSE 流式推。 */
@@ -140,39 +158,60 @@ public class AgentRunner {
      * 真正的循环。对"全新任务"和"半截任务"是同一套代码:
      * 每轮先把库里(可能)欠着的工具结果补齐,再问模型下一步。
      */
-    private String drive(TaskEntity task) {
+    private String drive(TaskEntity task, boolean autoRecovery) {
         String taskId = task.getId();
         // 单机内"同一任务不并发驱动"护栏:挡住"自动恢复 + 手动 resume 撞车"——否则两个 drive
         // 会撞 message.seq、还会把同一工具跑两遍(账本 DONE 检查与执行之间不是原子的)。
-        // 跨进程的同源竞态由 (task_id, seq) 唯一约束 fail-fast;彻底解决留给 M7 的 DB 租约。
         if (!inFlight.tryBegin(taskId)) {
             log.warn("任务 {} 已在本进程内执行中,跳过本次重复驱动。", taskId);
             return "任务已在执行中,本次重复驱动已跳过。";
         }
-        taskControl.begin(taskId);   // 登记驱动线程 + 打断信号槽(M4 Stage3)
-        // M6:任务 root span —— 用 taskId 派生 traceId,新任务与每次恢复都落在【同一条 trace】下(跨崩溃可视);
-        // root 不继承 HTTP 请求的 trace(任务与连接解耦、活得比连接长),与 M4 解耦一脉相承。
-        Span taskSpan = tracer.spanBuilder("agent.task")
-                .setParent(Trace.logicalRootContext(taskId))
-                .setSpanKind(SpanKind.INTERNAL)
-                .setAttribute(Trace.TASK_ID, taskId)
-                .setAttribute(Trace.GOAL, preview(task.getGoal()))
-                .setAttribute(Trace.RECOVERY_COUNT, (long) task.getRecoveryCount())
-                .startSpan();
-        try (Scope ignored = taskSpan.makeCurrent()) {
-            return driveLoop(taskId);
-        } catch (RuntimeException ex) {
-            taskSpan.recordException(ex);
-            taskSpan.setStatus(StatusCode.ERROR);
-            throw ex;
-        } finally {
-            try {
-                taskSpan.setAttribute(Trace.TASK_STATUS, stateStore.getTask(taskId).getStatus().name());
-            } catch (RuntimeException ignore) {
-                // 读终态失败不影响收尾
+        try {
+            // M7:跨【进程】护栏 —— 原子 claim 抢租约,只有持租约的 worker 才驱动。替掉了过去"凡 RUNNING
+            // 都是我崩的、全量抢来恢复"的单机假设:别的 worker 正在跑的任务(租约被心跳续着、未过期)会在此
+            // claim 失败、被干净跳过,不被误抢。InFlightTasks 只能管 JVM 内,跨进程同源竞态由这道 DB 租约收口。
+            if (!stateStore.claim(taskId)) {
+                log.warn("任务 {} 被其它 worker 持有(claim 失败),跳过本次驱动。", taskId);
+                return "任务已被其它 worker 持有,本次驱动跳过。";
             }
-            taskSpan.end();
-            taskControl.end(taskId);
+            // M7 Stage2:只有【自动恢复 / 失败转移】路径才计恢复次数并止损(手动 resume / 新任务不计)。
+            // 放在 claim 之后:只有真抢到执行权的 worker 才 +1,落败的 worker 直接跳过、绝不误加计数。
+            if (autoRecovery) {
+                int attempt = stateStore.incrementRecoveryCount(taskId);
+                if (attempt > maxAttempts) {
+                    log.warn("任务 {} 已自动恢复 {} 次仍未完成,超上限 {},止损标记 FAILED。", taskId, attempt - 1, maxAttempts);
+                    stateStore.failTask(taskId, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。");
+                    return "超过最大自动恢复次数,已止损标记 FAILED。";
+                }
+                log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
+            }
+            taskControl.begin(taskId);   // 登记驱动线程 + 打断信号槽(M4 Stage3)
+            // M6:任务 root span —— 用 taskId 派生 traceId,新任务与每次恢复都落在【同一条 trace】下(跨崩溃可视);
+            // root 不继承 HTTP 请求的 trace(任务与连接解耦、活得比连接长),与 M4 解耦一脉相承。
+            Span taskSpan = tracer.spanBuilder("agent.task")
+                    .setParent(Trace.logicalRootContext(taskId))
+                    .setSpanKind(SpanKind.INTERNAL)
+                    .setAttribute(Trace.TASK_ID, taskId)
+                    .setAttribute(Trace.GOAL, preview(task.getGoal()))
+                    .setAttribute(Trace.RECOVERY_COUNT, (long) task.getRecoveryCount())
+                    .setAttribute(Trace.WORKER_ID, workerIdentity.id())   // M7:标出本次由哪个 worker 驱动(失败转移后可见接管)
+                    .startSpan();
+            try (Scope ignored = taskSpan.makeCurrent()) {
+                return driveLoop(taskId);
+            } catch (RuntimeException ex) {
+                taskSpan.recordException(ex);
+                taskSpan.setStatus(StatusCode.ERROR);
+                throw ex;
+            } finally {
+                try {
+                    taskSpan.setAttribute(Trace.TASK_STATUS, stateStore.getTask(taskId).getStatus().name());
+                } catch (RuntimeException ignore) {
+                    // 读终态失败不影响收尾
+                }
+                taskSpan.end();
+                taskControl.end(taskId);
+            }
+        } finally {
             inFlight.end(taskId);
         }
     }

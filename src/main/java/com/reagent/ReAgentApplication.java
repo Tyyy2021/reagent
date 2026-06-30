@@ -3,6 +3,7 @@ package com.reagent;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * ReAgent —— 自研可恢复 Agent 运行时。
@@ -10,6 +11,7 @@ import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
  */
 @SpringBootApplication
 @ConfigurationPropertiesScan
+@EnableScheduling   // M7 Stage2:心跳续租 + 失效扫描都靠 @Scheduled
 public class ReAgentApplication {
     public static void main(String[] args) {
         SpringApplication.run(ReAgentApplication.class, args);

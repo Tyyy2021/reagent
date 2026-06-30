@@ -17,6 +17,21 @@ spring:
     open-in-view: false
 
 reagent:
+  # ====== M7:分布式 worker 身份 + 租约 ======
+  worker:
+    # 本实例 id;留空(默认)则取 "主机名:端口" —— 同机多实例靠端口区分(本地双 worker:8080 / 8081),
+    # 且端口对一实例固定 -> 重启稳定,开机能秒认领自己崩前的任务。k8s 可用环境变量填 Pod 名覆盖。
+    id: ${REAGENT_WORKER_ID:}
+    # 租约时长(毫秒):owner 持租期间独占驱动权;到期未续租 = 疑似已死,可被其它 worker claim 接管。
+    lease-ttl-ms: 30000
+    # M7 Stage2:心跳续租间隔(毫秒)。必须【小于】lease-ttl-ms(建议 ttl/3,留 2 次容错):
+    # 本 worker 正在跑的任务每隔这么久续一次租,心跳不断则租约永不过期、不会被别人抢。
+    heartbeat-ms: 10000
+    # M7 Stage2:失效扫描间隔(毫秒)。每个 worker 周期性扫"RUNNING 且租约过期"的孤儿任务并尝试接管。
+    # 故障检测时延上界 ≈ lease-ttl-ms + scan-ms(原 owner 崩 -> 租约过期 -> 下一轮扫到接管)。
+    scan-ms: 10000
+    # M7 Stage2:每轮扫描最多接管多少个,防一个 worker 一次抢太多(其余留给下一轮 / 别的 worker)。
+    scan-batch: 50
   # ====== M6:可观测(OpenTelemetry 全链路 trace -> OTLP -> Jaeger)======
   tracing:
     # 关掉(false)则用 no-op:不连 Jaeger 也能跑、开发无关功能时省心

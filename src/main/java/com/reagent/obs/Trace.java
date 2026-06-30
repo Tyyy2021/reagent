@@ -26,6 +26,8 @@ public final class Trace {
 
     // ===== task / step =====
     public static final AttributeKey<String> TASK_ID = AttributeKey.stringKey("reagent.task.id");
+    /** M7:驱动本任务的 worker id —— 失败转移后,同一条 trace 上能看出"从哪个 worker 接管到了哪个"。 */
+    public static final AttributeKey<String> WORKER_ID = AttributeKey.stringKey("reagent.worker.id");
     public static final AttributeKey<String> GOAL = AttributeKey.stringKey("reagent.task.goal");
     public static final AttributeKey<Long> RECOVERY_COUNT = AttributeKey.longKey("reagent.task.recovery_count");
     public static final AttributeKey<String> TASK_STATUS = AttributeKey.stringKey("reagent.task.status");

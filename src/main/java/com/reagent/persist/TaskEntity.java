@@ -6,6 +6,8 @@ import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -46,6 +48,29 @@ public class TaskEntity {
      */
     private int recoveryCount;
 
+    /**
+     * ★ M7:分布式租约持有者 —— 当前持有本任务执行权的 worker id(null = 无主)。
+     * 启动/扫描时据此区分"别的活 worker 正在跑"与"原 owner 已死、可接管"。新列,旧行经 ddl 自动补 NULL。
+     */
+    @Column(length = 64)
+    private String ownerId;
+
+    /**
+     * ★ M7:租约到期时刻。owner 持租期间独占驱动;过期未续租 = 疑似已死,可被其它 worker claim 接管。
+     *
+     * <p>用 {@code TIMESTAMP_UTC} 强制按 UTC 读写:让租约时间的存取与各 worker 的 {@code serverTimezone}
+     * 配置【解耦】—— 无论部署在哪个时区,claim / renew / findExpired 都在同一 UTC 基准上比较,杜绝"跨时区
+     * worker 把没过期的当过期、或把过期的当没过期"的错位。(普通 datetime 依赖连接时区,曾导致失效扫描漏判。)</p>
+     */
+    @JdbcTypeCode(SqlTypes.TIMESTAMP_UTC)
+    private Instant leaseExpiresAt;
+
+    /**
+     * ★ M7:fencing token —— 每次 claim 单调 +1。Stage3 用它把"被接管的旧 owner"栅栏掉:
+     * 旧 owner 的写带着过期的 epoch,影响 0 行 → 自知已被接管、干净退出,杜绝双驱动写花状态。新列,旧行补 0。
+     */
+    private long leaseEpoch;
+
     /** JPA 要求的无参构造 */
     protected TaskEntity() {
     }
@@ -60,16 +85,31 @@ public class TaskEntity {
         return t;
     }
 
+    /** ★ M7:认领租约 —— 新任务出生即归本 worker(owner 一并落库,杜绝"无主 RUNNING"空窗被漏扫)。 */
+    public void assignLease(String workerId, Instant expiresAt) {
+        this.ownerId = workerId;
+        this.leaseExpiresAt = expiresAt;
+        this.updatedAt = Instant.now();
+    }
+
+    /** ★ M7:释放租约 —— 进入终态 / 暂停时清空 owner,让任何 worker 可立即接手,也不留陈旧 owner。 */
+    public void releaseLease() {
+        this.ownerId = null;
+        this.leaseExpiresAt = null;
+    }
+
     public void complete(String answer) {
         this.status = TaskStatus.COMPLETED;
         this.result = answer;
         this.updatedAt = Instant.now();
+        releaseLease();
     }
 
     public void fail(String error) {
         this.status = TaskStatus.FAILED;
         this.result = error;
         this.updatedAt = Instant.now();
+        releaseLease();
     }
 
     /** M4:用户取消(终态)。 */
@@ -77,12 +117,14 @@ public class TaskEntity {
         this.status = TaskStatus.CANCELLED;
         this.result = note;
         this.updatedAt = Instant.now();
+        releaseLease();
     }
 
     /** M4:用户暂停(非终态;result 不动,留待 resume 后真正完成时再写)。 */
     public void pause() {
         this.status = TaskStatus.PAUSED;
         this.updatedAt = Instant.now();
+        releaseLease();
     }
 
     /** M4:PAUSED -> RUNNING(resume 续跑前调用)。 */
@@ -105,4 +147,7 @@ public class TaskEntity {
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
     public int getRecoveryCount() { return recoveryCount; }
+    public String getOwnerId() { return ownerId; }
+    public Instant getLeaseExpiresAt() { return leaseExpiresAt; }
+    public long getLeaseEpoch() { return leaseEpoch; }
 }

@@ -10,36 +10,33 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
- * ★ M2 杀手锏:崩溃恢复。
+ * ★ M2 杀手锏 + M7 升级:启动崩溃恢复。
  *
- * 应用启动完成后扫一遍数据库:凡是还停在 RUNNING 的任务,都是"上次进程被强杀时
- * 没跑完的"——逐个用 {@link AgentRunner#resume} 接着跑。
+ * <p>应用启动完成后扫一遍 RUNNING 任务,逐个委托 {@link FailoverService} 尝试接管。M7 后接管走
+ * {@link AgentRunner#recover} —— 内部先原子 claim:抢得到的(无主 / 自己崩前持有 owner=me / 别的 worker
+ * 已死租约过期)才恢复,抢不到的(别的 worker 正活着跑、租约被心跳续着)干净跳过。于是【多 worker 同时启动】
+ * 也安全 —— 不再像单机假设那样把别人正在跑的任务误抢过来。</p>
  *
- * 用 JDK21 虚拟线程跑恢复任务:不阻塞启动、也不必担心线程数(每任务一根虚拟线程极轻)。
- *
- * 可用配置 reagent.recovery.enabled=false 关掉(做无关开发、不想自动调 LLM 花钱时)。
+ * <p>这里只管"启动这一下"的快速恢复(尤其本机崩前自己的任务,owner=me 可【秒认领】,不必等租约过期);
+ * 运行期持续的失败转移由 {@link FailoverScanner} 周期扫描负责。恢复计数 + 止损已下沉到 {@code recover()},
+ * 此处不再重复。用 reagent.recovery.enabled=false 可整体关掉自动恢复 / 扫描。</p>
  */
 @Component
 public class CrashRecovery implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(CrashRecovery.class);
 
-    private final AgentRunner runner;
     private final StateStore stateStore;
+    private final FailoverService failover;
     private final boolean enabled;
-    private final int maxAttempts;
 
-    public CrashRecovery(AgentRunner runner, StateStore stateStore,
-                         @Value("${reagent.recovery.enabled:true}") boolean enabled,
-                         @Value("${reagent.recovery.max-attempts:3}") int maxAttempts) {
-        this.runner = runner;
+    public CrashRecovery(StateStore stateStore, FailoverService failover,
+                         @Value("${reagent.recovery.enabled:true}") boolean enabled) {
         this.stateStore = stateStore;
+        this.failover = failover;
         this.enabled = enabled;
-        this.maxAttempts = maxAttempts;
     }
 
     @Override
@@ -48,35 +45,15 @@ public class CrashRecovery implements ApplicationRunner {
             log.info("崩溃恢复已关闭(reagent.recovery.enabled=false),跳过。");
             return;
         }
-
         List<TaskEntity> unfinished = stateStore.findRunning();
         if (unfinished.isEmpty()) {
-            log.info("启动检查:没有未完成任务,无需恢复。");
+            log.info("启动检查:没有 RUNNING 任务,无需恢复。");
             return;
         }
-
-        log.info("启动检查:发现 {} 个未完成任务,后台恢复中......", unfinished.size());
-        ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
+        log.info("启动检查:发现 {} 个 RUNNING 任务,逐个尝试认领恢复(只领得到无主 / 自己 / 租约过期的)......",
+                unfinished.size());
         for (TaskEntity task : unfinished) {
-            String id = task.getId();
-            // 先把恢复计数 +1 并落库(必须在 resume 之前:即便这次又崩,计数也已记下,不会无限重试)。
-            // 超过上限就止损判 FAILED,避免"确定性崩溃"任务每次启动都被重跑、反复烧 LLM。
-            int attempt = stateStore.incrementRecoveryCount(id);
-            if (attempt > maxAttempts) {
-                log.warn("任务 {} 已恢复 {} 次仍未完成,超过上限 {},止损标记 FAILED。",
-                        id, attempt - 1, maxAttempts);
-                stateStore.failTask(id, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。");
-                continue;
-            }
-            log.info("恢复任务 {}(第 {}/{} 次尝试)", id, attempt, maxAttempts);
-            pool.submit(() -> {
-                try {
-                    runner.resume(id);
-                } catch (RuntimeException ex) {
-                    log.error("恢复任务 {} 失败", id, ex);
-                }
-            });
+            failover.submit(task.getId());
         }
-        pool.shutdown();   // 不再接新任务;已提交的虚拟线程继续跑完
     }
 }

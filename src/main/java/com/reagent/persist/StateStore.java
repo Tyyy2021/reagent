@@ -4,9 +4,13 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.Context;
 import com.reagent.core.ToolCall;
+import com.reagent.core.WorkerIdentity;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,13 +35,19 @@ public class StateStore {
     private final MessageRepository messageRepo;
     private final ToolCallRepository toolCallRepo;
     private final ObjectMapper mapper;
+    private final WorkerIdentity worker;        // M7:本 worker 身份(claim 的 owner)
+    private final long leaseTtlMs;              // M7:租约时长
 
     public StateStore(TaskRepository taskRepo, MessageRepository messageRepo,
-                      ToolCallRepository toolCallRepo, ObjectMapper mapper) {
+                      ToolCallRepository toolCallRepo, ObjectMapper mapper,
+                      WorkerIdentity worker,
+                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs) {
         this.taskRepo = taskRepo;
         this.messageRepo = messageRepo;
         this.toolCallRepo = toolCallRepo;
         this.mapper = mapper;
+        this.worker = worker;
+        this.leaseTtlMs = leaseTtlMs;
     }
 
     // ===================== 任务生命周期 =====================
@@ -45,7 +55,11 @@ public class StateStore {
     /** 新建任务,并把开场的 system + user(goal) 两条消息落库 */
     @Transactional
     public TaskEntity createTask(String goal, String systemPrompt) {
-        TaskEntity task = taskRepo.save(TaskEntity.newTask(goal));
+        // M7:新任务出生即认领租约(owner=本 worker),避免出现"无主 RUNNING"空窗 —— 否则创建者若在
+        // createTask 与首次 drive 之间崩了,该任务会成 owner=null/lease=null 的孤儿,失效扫描(只盯过期租约)永远漏掉。
+        TaskEntity t = TaskEntity.newTask(goal);
+        t.assignLease(worker.id(), Instant.now().plusMillis(leaseTtlMs));
+        TaskEntity task = taskRepo.save(t);
         appendMessage(task.getId(), "system", systemPrompt, null, null);
         appendMessage(task.getId(), "user", goal, null, null);
         return task;
@@ -59,6 +73,33 @@ public class StateStore {
     /** 崩溃恢复扫描:所有仍处于 RUNNING 的任务 */
     public List<TaskEntity> findRunning() {
         return taskRepo.findByStatus(TaskStatus.RUNNING);
+    }
+
+    /**
+     * ★ M7 Stage1:抢占任务执行租约(原子 claim 的薄封装)。委托 {@link TaskRepository#claim} 做
+     * 单条条件 UPDATE,owner=本 worker、续租 {@code leaseTtlMs}。
+     *
+     * @return true = 本 worker 抢到执行权(可驱动);false = 别人持活租约,应跳过本次驱动。
+     */
+    @Transactional
+    public boolean claim(String taskId) {
+        Instant now = Instant.now();
+        int rows = taskRepo.claim(taskId, worker.id(), now, now.plusMillis(leaseTtlMs));
+        return rows == 1;
+    }
+
+    /**
+     * ★ M7 Stage2:心跳续租 —— 把本 worker 持有的任务租约往后续 {@code leaseTtlMs}。
+     * @return true = 续上了(仍归我);false = 这任务已不归我(被接管 / 已释放),调用方据此自停(Stage3)。
+     */
+    @Transactional
+    public boolean renew(String taskId) {
+        return taskRepo.renew(taskId, worker.id(), Instant.now().plusMillis(leaseTtlMs)) == 1;
+    }
+
+    /** ★ M7 Stage2:失效扫描 —— 取最多 {@code limit} 个 RUNNING 且租约已过期的孤儿任务(供失败转移接管)。 */
+    public List<TaskEntity> findExpired(int limit) {
+        return taskRepo.findByStatusAndLeaseExpiresAtLessThan(TaskStatus.RUNNING, Instant.now(), Limit.of(limit));
     }
 
     @Transactional

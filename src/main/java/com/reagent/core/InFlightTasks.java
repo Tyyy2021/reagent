@@ -35,4 +35,9 @@ public class InFlightTasks {
     public boolean isRunning(String taskId) {
         return running.contains(taskId);
     }
+
+    /** M7 Stage2:本进程当前正在驱动的任务 id 快照 —— 供心跳续租遍历(只续"我在跑的")。 */
+    public Set<String> snapshot() {
+        return Set.copyOf(running);
+    }
 }
