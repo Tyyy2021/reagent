@@ -86,4 +86,21 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
             """)
     int failIfOwner(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch,
                     @Param("error") String error, @Param("now") Instant now);
+
+    /**
+     * ★ M7 Stage4:跨 worker 下达控制信号 —— 仅对仍在跑(RUNNING)的任务有意义(由其 owner 在安全点消费)。
+     * @return 1 = 已记录;0 = 任务不在 RUNNING(已结束 / 暂停等),调用方据此回 409。
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE TaskEntity t SET t.controlSignal = :sig WHERE t.id = :id AND t.status = com.reagent.persist.TaskStatus.RUNNING")
+    int requestControl(@Param("id") String id, @Param("sig") String sig);
+
+    /** ★ M7 Stage4:owner 消费控制信号后清回 NONE(避免 pause→resume 后又被重复触发)。 */
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE TaskEntity t SET t.controlSignal = 'NONE' WHERE t.id = :id")
+    int clearControlSignal(@Param("id") String id);
+
+    /** ★ M7 Stage4:只取控制信号列(owner 每个安全点轻量读,不取整行)。 */
+    @Query("SELECT t.controlSignal FROM TaskEntity t WHERE t.id = :id")
+    String findControlSignal(@Param("id") String id);
 }

@@ -71,6 +71,14 @@ public class TaskEntity {
      */
     private long leaseEpoch;
 
+    /**
+     * ★ M7 Stage4:跨 worker 控制信号。任意 worker 收到 cancel/pause 请求、而任务不在本机驱动时写这里,
+     * 当前 owner 在安全点读到并执行 —— 让控制面【位置透明】。值:NONE / CANCEL / PAUSE(用 varchar 存,
+     * 避开 Hibernate 原生 enum 定宽坑;与 task.status 同源教训)。新列,旧行补 NULL,读时当 NONE。
+     */
+    @Column(length = 16)
+    private String controlSignal;
+
     /** JPA 要求的无参构造 */
     protected TaskEntity() {
     }
@@ -150,4 +158,5 @@ public class TaskEntity {
     public String getOwnerId() { return ownerId; }
     public Instant getLeaseExpiresAt() { return leaseExpiresAt; }
     public long getLeaseEpoch() { return leaseEpoch; }
+    public String getControlSignal() { return controlSignal; }
 }

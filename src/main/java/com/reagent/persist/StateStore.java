@@ -106,6 +106,26 @@ public class StateStore {
         return taskRepo.findByStatusAndLeaseExpiresAtLessThan(TaskStatus.RUNNING, Instant.now(), Limit.of(limit));
     }
 
+    // ===================== M7 Stage4:跨 worker 控制面 =====================
+
+    /** ★ M7 Stage4:跨 worker 下达控制信号(写 DB,由 owner 在安全点消费)。true=已记录(任务在 RUNNING)。 */
+    @Transactional
+    public boolean requestControl(String taskId, String signal) {
+        return taskRepo.requestControl(taskId, signal) == 1;
+    }
+
+    /** ★ M7 Stage4:读当前控制信号(NULL→"NONE")。owner 每个安全点轻量读。 */
+    public String readControlSignal(String taskId) {
+        String s = taskRepo.findControlSignal(taskId);
+        return s == null ? "NONE" : s;
+    }
+
+    /** ★ M7 Stage4:owner 消费信号后清回 NONE。 */
+    @Transactional
+    public void clearControlSignal(String taskId) {
+        taskRepo.clearControlSignal(taskId);
+    }
+
     /**
      * 完成任务(终态),带 M7 Stage3 epoch 守卫:仅当本 worker 仍持有该 epoch 的租约才写得进(顺带释放租约)。
      * @return true=写成功;false=租约已被接管(fence)→ 调用方放弃,绝不覆盖接管者成果。

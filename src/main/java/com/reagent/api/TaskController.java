@@ -120,25 +120,35 @@ public class TaskController {
     @PostMapping("/{id}/cancel")
     public ResponseEntity<Map<String, String>> cancel(@PathVariable String id,
                                                       @RequestParam(defaultValue = "false") boolean force) {
-        boolean ok = taskControl.requestCancel(id, force);
-        if (!ok) {
-            return ResponseEntity.status(409).body(Map.of(
-                    "taskId", id, "message", "任务不在运行中(可能已结束),无法取消"));
+        // M7 Stage4:先试本地(任务恰在本 worker 驱动)—— 立即生效,force 还能硬杀 in-flight 工具
+        if (taskControl.requestCancel(id, force)) {
+            return ResponseEntity.accepted().body(Map.of("taskId", id,
+                    "message", force ? "已请求取消(本地 force 硬杀)" : "已请求取消(本地优雅:当前工具跑完后停)"));
         }
-        return ResponseEntity.accepted().body(Map.of("taskId", id,
-                "message", force ? "已请求取消(force 硬杀)" : "已请求取消(优雅:当前工具跑完后停)"));
+        // 本地没有 → 任务在别的 worker 上:落 DB 控制信号,由其 owner 在安全点优雅消费(位置透明)
+        if (stateStore.requestControl(id, "CANCEL")) {
+            return ResponseEntity.accepted().body(Map.of("taskId", id,
+                    "message", "已请求取消(跨 worker:owner 将在安全点优雅停"
+                            + (force ? ";force 跨 worker 退化为优雅)" : ")")));
+        }
+        return ResponseEntity.status(409).body(Map.of(
+                "taskId", id, "message", "任务不在运行中(可能已结束),无法取消"));
     }
 
     /** M4:暂停任务(优雅,留下可 resume 的干净状态)。 */
     @PostMapping("/{id}/pause")
     public ResponseEntity<Map<String, String>> pause(@PathVariable String id) {
-        boolean ok = taskControl.requestPause(id);
-        if (!ok) {
-            return ResponseEntity.status(409).body(Map.of(
-                    "taskId", id, "message", "任务不在运行中,无法暂停"));
+        // M7 Stage4:先试本地,本地没有再落 DB 信号(跨 worker 优雅暂停)
+        if (taskControl.requestPause(id)) {
+            return ResponseEntity.accepted().body(Map.of("taskId", id,
+                    "message", "已请求暂停(本地:当前工具跑完后停)"));
         }
-        return ResponseEntity.accepted().body(Map.of("taskId", id,
-                "message", "已请求暂停(当前工具跑完后停)"));
+        if (stateStore.requestControl(id, "PAUSE")) {
+            return ResponseEntity.accepted().body(Map.of("taskId", id,
+                    "message", "已请求暂停(跨 worker:owner 将在安全点停)"));
+        }
+        return ResponseEntity.status(409).body(Map.of(
+                "taskId", id, "message", "任务不在运行中,无法暂停"));
     }
 
     /** 续跑一个 PAUSED 任务(异步,过程经 /stream 跟)。RUNNING 也放行(InFlightTasks 挡双驱动);终态拒绝。 */

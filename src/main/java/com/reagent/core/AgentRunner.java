@@ -322,7 +322,17 @@ public class AgentRunner {
             log.warn("任务 {} 被 fence(租约已易主),在安全点停止驱动、不动状态(交接管者续跑)。", taskId);
             return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
         }
+        // M7 Stage4:本地无信号时,看跨 worker 的 DB 控制信号(任意 worker 下达、当前 owner 在此消费)——控制面位置透明。
+        if (sig == TaskControl.Signal.NONE) {
+            String db = stateStore.readControlSignal(taskId);
+            if ("CANCEL".equals(db)) {
+                sig = TaskControl.Signal.CANCEL;
+            } else if ("PAUSE".equals(db)) {
+                sig = TaskControl.Signal.PAUSE;
+            }
+        }
         if (sig == TaskControl.Signal.CANCEL) {
+            stateStore.clearControlSignal(taskId);   // 消费后清(幂等;防冗余触发)
             String msg = "任务已被用户取消。";
             stateStore.cancelTask(taskId, msg);
             bus.publish(taskId, TaskEvent.Type.CANCELLED, Map.of("status", "CANCELLED"));
@@ -330,6 +340,7 @@ public class AgentRunner {
             return msg;
         }
         if (sig == TaskControl.Signal.PAUSE) {
+            stateStore.clearControlSignal(taskId);   // 必须清:否则 resume 续跑后第一个安全点又读到 PAUSE、再次暂停
             String msg = "任务已暂停,可通过 resume 续跑。";
             stateStore.pauseTask(taskId);
             bus.publish(taskId, TaskEvent.Type.PAUSED, Map.of("status", "PAUSED"));
