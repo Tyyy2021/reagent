@@ -82,10 +82,14 @@ public class StateStore {
      * @return true = 本 worker 抢到执行权(可驱动);false = 别人持活租约,应跳过本次驱动。
      */
     @Transactional
-    public boolean claim(String taskId) {
+    public long claim(String taskId) {
         Instant now = Instant.now();
         int rows = taskRepo.claim(taskId, worker.id(), now, now.plusMillis(leaseTtlMs));
-        return rows == 1;
+        if (rows != 1) {
+            return -1L;   // 没抢到:别人持活租约
+        }
+        // 抢到了:回读本次获得的 epoch 当 fencing token(同事务;claim 已 clearAutomatically,findById 取 DB 最新值)
+        return taskRepo.findById(taskId).map(TaskEntity::getLeaseEpoch).orElse(-1L);
     }
 
     /**
@@ -93,8 +97,8 @@ public class StateStore {
      * @return true = 续上了(仍归我);false = 这任务已不归我(被接管 / 已释放),调用方据此自停(Stage3)。
      */
     @Transactional
-    public boolean renew(String taskId) {
-        return taskRepo.renew(taskId, worker.id(), Instant.now().plusMillis(leaseTtlMs)) == 1;
+    public boolean renew(String taskId, long epoch) {
+        return taskRepo.renew(taskId, worker.id(), epoch, Instant.now().plusMillis(leaseTtlMs)) == 1;
     }
 
     /** ★ M7 Stage2:失效扫描 —— 取最多 {@code limit} 个 RUNNING 且租约已过期的孤儿任务(供失败转移接管)。 */
@@ -102,18 +106,19 @@ public class StateStore {
         return taskRepo.findByStatusAndLeaseExpiresAtLessThan(TaskStatus.RUNNING, Instant.now(), Limit.of(limit));
     }
 
+    /**
+     * 完成任务(终态),带 M7 Stage3 epoch 守卫:仅当本 worker 仍持有该 epoch 的租约才写得进(顺带释放租约)。
+     * @return true=写成功;false=租约已被接管(fence)→ 调用方放弃,绝不覆盖接管者成果。
+     */
     @Transactional
-    public void completeTask(String taskId, String answer) {
-        TaskEntity t = getTask(taskId);
-        t.complete(answer);
-        taskRepo.save(t);
+    public boolean completeTask(String taskId, String answer, long epoch) {
+        return taskRepo.completeIfOwner(taskId, worker.id(), epoch, answer, Instant.now()) == 1;
     }
 
+    /** 失败置终态,带 epoch 守卫(语义同 {@link #completeTask})。 */
     @Transactional
-    public void failTask(String taskId, String error) {
-        TaskEntity t = getTask(taskId);
-        t.fail(error);
-        taskRepo.save(t);
+    public boolean failTask(String taskId, String error, long epoch) {
+        return taskRepo.failIfOwner(taskId, worker.id(), epoch, error, Instant.now()) == 1;
     }
 
     /** M4:用户取消(终态)。 */

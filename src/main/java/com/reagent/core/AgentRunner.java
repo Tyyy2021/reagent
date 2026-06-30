@@ -167,10 +167,11 @@ public class AgentRunner {
             return "任务已在执行中,本次重复驱动已跳过。";
         }
         try {
-            // M7:跨【进程】护栏 —— 原子 claim 抢租约,只有持租约的 worker 才驱动。替掉了过去"凡 RUNNING
-            // 都是我崩的、全量抢来恢复"的单机假设:别的 worker 正在跑的任务(租约被心跳续着、未过期)会在此
-            // claim 失败、被干净跳过,不被误抢。InFlightTasks 只能管 JVM 内,跨进程同源竞态由这道 DB 租约收口。
-            if (!stateStore.claim(taskId)) {
+            // M7:跨【进程】护栏 —— 原子 claim 抢租约,返回本次持有的 epoch(fencing token,Stage3 用);<0=没抢到。
+            // 替掉过去"凡 RUNNING 都是我崩的、全量抢恢复"的单机假设:别的 worker 正跑的任务(租约被心跳续着、
+            // 未过期)在此 claim 失败被干净跳过。InFlightTasks 只管 JVM 内,跨进程同源竞态由这道 DB 租约收口。
+            long myEpoch = stateStore.claim(taskId);
+            if (myEpoch < 0) {
                 log.warn("任务 {} 被其它 worker 持有(claim 失败),跳过本次驱动。", taskId);
                 return "任务已被其它 worker 持有,本次驱动跳过。";
             }
@@ -180,12 +181,12 @@ public class AgentRunner {
                 int attempt = stateStore.incrementRecoveryCount(taskId);
                 if (attempt > maxAttempts) {
                     log.warn("任务 {} 已自动恢复 {} 次仍未完成,超上限 {},止损标记 FAILED。", taskId, attempt - 1, maxAttempts);
-                    stateStore.failTask(taskId, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。");
+                    stateStore.failTask(taskId, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。", myEpoch);
                     return "超过最大自动恢复次数,已止损标记 FAILED。";
                 }
                 log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
             }
-            taskControl.begin(taskId);   // 登记驱动线程 + 打断信号槽(M4 Stage3)
+            taskControl.begin(taskId, myEpoch);   // 登记驱动线程 + 打断信号槽 + 本次租约 epoch(M4 / M7 Stage3)
             // M6:任务 root span —— 用 taskId 派生 traceId,新任务与每次恢复都落在【同一条 trace】下(跨崩溃可视);
             // root 不继承 HTTP 请求的 trace(任务与连接解耦、活得比连接长),与 M4 解耦一脉相承。
             Span taskSpan = tracer.spanBuilder("agent.task")
@@ -197,7 +198,7 @@ public class AgentRunner {
                     .setAttribute(Trace.WORKER_ID, workerIdentity.id())   // M7:标出本次由哪个 worker 驱动(失败转移后可见接管)
                     .startSpan();
             try (Scope ignored = taskSpan.makeCurrent()) {
-                return driveLoop(taskId);
+                return driveLoop(taskId, myEpoch);
             } catch (RuntimeException ex) {
                 taskSpan.recordException(ex);
                 taskSpan.setStatus(StatusCode.ERROR);
@@ -217,7 +218,7 @@ public class AgentRunner {
     }
 
     /** 实际的 ReAct 驱动循环(被 {@link #drive} 包上"同一任务单飞"护栏后调用)。 */
-    private String driveLoop(String taskId) {
+    private String driveLoop(String taskId, long myEpoch) {
         Context ctx = stateStore.loadContext(taskId);
         // 本任务的工具执行上下文:taskId + 独立工作目录(沙箱 cwd / 挂载点),一次解析、全程复用
         ToolContext toolCtx = new ToolContext(taskId, workspaceManager.workspaceFor(taskId));
@@ -257,10 +258,14 @@ public class AgentRunner {
                     if (decision.isFinal()) {
                         stateStore.appendAssistant(taskId, decision.getAssistantMessage());
                         ctx.addAssistant(decision.getAssistantMessage());
-                        stateStore.completeTask(taskId, decision.getAnswer());
-                        bus.publish(taskId, TaskEvent.Type.COMPLETED, Map.of("result", String.valueOf(decision.getAnswer())));
-                        log.info("====== 任务完成 ======\n{}", decision.getAnswer());
-                        return decision.getAnswer();
+                        // M7 Stage3:带 epoch 守卫写终态 —— 若期间被其它 worker 接管(fence),写 0 行→放弃,绝不覆盖接管者
+                        if (stateStore.completeTask(taskId, decision.getAnswer(), myEpoch)) {
+                            bus.publish(taskId, TaskEvent.Type.COMPLETED, Map.of("result", String.valueOf(decision.getAnswer())));
+                            log.info("====== 任务完成 ======\n{}", decision.getAnswer());
+                            return decision.getAnswer();
+                        }
+                        log.warn("任务 {} 写 COMPLETED 时发现租约已易主(被接管),放弃写终态、交接管者。", taskId);
+                        return "任务已被其它 worker 接管,放弃写终态。";
                     }
 
                     // 4. 大脑要调工具:先落库 assistant(顺带登记 PENDING 账本),再执行
@@ -278,8 +283,9 @@ public class AgentRunner {
 
             log.warn("达到最大步数 {},任务未在限定步数内完成。", MAX_STEPS);
             String msg = "达到最大步数(" + MAX_STEPS + "),任务未能完成。";
-            stateStore.failTask(taskId, msg);
-            bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", msg));
+            if (stateStore.failTask(taskId, msg, myEpoch)) {
+                bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", msg));
+            }
             return msg;
 
         } catch (RuntimeException ex) {
@@ -293,8 +299,9 @@ public class AgentRunner {
                 return "进程关闭,任务将于重启后恢复。";
             }
             log.error("任务 {} 执行异常,标记 FAILED", taskId, ex);
-            stateStore.failTask(taskId, "执行异常: " + ex.getMessage());
-            bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", String.valueOf(ex.getMessage())));
+            if (stateStore.failTask(taskId, "执行异常: " + ex.getMessage(), myEpoch)) {
+                bus.publish(taskId, TaskEvent.Type.FAILED, Map.of("error", String.valueOf(ex.getMessage())));
+            }
             return "任务执行失败:" + ex.getMessage();
         }
     }
@@ -310,6 +317,11 @@ public class AgentRunner {
      */
     private String checkInterrupt(String taskId) {
         TaskControl.Signal sig = taskControl.signalOf(taskId);
+        if (sig == TaskControl.Signal.FENCED) {
+            // M7 Stage3:租约已被其它 worker 接管 —— 本 worker 干净停手,且【绝不改任务状态】(状态归接管者)。
+            log.warn("任务 {} 被 fence(租约已易主),在安全点停止驱动、不动状态(交接管者续跑)。", taskId);
+            return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
+        }
         if (sig == TaskControl.Signal.CANCEL) {
             String msg = "任务已被用户取消。";
             stateStore.cancelTask(taskId, msg);

@@ -52,13 +52,38 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
               @Param("expires") Instant expires);
 
     /**
-     * ★ M7 Stage2:心跳续租 —— 仅当任务仍归我({@code owner_id = :me})才把租约往后续。
-     * 不动 owner、不动 epoch(续租不是改所有权)。返回 0 = 这任务已不归我了(被接管 / 已释放)。
+     * ★ M7 Stage2/3:心跳续租 —— 仅当任务仍归我({@code owner_id = :me})【且 epoch 仍是我持有的那次】才续。
+     * 不动 owner、不动 epoch(续租不改所有权)。返回 0 = 已被别的 worker claim 接管(epoch 已 +1)→ 调用方据此 fence。
      */
     @Modifying(clearAutomatically = true)
     @Query("""
             UPDATE TaskEntity t SET t.leaseExpiresAt = :expires
-             WHERE t.id = :id AND t.ownerId = :me
+             WHERE t.id = :id AND t.ownerId = :me AND t.leaseEpoch = :epoch
             """)
-    int renew(@Param("id") String id, @Param("me") String me, @Param("expires") Instant expires);
+    int renew(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch, @Param("expires") Instant expires);
+
+    /**
+     * ★ M7 Stage3:带 epoch 守卫地置【完成】终态(fencing)。仅当任务仍归我且 epoch 未变才写得进,
+     * 顺带释放租约(owner/lease 置空)。返回 0 = 期间已被接管 → 调用方放弃,绝不覆盖接管者成果。
+     */
+    @Modifying(clearAutomatically = true)
+    @Query("""
+            UPDATE TaskEntity t
+               SET t.status = com.reagent.persist.TaskStatus.COMPLETED,
+                   t.result = :result, t.ownerId = NULL, t.leaseExpiresAt = NULL, t.updatedAt = :now
+             WHERE t.id = :id AND t.ownerId = :me AND t.leaseEpoch = :epoch
+            """)
+    int completeIfOwner(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch,
+                        @Param("result") String result, @Param("now") Instant now);
+
+    /** ★ M7 Stage3:带 epoch 守卫地置【失败】终态(同 {@link #completeIfOwner})。 */
+    @Modifying(clearAutomatically = true)
+    @Query("""
+            UPDATE TaskEntity t
+               SET t.status = com.reagent.persist.TaskStatus.FAILED,
+                   t.result = :error, t.ownerId = NULL, t.leaseExpiresAt = NULL, t.updatedAt = :now
+             WHERE t.id = :id AND t.ownerId = :me AND t.leaseEpoch = :epoch
+            """)
+    int failIfOwner(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch,
+                    @Param("error") String error, @Param("now") Instant now);
 }
