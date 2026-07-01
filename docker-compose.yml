@@ -1,0 +1,52 @@
+# ReAgent 依赖一键起:MySQL(持久化/断点续跑)+ Redis(M7 跨 worker 流式)+ Jaeger(M6 全链路 trace)
+#
+# 用法:
+#   docker compose up -d          # 起三件套(首次会拉镜像)
+#   export DEEPSEEK_API_KEY=sk-xxx
+#   mvn spring-boot:run           # 再跑 app(端口默认对齐 application.yml)
+#   docker compose down           # 停;down -v 连数据卷一起删
+#
+# 注意:端口对齐 application.yml 默认值(3306/6379/4318)。若本机已跑着 MySQL/Redis,
+#       先停掉本地实例或改这里的宿主端口,免得冲突。
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: reagent-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root       # 对齐 application.yml 的 ${MYSQL_PASSWORD:root}
+      MYSQL_DATABASE: reagent         # 自动建库,省去手动 CREATE DATABASE
+      TZ: Asia/Shanghai
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    ports:
+      - "3306:3306"
+    volumes:
+      - reagent-mysql-data:/var/lib/mysql
+    healthcheck:                       # app 等 MySQL ready 再连,避免启动竞态
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: reagent-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: reagent-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"   # 开 OTLP 接收(app 的 tracing.otlp-endpoint 指向 4318)
+    ports:
+      - "16686:16686"                  # Jaeger UI:浏览器开 http://localhost:16686 看 trace
+      - "4318:4318"                    # OTLP/HTTP 收集端点
+    restart: always                    # 踩过 all-in-one 容器莫名 Exited(0),加 restart 兜底
+
+volumes:
+  reagent-mysql-data:

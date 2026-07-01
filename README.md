@@ -5,6 +5,8 @@
 
 `Java 21` · `Spring Boot 3` · `Spring Data JPA` · `MySQL` · `Redis` · `docker-java` · `JDK21 虚拟线程`
 
+[![CI](https://github.com/Tyyy2021/reagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Tyyy2021/reagent/actions/workflows/ci.yml)
+
 ---
 
 ## 它解决什么
@@ -150,30 +152,32 @@ com.reagent
 
 > 沙箱依赖 Linux 进程组 / cgroup,请在 **Linux 或 WSL2** 上运行(非纯 Windows 原生)。
 
-**前置**:JDK 21、MySQL 8、(可选)Docker——子进程沙箱是默认,无 Docker 也能跑。
+**前置**:JDK 21;Docker(用 `docker compose` 一键起依赖,见下)。构建用自带的 **Maven Wrapper**(`./mvnw`),无需本机装 Maven。
 
 ```bash
-# 1. MySQL:建库(建表由 JPA ddl-auto=update 首次启动自动完成)
-CREATE DATABASE reagent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-# 默认连 localhost:3306 root/root;不同就设 MYSQL_USER / MYSQL_PASSWORD 或改 application.yml
+# 1. 起依赖:MySQL(自动建 reagent 库)+ Redis + Jaeger,一键拉起
+docker compose up -d
+#   需 Docker Compose 插件(docker compose version 能显示版本);没有则手动装 MySQL8 + Redis,并建库:
+#   CREATE DATABASE reagent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+#   默认连 localhost:3306 root/root;不同就设 MYSQL_USER / MYSQL_PASSWORD 或改 application.yml
 
 # 2. 模型:DeepSeek API key 走环境变量(不进代码)
 export DEEPSEEK_API_KEY=sk-xxxx       # 备选通义 / Ollama 见 application.yml 注释
 
-# 3. 启动(默认子进程沙箱)
-mvn spring-boot:run
-#   走 Docker 沙箱:mvn spring-boot:run -Dspring-boot.run.arguments=--reagent.sandbox.type=docker
+# 3. 启动(默认子进程沙箱;建表由 JPA ddl-auto=update 首次启动自动完成)
+./mvnw spring-boot:run
+#   走 Docker 沙箱:./mvnw spring-boot:run -Dspring-boot.run.arguments=--reagent.sandbox.type=docker
 
-# 看到 "Started ReAgentApplication" + "启动检查:..." 即成功(端口 8080)
+# 看到 "Started ReAgentApplication" + "启动检查:..." 即成功(端口 8080);Jaeger UI http://localhost:16686
 ```
 
 **多 worker 模式(M7)**:装 Redis(`redis-server`),起多个实例连同库同 Redis:
 
 ```bash
 # worker A
-mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8080 --reagent.streaming.transport=redis --reagent.worker.id=A"
+./mvnw spring-boot:run -Dspring-boot.run.arguments="--server.port=8080 --reagent.streaming.transport=redis --reagent.worker.id=A"
 # worker B(另一终端)
-mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081 --reagent.streaming.transport=redis --reagent.worker.id=B"
+./mvnw spring-boot:run -Dspring-boot.run.arguments="--server.port=8081 --reagent.streaming.transport=redis --reagent.worker.id=B"
 ```
 
 强杀 A,它在跑的任务被 B 在租约过期后自动 `claim` 接管续跑;客户端连 B 的 `/stream` 能看到在 A(或接管后)跑的任务**实时 token 流**。workspace-root 指向所有 worker 共享挂载的盘(本地同机天然共享;生产用 NFS/EFS)。
@@ -186,6 +190,12 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081 --reagent.st
 - **流式 + 打断 + 重连**:`POST /api/tasks` 立返 taskId;`GET /{id}/stream` 看实时 token / 事件流;`POST /{id}/cancel`(`?force` 硬杀)/ `pause` / `resume`;断开后带 `Last-Event-ID` 重连,精确补播断点之后的事件。
 
 ## 验证
+
+一键跑全部测试(不依赖 MySQL / Redis;有 Docker 时沙箱用例也真跑):
+
+```bash
+./mvnw test          # 54 个测试,全绿
+```
 
 54 个单测(账本状态机迁移 / 幂等分级 fail-closed / 子进程沙箱死循环硬杀 / Docker 隔离 / workspace 遏制 / journal 读写 / 流式 delta 拼装 + token usage / **事件总线补播不漏不重并发压测** / **跨虚拟线程 trace context 传播** / taskId 派生 traceId)+ 两条 e2e:① **崩溃注入**——伪造「崩在记账前」,验证 journal 在 → 对账标 `DONE` 不重放、journal 删 → 上报 in-doubt,两分支副作用都不重跑;② **断线重连续播**——首连收若干事件后断开,带 `Last-Event-ID` 重连,精确补播断点之后的每个事件、不漏不重、追平 `COMPLETED`;③ **M7 跨 worker**(真机双 worker 同库同 Redis)——A `submit` 的任务事件经 Redis Streams 被 B 进程**实时收到**(token 级跨机),接管 worker `checkout` 到同一 workspace;另以 SQL 镜像 / HTTP 端到端验 claim CAS、fence epoch 守卫、跨机 cancel 落 DB 信号。
 

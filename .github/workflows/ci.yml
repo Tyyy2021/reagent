@@ -1,0 +1,27 @@
+name: CI
+
+# push 到 main / 提 PR 时自动跑 54 个测试(不依赖 MySQL/Redis,runner 自带 Docker 让沙箱用例也真跑)
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest        # 自带 Docker daemon -> DockerSandboxTest 能真跑
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Pull sandbox image  # 预拉镜像,否则 Docker 沙箱用例会被 assumeTrue 跳过(而非真跑)
+        run: docker pull python:3.12-slim
+
+      - name: Run tests
+        run: ./mvnw -B test
