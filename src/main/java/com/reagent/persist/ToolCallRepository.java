@@ -7,6 +7,4 @@ import java.util.Optional;
 public interface ToolCallRepository extends JpaRepository<ToolCallEntity, String> {
 
     Optional<ToolCallEntity> findByIdAndTaskId(String id, String taskId);
-
-    boolean existsByIdAndTaskIdNot(String id, String taskId);
 }

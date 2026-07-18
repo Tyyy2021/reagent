@@ -312,12 +312,12 @@ public class StateStore {
 
     /** 返回本任务账本行；同 ID 已属于其它任务时在调用方修改任何实体前 fail closed。 */
     private Optional<ToolCallEntity> ownedToolCall(String taskId, String toolCallId) {
-        Optional<ToolCallEntity> owned = toolCallRepo.findByIdAndTaskId(toolCallId, taskId);
-        if (owned.isEmpty() && toolCallRepo.existsByIdAndTaskIdNot(toolCallId, taskId)) {
+        Optional<ToolCallEntity> existing = toolCallRepo.findById(toolCallId);
+        if (existing.isPresent() && !taskId.equals(existing.orElseThrow().getTaskId())) {
             throw new IllegalStateException(
                     "tool_call_id 已属于其它任务: " + toolCallId + ", 当前任务: " + taskId);
         }
-        return owned;
+        return existing;
     }
 
     private int appendMessage(String taskId, String role, String content,
