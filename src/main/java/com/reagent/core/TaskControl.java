@@ -2,7 +2,8 @@ package com.reagent.core;
 
 import org.springframework.stereotype.Component;
 
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -10,7 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * 任务打断控制(M4 Stage3 起;M7 Stage3 加 fencing)。与 {@link InFlightTasks}(单飞护栏)分开,避免动它已有的测试。
  *
  * <p>每个正被 {@code drive} 的任务登记一个 {@link Handle}:打断信号(NONE/PAUSE/CANCEL/FENCED)+ force 标志 +
- * 驱动线程引用 + 本次驱动持有的租约 epoch。取消/暂停端点在 Tomcat 线程上设信号、心跳线程发现租约被接管时设
+ * 驱动线程引用 + 本次驱动持有的完整 run token。取消/暂停端点在 Tomcat 线程上设信号、心跳线程发现租约被接管时设
  * FENCED,drive 循环在 agent 虚拟线程上于<b>安全点</b>查信号——用并发容器兜住跨线程。</p>
  */
 @Component
@@ -23,22 +24,22 @@ public class TaskControl {
         private volatile Signal signal = Signal.NONE;
         private volatile boolean force = false;
         private final Thread driver;
-        /** M7 Stage3:本次驱动持有的租约 epoch(fencing token);心跳据此带 epoch 续租。 */
-        private final long epoch;
+        /** M7 Stage3:本次驱动持有的完整 run token;心跳据此续租。 */
+        private final TaskRunToken token;
 
-        Handle(Thread driver, long epoch) { this.driver = driver; this.epoch = epoch; }
+        Handle(Thread driver, TaskRunToken token) { this.driver = driver; this.token = token; }
 
         public Signal signal() { return signal; }
         public boolean force() { return force; }
         public Thread driver() { return driver; }
-        public long epoch() { return epoch; }
+        public TaskRunToken token() { return token; }
     }
 
     private final ConcurrentHashMap<String, Handle> handles = new ConcurrentHashMap<>();
 
-    /** drive 开始时登记当前(虚拟)线程为该任务的驱动线程,并记下本次驱动持有的租约 epoch。 */
-    public void begin(String taskId, long epoch) {
-        handles.put(taskId, new Handle(Thread.currentThread(), epoch));
+    /** drive 开始时登记当前(虚拟)线程为该任务的驱动线程,并记下本次驱动持有的 run token。 */
+    public void begin(TaskRunToken token) {
+        handles.put(token.taskId(), new Handle(Thread.currentThread(), token));
     }
 
     /** drive 结束时注销。 */
@@ -96,10 +97,10 @@ public class TaskControl {
         return handles.containsKey(taskId);
     }
 
-    /** ★ M7 Stage3:本进程当前在驱动的任务 → 其持有 epoch 的快照(供心跳带 epoch 续租)。 */
-    public Map<String, Long> ownedEpochs() {
-        Map<String, Long> m = new HashMap<>();
-        handles.forEach((id, h) -> m.put(id, h.epoch()));
-        return m;
+    /** ★ M7 Stage3:本进程当前在驱动的任务 → 其 run token 快照(供心跳续租)。 */
+    public List<TaskRunToken> ownedTokens() {
+        List<TaskRunToken> tokens = new ArrayList<>();
+        handles.forEach((id, handle) -> tokens.add(handle.token()));
+        return List.copyOf(tokens);
     }
 }

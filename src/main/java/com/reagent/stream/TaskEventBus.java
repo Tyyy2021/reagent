@@ -1,8 +1,10 @@
 package com.reagent.stream;
 
+import com.reagent.core.TaskRunToken;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
+import java.time.Clock;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -26,6 +28,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public class TaskEventBus implements StreamTransport {
 
     private final EventStore eventStore;
+    private final Clock clock;
 
     /** taskId -> 该任务当前订阅者。subscribe 建条目、最后一个退订删条目;publish 不建条目(无订阅者=零开销、无泄漏)。 */
     private final ConcurrentHashMap<String, CopyOnWriteArrayList<EventSink>> subscribers = new ConcurrentHashMap<>();
@@ -33,8 +36,9 @@ public class TaskEventBus implements StreamTransport {
     /** taskId -> 每任务一把锁:串行化 {publish 的 持久化+多播} 与 {subscribeWithReplay 的 补播+挂载},消解补播/live 交错。 */
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
 
-    public TaskEventBus(EventStore eventStore) {
+    public TaskEventBus(EventStore eventStore, Clock clock) {
         this.eventStore = eventStore;
+        this.clock = clock;
     }
 
     private Object lockFor(String taskId) {
@@ -43,11 +47,26 @@ public class TaskEventBus implements StreamTransport {
 
     @Override
     public TaskEvent publish(String taskId, TaskEvent.Type type, Object data) {
+        return publish(taskId, null, type, data);
+    }
+
+    @Override
+    public TaskEvent publish(TaskRunToken token, TaskEvent.Type type, Object data) {
+        return publish(token.taskId(), token, type, data);
+    }
+
+    private TaskEvent publish(String taskId, TaskRunToken token, TaskEvent.Type type, Object data) {
         Object lock = lockFor(taskId);
         synchronized (lock) {
             // 非 TOKEN 先落 event 表,拿回行 id(十进制串)作 durable 游标(在多播【之前】commit);TOKEN 高频易逝 -> 不落库、eventId=null
-            String eventId = (type == TaskEvent.Type.TOKEN) ? null : String.valueOf(eventStore.append(taskId, type, data));
-            TaskEvent event = TaskEvent.of(taskId, eventId, type, data);
+            String eventId = null;
+            if (type != TaskEvent.Type.TOKEN) {
+                long durableId = token == null
+                        ? eventStore.append(taskId, type, data)
+                        : eventStore.appendFenced(token, type, data);
+                eventId = String.valueOf(durableId);
+            }
+            TaskEvent event = TaskEvent.of(taskId, eventId, type, data, clock.instant());
             multicast(taskId, event);
             if (event.isTerminal()) {
                 locks.remove(taskId, lock);   // 终态回收(同一把锁才删,防误删并发刚新建的)

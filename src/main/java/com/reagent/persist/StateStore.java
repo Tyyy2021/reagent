@@ -3,6 +3,7 @@ package com.reagent.persist;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.Context;
+import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
 import com.reagent.core.WorkerIdentity;
 import org.springframework.beans.factory.annotation.Value;
@@ -10,11 +11,13 @@ import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * ★ M2 的核心:状态存储层。把内存里的 agent 运行状态"投影"到数据库,并能反向重建。
@@ -37,17 +40,23 @@ public class StateStore {
     private final ObjectMapper mapper;
     private final WorkerIdentity worker;        // M7:本 worker 身份(claim 的 owner)
     private final long leaseTtlMs;              // M7:租约时长
+    private final Clock clock;
+    private final TaskLeaseGuard leaseGuard;
 
     public StateStore(TaskRepository taskRepo, MessageRepository messageRepo,
                       ToolCallRepository toolCallRepo, ObjectMapper mapper,
                       WorkerIdentity worker,
-                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs) {
+                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs,
+                      Clock clock,
+                      TaskLeaseGuard leaseGuard) {
         this.taskRepo = taskRepo;
         this.messageRepo = messageRepo;
         this.toolCallRepo = toolCallRepo;
         this.mapper = mapper;
         this.worker = worker;
         this.leaseTtlMs = leaseTtlMs;
+        this.clock = clock;
+        this.leaseGuard = leaseGuard;
     }
 
     // ===================== 任务生命周期 =====================
@@ -57,11 +66,12 @@ public class StateStore {
     public TaskEntity createTask(String goal, String systemPrompt) {
         // M7:新任务出生即认领租约(owner=本 worker),避免出现"无主 RUNNING"空窗 —— 否则创建者若在
         // createTask 与首次 drive 之间崩了,该任务会成 owner=null/lease=null 的孤儿,失效扫描(只盯过期租约)永远漏掉。
-        TaskEntity t = TaskEntity.newTask(goal);
-        t.assignLease(worker.id(), Instant.now().plusMillis(leaseTtlMs));
+        Instant now = clock.instant();
+        TaskEntity t = TaskEntity.newTask(goal, now);
+        t.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
         TaskEntity task = taskRepo.save(t);
-        appendMessage(task.getId(), "system", systemPrompt, null, null);
-        appendMessage(task.getId(), "user", goal, null, null);
+        appendMessage(task.getId(), "system", systemPrompt, null, null, now);
+        appendMessage(task.getId(), "user", goal, null, null, now);
         return task;
     }
 
@@ -79,17 +89,17 @@ public class StateStore {
      * ★ M7 Stage1:抢占任务执行租约(原子 claim 的薄封装)。委托 {@link TaskRepository#claim} 做
      * 单条条件 UPDATE,owner=本 worker、续租 {@code leaseTtlMs}。
      *
-     * @return true = 本 worker 抢到执行权(可驱动);false = 别人持活租约,应跳过本次驱动。
+     * @return 本 worker 抢到执行权时返回完整 run token；别人持活租约时返回 empty。
      */
     @Transactional
-    public long claim(String taskId) {
-        Instant now = Instant.now();
+    public Optional<TaskRunToken> claim(String taskId) {
+        Instant now = clock.instant();
         int rows = taskRepo.claim(taskId, worker.id(), now, now.plusMillis(leaseTtlMs));
         if (rows != 1) {
-            return -1L;   // 没抢到:别人持活租约
+            return Optional.empty();
         }
-        // 抢到了:回读本次获得的 epoch 当 fencing token(同事务;claim 已 clearAutomatically,findById 取 DB 最新值)
-        return taskRepo.findById(taskId).map(TaskEntity::getLeaseEpoch).orElse(-1L);
+        return taskRepo.findById(taskId)
+                .map(task -> new TaskRunToken(taskId, worker.id(), task.getLeaseEpoch()));
     }
 
     /**
@@ -97,13 +107,14 @@ public class StateStore {
      * @return true = 续上了(仍归我);false = 这任务已不归我(被接管 / 已释放),调用方据此自停(Stage3)。
      */
     @Transactional
-    public boolean renew(String taskId, long epoch) {
-        return taskRepo.renew(taskId, worker.id(), epoch, Instant.now().plusMillis(leaseTtlMs)) == 1;
+    public boolean renew(TaskRunToken token) {
+        return taskRepo.renew(token.taskId(), token.workerId(), token.leaseEpoch(),
+                clock.instant().plusMillis(leaseTtlMs)) == 1;
     }
 
     /** ★ M7 Stage2:失效扫描 —— 取最多 {@code limit} 个 RUNNING 且租约已过期的孤儿任务(供失败转移接管)。 */
-    public List<TaskEntity> findExpired(int limit) {
-        return taskRepo.findByStatusAndLeaseExpiresAtLessThan(TaskStatus.RUNNING, Instant.now(), Limit.of(limit));
+    public List<TaskEntity> findRecoverable(int limit) {
+        return taskRepo.findRecoverable(clock.instant(), Limit.of(limit));
     }
 
     // ===================== M7 Stage4:跨 worker 控制面 =====================
@@ -122,55 +133,60 @@ public class StateStore {
 
     /** ★ M7 Stage4:owner 消费信号后清回 NONE。 */
     @Transactional
-    public void clearControlSignal(String taskId) {
-        taskRepo.clearControlSignal(taskId);
+    public void clearControlSignal(TaskRunToken token) {
+        leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        taskRepo.clearControlSignal(token.taskId());
     }
 
     /**
-     * 完成任务(终态),带 M7 Stage3 epoch 守卫:仅当本 worker 仍持有该 epoch 的租约才写得进(顺带释放租约)。
-     * @return true=写成功;false=租约已被接管(fence)→ 调用方放弃,绝不覆盖接管者成果。
+     * 完成任务(终态),带 M7 Stage3 token 守卫:仅当本 worker 仍持有该 epoch 的租约才写得进(顺带释放租约)。
+     * 租约已被接管时抛 {@code FencedExecutionException}，调用方必须停手。
      */
     @Transactional
-    public boolean completeTask(String taskId, String answer, long epoch) {
-        return taskRepo.completeIfOwner(taskId, worker.id(), epoch, answer, Instant.now()) == 1;
+    public void completeTask(TaskRunToken token, String answer) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.complete(answer, clock.instant());
+        taskRepo.save(task);
     }
 
     /** 失败置终态,带 epoch 守卫(语义同 {@link #completeTask})。 */
     @Transactional
-    public boolean failTask(String taskId, String error, long epoch) {
-        return taskRepo.failIfOwner(taskId, worker.id(), epoch, error, Instant.now()) == 1;
+    public void failTask(TaskRunToken token, String error) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.fail(error, clock.instant());
+        taskRepo.save(task);
     }
 
     /** M4:用户取消(终态)。 */
     @Transactional
-    public void cancelTask(String taskId, String note) {
-        TaskEntity t = getTask(taskId);
-        t.cancel(note);
-        taskRepo.save(t);
+    public void cancelTask(TaskRunToken token, String note) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.cancel(note, clock.instant());
+        taskRepo.save(task);
     }
 
     /** M4:用户暂停(非终态,仅显式 resume 续跑)。 */
     @Transactional
-    public void pauseTask(String taskId) {
-        TaskEntity t = getTask(taskId);
-        t.pause();
-        taskRepo.save(t);
+    public void pauseTask(TaskRunToken token) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.pause(clock.instant());
+        taskRepo.save(task);
     }
 
     /** M4:PAUSED -> RUNNING(resume 续跑前)。 */
     @Transactional
     public void markRunning(String taskId) {
         TaskEntity t = getTask(taskId);
-        t.markRunning();
+        t.markRunning(clock.instant());
         taskRepo.save(t);
     }
 
     /** 崩溃恢复:把该任务的恢复计数 +1 并持久化,返回新的计数值(这是第几次恢复)。 */
     @Transactional
-    public int incrementRecoveryCount(String taskId) {
-        TaskEntity t = getTask(taskId);
-        int n = t.incrementRecovery();
-        taskRepo.save(t);
+    public int incrementRecoveryCount(TaskRunToken token) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        int n = task.incrementRecovery(clock.instant());
+        taskRepo.save(task);
         return n;
     }
 
@@ -181,12 +197,14 @@ public class StateStore {
      * content 可能为 null(模型只调工具、不带文本时)。
      */
     @Transactional
-    public void appendAssistant(String taskId, Map<String, Object> assistantMessage) {
+    public int appendAssistant(TaskRunToken token, Map<String, Object> assistantMessage) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
         String content = asStringOrNull(assistantMessage.get("content"));
         Object toolCalls = assistantMessage.get("tool_calls");
         String toolCallsJson = toolCalls == null ? null : toJson(toolCalls);
 
-        appendMessage(taskId, "assistant", content, toolCallsJson, null);
+        int sequence = appendMessage(task.getId(), "assistant", content, toolCallsJson, null, now);
 
         if (toolCalls instanceof List<?> list) {
             for (Object o : list) {
@@ -197,10 +215,11 @@ public class StateStore {
                 String args = asArguments(fn.get("arguments"));
                 // 同一 id 不重复登记(恢复路径里 assistant 不会被重复落库,这里仅作防御)
                 if (!toolCallRepo.existsById(id)) {
-                    toolCallRepo.save(new ToolCallEntity(id, taskId, name, args));
+                    toolCallRepo.save(new ToolCallEntity(id, task.getId(), name, args, now));
                 }
             }
         }
+        return sequence;
     }
 
     /**
@@ -209,10 +228,13 @@ public class StateStore {
      * attemptCount 也在此 +1,供 per-tool 重试上限止损。
      */
     @Transactional
-    public void markInProgress(String taskId, ToolCall call) {
+    public void markInProgress(TaskRunToken token, ToolCall call) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
         ToolCallEntity e = toolCallRepo.findById(call.id())
-                .orElseGet(() -> new ToolCallEntity(call.id(), taskId, call.name(), call.arguments()));
-        e.markInProgress();
+                .orElseGet(() -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(), now));
+        e.markInProgress(now);
         toolCallRepo.save(e);
     }
 
@@ -221,12 +243,15 @@ public class StateStore {
      * 二者在同一事务里,尽量缩小"账本与消息不一致"的窗口。
      */
     @Transactional
-    public void recordToolResult(String taskId, ToolCall call, String result) {
+    public void recordToolResult(TaskRunToken token, ToolCall call, String result) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
         ToolCallEntity e = toolCallRepo.findById(call.id())
-                .orElseGet(() -> new ToolCallEntity(call.id(), taskId, call.name(), call.arguments()));
-        e.markDone(result);
+                .orElseGet(() -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(), now));
+        e.markDone(result, now);
         toolCallRepo.save(e);
-        appendMessage(taskId, "tool", result, null, call.id());
+        appendMessage(task.getId(), "tool", result, null, call.id(), now);
     }
 
     /**
@@ -234,12 +259,15 @@ public class StateStore {
      * (把"未知"作为观察回给模型,既满足"每个 tool_call 必有结果"的协议,又绝不替它重放副作用)。
      */
     @Transactional
-    public void markInDoubt(String taskId, ToolCall call, String result) {
+    public void markInDoubt(TaskRunToken token, ToolCall call, String result) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
         ToolCallEntity e = toolCallRepo.findById(call.id())
-                .orElseGet(() -> new ToolCallEntity(call.id(), taskId, call.name(), call.arguments()));
-        e.markInDoubt(result);
+                .orElseGet(() -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(), now));
+        e.markInDoubt(result, now);
         toolCallRepo.save(e);
-        appendMessage(taskId, "tool", result, null, call.id());
+        appendMessage(task.getId(), "tool", result, null, call.id(), now);
     }
 
     /** 账本当前状态(用于恢复决策表);账本里没有这条 = 从没登记过 → 当 PENDING(安全重跑)处理。 */
@@ -278,10 +306,12 @@ public class StateStore {
 
     // ===================== 内部小工具 =====================
 
-    private void appendMessage(String taskId, String role, String content,
-                               String toolCallsJson, String toolCallId) {
-        int seq = messageRepo.countByTaskId(taskId);
-        messageRepo.save(new MessageEntity(taskId, seq, role, content, toolCallsJson, toolCallId));
+    private int appendMessage(String taskId, String role, String content,
+                              String toolCallsJson, String toolCallId, Instant now) {
+        int seq = messageRepo.nextSequenceForLockedTask(taskId);
+        messageRepo.save(new MessageEntity(
+                taskId, seq, role, content, toolCallsJson, toolCallId, now));
+        return seq;
     }
 
     private static String asStringOrNull(Object o) {

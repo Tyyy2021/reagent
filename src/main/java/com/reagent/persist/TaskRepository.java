@@ -1,15 +1,22 @@
 package com.reagent.persist;
 
+import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 public interface TaskRepository extends JpaRepository<TaskEntity, String> {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select t from TaskEntity t where t.id = :id")
+    Optional<TaskEntity> findByIdForUpdate(@Param("id") String id);
 
     /** 崩溃恢复用:启动时找出所有"卡在进行中"的任务 */
     List<TaskEntity> findByStatus(TaskStatus status);
@@ -19,7 +26,13 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
      * {@code leaseExpiresAt < now}:owner=null 的新任务(lease=null,NULL 比较为 unknown)天然不会被选中。
      * 用 {@link Limit} 限批,避免一个 worker 一次抢太多。
      */
-    List<TaskEntity> findByStatusAndLeaseExpiresAtLessThan(TaskStatus status, Instant now, Limit limit);
+    @Query("""
+           select t from TaskEntity t
+            where t.status = com.reagent.persist.TaskStatus.RUNNING
+              and (t.ownerId is null or t.leaseExpiresAt < :now)
+            order by t.updatedAt asc
+           """)
+    List<TaskEntity> findRecoverable(@Param("now") Instant now, Limit limit);
 
     /**
      * ★ M7 Stage1:原子 claim —— 抢占某任务的执行租约。
@@ -61,31 +74,6 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
              WHERE t.id = :id AND t.ownerId = :me AND t.leaseEpoch = :epoch
             """)
     int renew(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch, @Param("expires") Instant expires);
-
-    /**
-     * ★ M7 Stage3:带 epoch 守卫地置【完成】终态(fencing)。仅当任务仍归我且 epoch 未变才写得进,
-     * 顺带释放租约(owner/lease 置空)。返回 0 = 期间已被接管 → 调用方放弃,绝不覆盖接管者成果。
-     */
-    @Modifying(clearAutomatically = true)
-    @Query("""
-            UPDATE TaskEntity t
-               SET t.status = com.reagent.persist.TaskStatus.COMPLETED,
-                   t.result = :result, t.ownerId = NULL, t.leaseExpiresAt = NULL, t.updatedAt = :now
-             WHERE t.id = :id AND t.ownerId = :me AND t.leaseEpoch = :epoch
-            """)
-    int completeIfOwner(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch,
-                        @Param("result") String result, @Param("now") Instant now);
-
-    /** ★ M7 Stage3:带 epoch 守卫地置【失败】终态(同 {@link #completeIfOwner})。 */
-    @Modifying(clearAutomatically = true)
-    @Query("""
-            UPDATE TaskEntity t
-               SET t.status = com.reagent.persist.TaskStatus.FAILED,
-                   t.result = :error, t.ownerId = NULL, t.leaseExpiresAt = NULL, t.updatedAt = :now
-             WHERE t.id = :id AND t.ownerId = :me AND t.leaseEpoch = :epoch
-            """)
-    int failIfOwner(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch,
-                    @Param("error") String error, @Param("now") Instant now);
 
     /**
      * ★ M7 Stage4:跨 worker 下达控制信号 —— 仅对仍在跑(RUNNING)的任务有意义(由其 owner 在安全点消费)。

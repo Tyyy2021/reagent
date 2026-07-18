@@ -1,9 +1,11 @@
 package com.reagent.tool;
 
+import com.reagent.core.TaskRunToken;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -71,5 +73,24 @@ class ToolContextTest {
         // resolve 遇绝对路径会直接采用它,normalize 后 startsWith 校验失败 -> 拒
         assertThrows(WorkspaceEscapeException.class,
                 () -> ctx(ws).resolveInWorkspace("/etc/passwd"));
+    }
+
+    @Test
+    void rejectsRunTokenTaskMismatch(@TempDir Path ws) {
+        TaskRunToken token = new TaskRunToken("token-task", "worker-a", 3);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new ToolContext("different-task", ws, null, Optional.of(token)));
+    }
+
+    @Test
+    void preservesRunTokenWhenBindingCall(@TempDir Path ws) {
+        TaskRunToken token = new TaskRunToken("task-with-token", "worker-a", 3);
+
+        ToolContext bound = new ToolContext(token, ws).forCall("call-1");
+
+        assertEquals(token.taskId(), bound.taskId());
+        assertEquals(Optional.of(token), bound.runToken());
+        assertEquals("call-1", bound.idempotencyKey());
     }
 }

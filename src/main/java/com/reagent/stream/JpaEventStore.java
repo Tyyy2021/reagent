@@ -2,13 +2,20 @@ package com.reagent.stream;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.core.FencedExecutionException;
+import com.reagent.core.TaskRunToken;
 import com.reagent.persist.EventEntity;
 import com.reagent.persist.EventRepository;
+import com.reagent.persist.TaskEntity;
+import com.reagent.persist.TaskRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * {@link EventStore} 的 JPA 实现 —— 事件流持久化到 {@code event} 表(自增 id = durable 游标)。
@@ -23,18 +30,36 @@ import java.util.List;
 public class JpaEventStore implements EventStore {
 
     private final EventRepository repo;
+    private final TaskRepository taskRepository;
     private final ObjectMapper mapper;
+    private final Clock clock;
 
-    public JpaEventStore(EventRepository repo, ObjectMapper mapper) {
+    public JpaEventStore(EventRepository repo, TaskRepository taskRepository,
+                         ObjectMapper mapper, Clock clock) {
         this.repo = repo;
+        this.taskRepository = taskRepository;
         this.mapper = mapper;
+        this.clock = clock;
     }
 
     @Override
     @Transactional
     public long append(String taskId, TaskEvent.Type type, Object data) {
-        EventEntity row = repo.save(new EventEntity(taskId, type.name(), toJson(data)));
-        return row.getId();   // IDENTITY 策略:save/flush 后自增 id 已就位
+        return appendRow(taskId, type, data, clock.instant());
+    }
+
+    @Override
+    @Transactional
+    public long appendFenced(TaskRunToken token, TaskEvent.Type type, Object data) {
+        TaskEntity task = taskRepository.findByIdForUpdate(token.taskId())
+                .orElseThrow(() -> new FencedExecutionException(token, null, -1, null));
+        if (task.getLeaseEpoch() != token.leaseEpoch()
+                || (task.getOwnerId() != null
+                && !Objects.equals(task.getOwnerId(), token.workerId()))) {
+            throw new FencedExecutionException(
+                    token, task.getOwnerId(), task.getLeaseEpoch(), task.getStatus());
+        }
+        return appendRow(task.getId(), type, data, clock.instant());
     }
 
     @Override
@@ -55,6 +80,11 @@ public class JpaEventStore implements EventStore {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("事件负载序列化失败: " + data, e);
         }
+    }
+
+    private long appendRow(String taskId, TaskEvent.Type type, Object data, Instant now) {
+        EventEntity row = repo.save(new EventEntity(taskId, type.name(), toJson(data), now));
+        return row.getId();   // IDENTITY 策略:save/flush 后自增 id 已就位
     }
 
     private Object fromJson(String json) {

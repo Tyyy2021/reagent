@@ -1,5 +1,7 @@
 package com.reagent.stream;
 
+import com.reagent.core.TaskRunToken;
+
 /**
  * 事件流传输层抽象(M7 Stage5)。把"任务产生的事件流"与"看它的 SSE 连接"解耦,且让这层<b>可跨 worker</b>。
  *
@@ -30,8 +32,11 @@ public interface StreamTransport {
         void close();
     }
 
-    /** 发布一个事件(非 TOKEN 持久化、TOKEN live-only);返回组装好的事件便于调用方记日志。 */
+    /** 控制面发布事件；运行期事件必须使用 token overload。 */
     TaskEvent publish(String taskId, TaskEvent.Type type, Object data);
+
+    /** 发布运行期事件；非 TOKEN 持久化写受 token fence，TOKEN 只用 token 提供 live 身份。 */
+    TaskEvent publish(TaskRunToken token, TaskEvent.Type type, Object data);
 
     /**
      * 订阅:先补播 cursor 之后的历史、再无缝转 live。

@@ -1,11 +1,20 @@
 package com.reagent.stream;
 
+import com.reagent.core.TaskRunToken;
+import com.reagent.persist.StateStore;
 import com.reagent.testsupport.InfrastructureIT;
+import com.reagent.testsupport.MutableClock;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.TestPropertySource;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -23,9 +32,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "reagent.streaming.transport=redis",
         "reagent.streaming.redis-stream-ttl-sec=30"
 })
+@Import(RedisStreamTransportIT.FixedClockConfiguration.class)
 class RedisStreamTransportIT extends InfrastructureIT {
 
     private static final String KEY_PREFIX = "reagent:stream:";
+    private static final Instant TEST_NOW = Instant.parse("2026-07-18T09:00:00Z");
 
     @Autowired
     private RedisStreamTransport transport;
@@ -38,6 +49,20 @@ class RedisStreamTransportIT extends InfrastructureIT {
 
     @Autowired
     private StringRedisTemplate redis;
+
+    @Autowired
+    private StateStore stateStore;
+
+    @Test
+    void runtimeTokenUsesFencedAppendAndInjectedUtcClock() {
+        String taskId = stateStore.createTask("redis runtime event", "system").getId();
+        TaskRunToken token = stateStore.claim(taskId).orElseThrow();
+
+        TaskEvent event = transport.publish(token, TaskEvent.Type.STEP, Map.of("step", 1));
+
+        assertEquals(TEST_NOW, event.at());
+        assertEquals(List.of(TaskEvent.Type.STEP), types(eventStore.replayAfter(taskId, 0L)));
+    }
 
     @Test
     void replaysPersistedStepThenDeliversLiveToolResultWithoutLossOrDuplicate() throws InterruptedException {
@@ -129,5 +154,14 @@ class RedisStreamTransportIT extends InfrastructureIT {
 
     private static String taskId() {
         return "redis-it-" + UUID.randomUUID();
+    }
+
+    @TestConfiguration(proxyBeanMethods = false)
+    static class FixedClockConfiguration {
+        @Bean
+        @Primary
+        Clock redisIntegrationClock() {
+            return new MutableClock(TEST_NOW);
+        }
     }
 }

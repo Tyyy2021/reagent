@@ -59,18 +59,26 @@ public class ToolCallEntity {
 
     /** 新建一条待执行(PENDING)记录 */
     public ToolCallEntity(String id, String taskId, String toolName, String arguments) {
+        this(id, taskId, toolName, arguments, Instant.EPOCH);
+    }
+
+    public ToolCallEntity(String id, String taskId, String toolName, String arguments, Instant createdAt) {
         this.id = id;
         this.taskId = taskId;
         this.toolName = toolName;
         this.arguments = arguments;
         this.status = ToolCallStatus.PENDING;
-        this.createdAt = Instant.now();
+        this.createdAt = createdAt;
     }
 
     public void markDone(String result) {
+        markDone(result, timestampFallback());
+    }
+
+    public void markDone(String result, Instant now) {
         this.result = result;
         this.status = ToolCallStatus.DONE;
-        this.completedAt = Instant.now();
+        this.completedAt = now;
     }
 
     /**
@@ -78,9 +86,13 @@ public class ToolCallEntity {
      * 让恢复时能区分"PENDING=从没开跑"与"IN_PROGRESS=可能做了一半 / 跑完没记"。
      */
     public void markInProgress() {
+        markInProgress(timestampFallback());
+    }
+
+    public void markInProgress(Instant now) {
         this.status = ToolCallStatus.IN_PROGRESS;
         this.attemptCount++;
-        this.startedAt = Instant.now();
+        this.startedAt = now;
     }
 
     /**
@@ -88,9 +100,17 @@ public class ToolCallEntity {
      * 系统不自动重试,把这条"未知"的观察(result)回给模型,由其核对 / 重发。
      */
     public void markInDoubt(String result) {
+        markInDoubt(result, timestampFallback());
+    }
+
+    public void markInDoubt(String result, Instant now) {
         this.result = result;
         this.status = ToolCallStatus.IN_DOUBT;
-        this.completedAt = Instant.now();
+        this.completedAt = now;
+    }
+
+    private Instant timestampFallback() {
+        return startedAt != null ? startedAt : createdAt;
     }
 
     public String getId() { return id; }

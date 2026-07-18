@@ -1,5 +1,7 @@
 package com.reagent.stream;
 
+import com.reagent.core.TaskRunToken;
+
 import java.util.List;
 
 /**
@@ -10,8 +12,11 @@ import java.util.List;
  */
 public interface EventStore {
 
-    /** 追加一个事件,返回它的 durable 行 id(= 客户端 SSE 的 Last-Event-ID 续播游标)。 */
+    /** 控制面追加事件,返回 durable 行 id；运行期事件必须使用 {@link #appendFenced}。 */
     long append(String taskId, TaskEvent.Type type, Object data);
+
+    /** 运行期追加事件；旧 epoch 在插入前被拒绝。 */
+    long appendFenced(TaskRunToken token, TaskEvent.Type type, Object data);
 
     /** 补播:取出某任务里 id 大于游标的历史事件,重建成与 live 完全同构的 {@link TaskEvent}(按发生序)。 */
     List<TaskEvent> replayAfter(String taskId, long afterEventId);

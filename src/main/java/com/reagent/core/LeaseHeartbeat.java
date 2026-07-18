@@ -6,8 +6,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import java.util.Map;
-
 /**
  * ★ M7 Stage2/3:租约心跳续租 + fence 检测。
  *
@@ -39,9 +37,9 @@ public class LeaseHeartbeat {
             initialDelayString = "${reagent.worker.heartbeat-ms:10000}")
     public void beat() {
         try {
-            for (Map.Entry<String, Long> e : taskControl.ownedEpochs().entrySet()) {
-                String taskId = e.getKey();
-                if (!stateStore.renew(taskId, e.getValue())) {
+            for (TaskRunToken token : taskControl.ownedTokens()) {
+                String taskId = token.taskId();
+                if (!stateStore.renew(token)) {
                     log.warn("续租失败:任务 {} 的租约已被其它 worker 接管(epoch 不匹配),标记 FENCED,将在安全点自停。", taskId);
                     taskControl.markFenced(taskId);
                 }

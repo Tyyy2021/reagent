@@ -1,6 +1,7 @@
 package com.reagent.persist;
 
 import com.reagent.core.Context;
+import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
 import com.reagent.testsupport.InfrastructureIT;
 import jakarta.persistence.EntityManager;
@@ -29,6 +30,7 @@ class StateStoreIT extends InfrastructureIT {
     @Transactional
     void reconstructsToolCallContextAndLedgerFromMySql() {
         TaskEntity task = stateStore.createTask("inspect runtime", "system prompt");
+        TaskRunToken token = stateStore.claim(task.getId()).orElseThrow();
         ToolCall call = new ToolCall("call-state-store-it", "read_file", "{\"path\":\"README.md\"}");
 
         Map<String, Object> assistant = new LinkedHashMap<>();
@@ -38,9 +40,9 @@ class StateStoreIT extends InfrastructureIT {
                 "id", call.id(),
                 "type", "function",
                 "function", Map.of("name", call.name(), "arguments", call.arguments()))));
-        stateStore.appendAssistant(task.getId(), assistant);
-        stateStore.markInProgress(task.getId(), call);
-        stateStore.recordToolResult(task.getId(), call, "file contents");
+        stateStore.appendAssistant(token, assistant);
+        stateStore.markInProgress(token, call);
+        stateStore.recordToolResult(token, call, "file contents");
 
         entityManager.flush();
         entityManager.clear();

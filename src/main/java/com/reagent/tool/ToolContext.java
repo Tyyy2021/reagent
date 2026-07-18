@@ -1,6 +1,10 @@
 package com.reagent.tool;
 
+import com.reagent.core.TaskRunToken;
+
 import java.nio.file.Path;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * 工具执行上下文 —— 把“当前是哪个任务、在哪个工作目录干活”这类运行时身份,<b>显式</b>传进工具。
@@ -16,17 +20,33 @@ import java.nio.file.Path;
 public record ToolContext(
         String taskId,         // 当前任务 id
         Path workspaceDir,     // 本任务的独立工作目录(沙箱 cwd / 挂载点),已确保存在
-        String idempotencyKey  // 本次工具调用的幂等 key(= tool_call_id);任务级模板为 null,执行某工具时由 forCall 绑定
+        String idempotencyKey, // 本次工具调用的幂等 key(= tool_call_id);任务级模板为 null,执行某工具时由 forCall 绑定
+        Optional<TaskRunToken> runToken
 ) {
+
+    public ToolContext {
+        Objects.requireNonNull(taskId, "taskId");
+        Objects.requireNonNull(workspaceDir, "workspaceDir");
+        Objects.requireNonNull(runToken, "runToken");
+        if (runToken.isPresent() && !taskId.equals(runToken.orElseThrow().taskId())) {
+            throw new IllegalArgumentException("run token taskId must match ToolContext taskId");
+        }
+    }
 
     /** 任务级模板:还没绑定到具体某次工具调用(idempotencyKey=null);真正执行某工具时用 {@link #forCall} 绑定它的 id。 */
     public ToolContext(String taskId, Path workspaceDir) {
-        this(taskId, workspaceDir, null);
+        this(taskId, workspaceDir, null, Optional.empty());
+    }
+
+    /** Agent 运行上下文:从当前持有的 token 派生 task id。 */
+    public ToolContext(TaskRunToken runToken, Path workspaceDir) {
+        this(Objects.requireNonNull(runToken, "runToken").taskId(), workspaceDir,
+                null, Optional.of(runToken));
     }
 
     /** 绑定到某一次工具调用,得到带 idempotencyKey 的上下文(供 run_command 等把 key 下推给副作用做幂等)。 */
     public ToolContext forCall(String toolCallId) {
-        return new ToolContext(taskId, workspaceDir, toolCallId);
+        return new ToolContext(taskId, workspaceDir, toolCallId, runToken);
     }
 
     /**

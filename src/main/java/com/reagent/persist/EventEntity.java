@@ -51,11 +51,11 @@ public class EventEntity {
     protected EventEntity() {
     }
 
-    public EventEntity(String taskId, String type, String data) {
+    public EventEntity(String taskId, String type, String data, Instant createdAt) {
         this.taskId = taskId;
         this.type = type;
         this.data = data;
-        this.createdAt = Instant.now();
+        this.createdAt = createdAt;
     }
 
     public Long getId() { return id; }

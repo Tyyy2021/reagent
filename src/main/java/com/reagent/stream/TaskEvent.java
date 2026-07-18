@@ -33,9 +33,9 @@ public record TaskEvent(String taskId, String eventId, Type type, Object data, I
         PAUSED          // 用户暂停(非任务终态,但本次 run 的事件流到此为止)
     }
 
-    /** live 事件工厂(补当前时刻):持久事件传游标 id,TOKEN 传 {@code null}。 */
-    public static TaskEvent of(String taskId, String eventId, Type type, Object data) {
-        return new TaskEvent(taskId, eventId, type, data, Instant.now());
+    /** live 事件工厂:持久事件传游标 id,TOKEN 传 {@code null};时间由统一 UTC Clock 显式提供。 */
+    public static TaskEvent of(String taskId, String eventId, Type type, Object data, Instant at) {
+        return new TaskEvent(taskId, eventId, type, data, at);
     }
 
     /** 本次 run 的收尾事件:之后该 run 不再有新事件,SSE 端据此收尾。注意 PAUSED 非任务终态(可 resume),但对"本次 SSE 流"而言已结束。 */
