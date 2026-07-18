@@ -3,7 +3,10 @@ package com.reagent.persist;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.output.MigrateResult;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -15,13 +18,18 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Testcontainers
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SchemaMigrationIT {
 
     private static final String FRESH_DATABASE = uniqueDatabase("fresh");
@@ -44,20 +52,24 @@ class SchemaMigrationIT {
     }
 
     @Test
-    void createsFreshRuntimeSchemaAtVersionOne() throws SQLException {
+    @Order(1)
+    void createsFreshRuntimeSchemaAtVersionTwo() throws SQLException {
         Flyway flyway = flyway(FRESH_DATABASE, false);
 
         MigrateResult result = flyway.migrate();
 
         assertTrue(result.success, "Flyway migration must succeed");
-        assertEquals(1, result.migrationsExecuted, "Fresh schema must execute V1");
-        assertHistoryRow(FRESH_DATABASE, "SQL");
+        assertEquals(2, result.migrationsExecuted, "Fresh schema must execute V1 and V2");
+        assertHistoryRow(FRESH_DATABASE, "1", "SQL");
+        assertHistoryRow(FRESH_DATABASE, "2", "SQL");
         assertTables(FRESH_DATABASE, Set.of(
                 "task", "message", "tool_call", "event", "flyway_schema_history"));
+        assertV2Metadata(FRESH_DATABASE);
     }
 
     @Test
-    void baselinesExistingRuntimeSchemaAtVersionOne() throws SQLException {
+    @Order(2)
+    void upgradesLegacyRuntimeSchemaAndConvergesAtVersionTwo() throws SQLException {
         createLegacySchema();
         execute(LEGACY_DATABASE, """
                 INSERT INTO task (id, goal, status, recovery_count, lease_epoch)
@@ -67,17 +79,24 @@ class SchemaMigrationIT {
         MigrateResult result = flyway(LEGACY_DATABASE, true).migrate();
 
         assertTrue(result.success, "Flyway baseline migration must succeed");
-        assertEquals(0, result.migrationsExecuted, "Existing V1 schema is baselined, not recreated");
-        assertHistoryRow(LEGACY_DATABASE, "BASELINE");
+        assertEquals(1, result.migrationsExecuted, "Existing V1 schema must baseline then execute V2");
+        assertHistoryRow(LEGACY_DATABASE, "1", "BASELINE");
+        assertHistoryRow(LEGACY_DATABASE, "2", "SQL");
         assertTables(LEGACY_DATABASE, Set.of(
                 "task", "message", "tool_call", "event", "flyway_schema_history"));
         try (Connection connection = databaseConnection(LEGACY_DATABASE);
              PreparedStatement statement = connection.prepareStatement(
-                     "SELECT goal FROM task WHERE id = 'legacy-task'");
+                     "SELECT goal, profile_id, profile_snapshot FROM task WHERE id = 'legacy-task'");
              ResultSet rows = statement.executeQuery()) {
             assertTrue(rows.next(), "Legacy row must survive baselining");
             assertEquals("keep me", rows.getString("goal"));
+            assertEquals("coding", rows.getString("profile_id"));
+            assertEquals(null, rows.getString("profile_snapshot"),
+                    "Legacy snapshot remains null until StateStore materializes it under lock");
         }
+        assertV2Metadata(LEGACY_DATABASE);
+        assertEquals(columnMetadata(FRESH_DATABASE), columnMetadata(LEGACY_DATABASE),
+                "Fresh and upgraded V2 task/tool_call metadata must converge exactly");
     }
 
     private static Flyway flyway(String database, boolean baselineOnMigrate) {
@@ -148,20 +167,108 @@ class SchemaMigrationIT {
                 """);
     }
 
-    private static void assertHistoryRow(String database, String expectedType) throws SQLException {
+    private static void assertHistoryRow(String database, String version, String expectedType) throws SQLException {
         try (Connection connection = databaseConnection(database);
              PreparedStatement statement = connection.prepareStatement("""
                      SELECT version, type, success
                      FROM flyway_schema_history
-                     WHERE version = '1'
+                     WHERE version = ?
                      """);
-             ResultSet rows = statement.executeQuery()) {
-            assertTrue(rows.next(), "Flyway history must contain version 1");
-            assertEquals("1", rows.getString("version"));
+             ) {
+            statement.setString(1, version);
+            try (ResultSet rows = statement.executeQuery()) {
+            assertTrue(rows.next(), "Flyway history must contain version " + version);
+            assertEquals(version, rows.getString("version"));
             assertEquals(expectedType, rows.getString("type"));
             assertTrue(rows.getBoolean("success"));
-            assertTrue(!rows.next(), "Version 1 must have exactly one history row");
+            assertTrue(!rows.next(), "Version " + version + " must have exactly one history row");
+            }
         }
+    }
+
+    private static void assertV2Metadata(String database) throws SQLException {
+        assertColumn(database, "task", "profile_id", "varchar(64)", "YES");
+        assertColumn(database, "task", "profile_snapshot", "mediumtext", "YES");
+        assertColumn(database, "task", "status", "varchar(32)", "NO");
+        assertColumn(database, "tool_call", "assistant_message_seq", "int", "YES");
+        assertColumn(database, "tool_call", "status", "varchar(32)", "YES");
+
+        List<String> columns = new java.util.ArrayList<>();
+        try (Connection connection = databaseConnection(database);
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT column_name
+                     FROM information_schema.statistics
+                     WHERE table_schema = ? AND table_name = 'tool_call'
+                       AND index_name = 'idx_tool_call_task_batch'
+                     ORDER BY seq_in_index
+                     """)) {
+            statement.setString(1, database);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    columns.add(rows.getString("column_name"));
+                }
+            }
+        }
+        assertEquals(List.of("task_id", "assistant_message_seq"), columns);
+    }
+
+    private static void assertColumn(String database, String table, String column,
+                                     String expectedType, String expectedNullable) throws SQLException {
+        try (Connection connection = databaseConnection(database);
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT column_type, is_nullable
+                     FROM information_schema.columns
+                     WHERE table_schema = ? AND table_name = ? AND column_name = ?
+                     """)) {
+            statement.setString(1, database);
+            statement.setString(2, table);
+            statement.setString(3, column);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertTrue(rows.next(), () -> "Missing column " + table + "." + column);
+                assertEquals(expectedType, rows.getString("column_type"));
+                assertEquals(expectedNullable, rows.getString("is_nullable"));
+                assertTrue(!rows.next(), "Column metadata must be unique");
+            }
+        }
+    }
+
+    private static Map<String, ColumnMetadata> columnMetadata(String database) throws SQLException {
+        Map<String, ColumnMetadata> metadata = new TreeMap<>();
+        try (Connection connection = databaseConnection(database);
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT table_name, column_name, ordinal_position, column_type, is_nullable,
+                            column_default, extra, character_set_name, collation_name
+                     FROM information_schema.columns
+                     WHERE table_schema = ? AND table_name IN ('task', 'tool_call')
+                     ORDER BY table_name, ordinal_position
+                     """)) {
+            statement.setString(1, database);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    String key = rows.getString("table_name") + "." + rows.getString("column_name");
+                    metadata.put(key, new ColumnMetadata(
+                            rows.getInt("ordinal_position"),
+                            rows.getString("column_type"),
+                            rows.getString("is_nullable"),
+                            rows.getString("column_default"),
+                            rows.getString("extra"),
+                            rows.getString("character_set_name"),
+                            rows.getString("collation_name")));
+                }
+            }
+        }
+        return metadata;
+    }
+
+    private record ColumnMetadata(
+            int ordinalPosition,
+            String columnType,
+            String nullable,
+            String defaultValue,
+            String extra,
+            String characterSet,
+            String collation
+    ) {
     }
 
     private static void assertTables(String database, Set<String> expected) throws SQLException {

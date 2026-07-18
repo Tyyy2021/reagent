@@ -33,6 +33,8 @@ public class ToolCallEntity {
 
     private String toolName;
 
+    private Integer assistantMessageSeq;
+
     @Column(length = 1_000_000)
     private String arguments;
 
@@ -63,9 +65,15 @@ public class ToolCallEntity {
     }
 
     public ToolCallEntity(String id, String taskId, String toolName, String arguments, Instant createdAt) {
+        this(id, taskId, toolName, arguments, createdAt, null);
+    }
+
+    public ToolCallEntity(String id, String taskId, String toolName, String arguments,
+                          Instant createdAt, Integer assistantMessageSeq) {
         this.id = id;
         this.taskId = taskId;
         this.toolName = toolName;
+        this.assistantMessageSeq = assistantMessageSeq;
         this.arguments = arguments;
         this.status = ToolCallStatus.PENDING;
         this.createdAt = createdAt;
@@ -116,6 +124,7 @@ public class ToolCallEntity {
     public String getId() { return id; }
     public String getTaskId() { return taskId; }
     public String getToolName() { return toolName; }
+    public Integer getAssistantMessageSeq() { return assistantMessageSeq; }
     public String getArguments() { return arguments; }
     public String getResult() { return result; }
     public ToolCallStatus getStatus() { return status; }

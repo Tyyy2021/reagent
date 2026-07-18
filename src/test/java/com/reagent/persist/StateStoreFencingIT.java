@@ -339,7 +339,7 @@ class StateStoreFencingIT extends InfrastructureIT {
 
     private StateStore stateStore(String workerId, TaskLeaseGuard leaseGuard) {
         return new StateStore(taskRepository, messageRepository, toolCallRepository, objectMapper,
-                new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
+                null, new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
     }
 
     private TaskSnapshot taskSnapshot(String taskId) {

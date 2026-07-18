@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.ToolCall;
 import com.reagent.obs.Trace;
+import com.reagent.profile.TaskToolCatalog;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -21,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 
 /**
  * 工具执行器。负责:找到工具 -> 解析参数 -> 执行 -> 把异常兜成可读结果。
@@ -37,21 +39,22 @@ public class ToolExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(ToolExecutor.class);
 
-    private final ToolRegistry registry;
     private final ObjectMapper mapper;
     private final ToolProperties props;
     private final Tracer tracer;
 
-    public ToolExecutor(ToolRegistry registry, ObjectMapper mapper, ToolProperties props, Tracer tracer) {
-        this.registry = registry;
+    public ToolExecutor(ObjectMapper mapper, ToolProperties props, Tracer tracer) {
         this.mapper = mapper;
         this.props = props;
         this.tracer = tracer;
     }
 
-    /** 执行单个工具调用。任何异常都兜底成可读字符串,绝不抛出。 */
-    public String execute(ToolCall call, ToolContext ctx) {
-        Tool tool = registry.get(call.name());
+    /** Execute only through the task's frozen allowlist. */
+    public String execute(TaskToolCatalog catalog, ToolCall call, ToolContext ctx) {
+        return executeResolved(catalog.get(call.name()), call, ctx);
+    }
+
+    private String executeResolved(Tool tool, ToolCall call, ToolContext ctx) {
         // M6:工具 span(parent = 当前 agent.step;并发路径下由 executeConcurrently 跨虚拟线程把 context 传好)
         Span span = tracer.spanBuilder("execute_tool " + call.name())
                 .setAttribute(Trace.TOOL_NAME, call.name())
@@ -97,12 +100,19 @@ public class ToolExecutor {
      *
      * 单个工具或显式关并发时退回串行,省掉线程开销、也便于"串行 vs 并发"对照演示。
      */
-    public Map<String, String> executeConcurrently(List<ToolCall> calls, ToolContext ctx) {
+    /** Execute a batch only through the task's frozen allowlist. */
+    public Map<String, String> executeConcurrently(
+            TaskToolCatalog catalog, List<ToolCall> calls, ToolContext ctx) {
+        return executeConcurrently(calls, call -> execute(catalog, call, ctx));
+    }
+
+    private Map<String, String> executeConcurrently(
+            List<ToolCall> calls, Function<ToolCall, String> execution) {
         Map<String, String> results = new LinkedHashMap<>();
 
         if (calls.size() <= 1 || !props.isConcurrent()) {
             for (ToolCall c : calls) {
-                results.put(c.id(), execute(c, ctx));   // 串行:同线程,execute_tool span 自动挂当前 step span
+                results.put(c.id(), execution.apply(c));   // 串行:同线程,execute_tool span 自动挂当前 step span
             }
             return results;
         }
@@ -117,7 +127,7 @@ public class ToolExecutor {
             for (ToolCall c : calls) {
                 futures.put(c, pool.submit(() -> {
                     try (Scope ignored = otelContext.makeCurrent()) {
-                        return execute(c, ctx);
+                        return execution.apply(c);
                     }
                 }));
             }

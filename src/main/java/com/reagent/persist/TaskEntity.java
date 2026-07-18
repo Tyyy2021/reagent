@@ -28,6 +28,12 @@ public class TaskEntity {
     @Column(length = 1_000_000)
     private String goal;
 
+    @Column(length = 64)
+    private String profileId;
+
+    @Column(length = 1_000_000)
+    private String profileSnapshot;
+
     // 显式 length=32 让 Hibernate 生成 varchar(32) 而非 MySQL 原生 enum——否则 EnumType.STRING 在 MySQL 上
     // 会建成 enum('RUNNING','COMPLETED','FAILED'),后加 CANCELLED/PAUSED 写入即报 "Data truncated",
     // 且 ddl-auto=update 不改已存在列(与 tool_call.status 同源的坑)。运行库已 ALTER ... MODIFY status VARCHAR(32)。
@@ -93,6 +99,11 @@ public class TaskEntity {
         return t;
     }
 
+    void freezeProfile(String profileId, String profileSnapshot) {
+        this.profileId = profileId;
+        this.profileSnapshot = profileSnapshot;
+    }
+
     /** ★ M7:认领租约 —— 新任务出生即归本 worker(owner 一并落库,杜绝"无主 RUNNING"空窗被漏扫)。 */
     public void assignLease(String workerId, Instant expiresAt, Instant now) {
         this.ownerId = workerId;
@@ -155,6 +166,8 @@ public class TaskEntity {
 
     public String getId() { return id; }
     public String getGoal() { return goal; }
+    public String getProfileId() { return profileId; }
+    public String getProfileSnapshot() { return profileSnapshot; }
     public TaskStatus getStatus() { return status; }
     public String getResult() { return result; }
     public Instant getCreatedAt() { return createdAt; }

@@ -6,15 +6,18 @@ import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
 import com.reagent.persist.ToolCallStatus;
+import com.reagent.profile.AgentProfileRegistry;
+import com.reagent.profile.TaskProfileSnapshot;
+import com.reagent.profile.TaskToolCatalog;
+import com.reagent.profile.ToolCatalogResolver;
+import com.reagent.profile.ToolSnapshot;
 import com.reagent.sandbox.RunJournal;
 import com.reagent.sandbox.WorkspaceStore;
 import com.reagent.stream.TaskEvent;
 import com.reagent.stream.StreamTransport;
 import com.reagent.tool.IdempotencyClass;
-import com.reagent.tool.Tool;
 import com.reagent.tool.ToolContext;
 import com.reagent.tool.ToolExecutor;
-import com.reagent.tool.ToolRegistry;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
@@ -55,15 +58,9 @@ public class AgentRunner {
     /** 停止条件:最多走多少步,防止 agent 死循环烧钱 */
     private static final int MAX_STEPS = 15;
 
-    private static final String SYSTEM_PROMPT = """
-            你是一个能够调用工具来完成任务的智能体(agent)。
-            根据用户给出的目标,自主判断需要哪些信息,调用合适的工具一步步推进。
-            每次只需决定下一步:要么调用一个工具,要么在信息足够时直接给出最终回答。
-            当你认为任务已经完成,用简洁的自然语言给出最终结论,不要再调用工具。
-            """;
-
     private final LlmClient llm;
-    private final ToolRegistry registry;
+    private final AgentProfileRegistry profileRegistry;
+    private final ToolCatalogResolver catalogResolver;
     private final ToolExecutor executor;
     private final StateStore stateStore;
     private final ShutdownState shutdownState;
@@ -75,14 +72,16 @@ public class AgentRunner {
     private final WorkerIdentity workerIdentity;   // M7:本 worker 身份(span 属性 / 日志)
     private final int maxAttempts;                 // M7 Stage2:单任务自动恢复次数上限(止损)
 
-    public AgentRunner(LlmClient llm, ToolRegistry registry, ToolExecutor executor,
+    public AgentRunner(LlmClient llm, AgentProfileRegistry profileRegistry,
+                       ToolCatalogResolver catalogResolver, ToolExecutor executor,
                        StateStore stateStore, ShutdownState shutdownState,
                        WorkspaceStore workspaceStore, InFlightTasks inFlight,
                        StreamTransport bus, TaskControl taskControl, Tracer tracer,
                        WorkerIdentity workerIdentity,
                        @Value("${reagent.recovery.max-attempts:3}") int maxAttempts) {
         this.llm = llm;
-        this.registry = registry;
+        this.profileRegistry = profileRegistry;
+        this.catalogResolver = catalogResolver;
         this.executor = executor;
         this.stateStore = stateStore;
         this.shutdownState = shutdownState;
@@ -97,9 +96,15 @@ public class AgentRunner {
 
     /** 提交一个新任务:落库后从头跑(同步,阻塞到跑完)。M4:仅 `POST /api/tasks?sync=true` 与单测走这条。 */
     public RunResult run(String goal) {
+        return run(goal, "coding");
+    }
+
+    public RunResult run(String goal, String profileId) {
         log.info("====== 新任务:{} ======", goal);
-        TaskEntity task = stateStore.createTask(goal, SYSTEM_PROMPT);
-        String answer = drive(task, false);
+        TaskProfileSnapshot snapshot = profileRegistry.snapshot(profileId);
+        TaskToolCatalog catalog = catalogResolver.resolve(snapshot);
+        TaskEntity task = stateStore.createTask(goal, snapshot);
+        String answer = drive(task, false, catalog);
         return new RunResult(task.getId(), answer);
     }
 
@@ -108,12 +113,18 @@ public class AgentRunner {
      * 以 SSE 流式推给订阅者。任务<b>不绑 HTTP 连接</b>——客户端断开/重连都不影响它(本就持久可恢复)。
      */
     public String submit(String goal) {
+        return submit(goal, "coding");
+    }
+
+    public String submit(String goal, String profileId) {
         log.info("====== 新任务(异步):{} ======", goal);
-        TaskEntity task = stateStore.createTask(goal, SYSTEM_PROMPT);
+        TaskProfileSnapshot snapshot = profileRegistry.snapshot(profileId);
+        TaskToolCatalog catalog = catalogResolver.resolve(snapshot);
+        TaskEntity task = stateStore.createTask(goal, snapshot);
         String taskId = task.getId();
         Thread.ofVirtual().name("agent-" + taskId).start(() -> {
             try {
-                drive(task, false);
+                drive(task, false, catalog);
             } catch (RuntimeException ex) {
                 // drive 内部已分流(shutdown 保 RUNNING / 真错判 FAILED);此处兜底,防虚拟线程静默吞异常
                 log.error("异步任务 {} 驱动异常", taskId, ex);
@@ -125,11 +136,12 @@ public class AgentRunner {
     /** 恢复一个半截任务:从库里重建上下文接着跑(崩溃恢复 / 手动续跑都走这里)。 */
     public String resume(String taskId) {
         log.info("====== 恢复任务:{} ======", taskId);
+        TaskToolCatalog catalog = catalogResolver.resolve(stateStore.loadProfile(taskId));
         TaskEntity task = stateStore.getTask(taskId);
         if (task.getStatus() == TaskStatus.PAUSED) {
             stateStore.markRunning(taskId);   // 暂停的任务:先 PAUSED -> RUNNING 再续跑
         }
-        return drive(task, false);
+        return drive(task, false, catalog);
     }
 
     /**
@@ -139,8 +151,9 @@ public class AgentRunner {
      */
     public String recover(String taskId) {
         log.info("====== 接管 / 恢复任务:{} ======", taskId);
+        TaskToolCatalog catalog = catalogResolver.resolve(stateStore.loadProfile(taskId));
         TaskEntity task = stateStore.getTask(taskId);
-        return drive(task, true);
+        return drive(task, true, catalog);
     }
 
     /** M4:异步恢复(给 resume 端点用)——在虚拟线程上续跑、立即返回,过程经 SSE 流式推。 */
@@ -158,7 +171,7 @@ public class AgentRunner {
      * 真正的循环。对"全新任务"和"半截任务"是同一套代码:
      * 每轮先把库里(可能)欠着的工具结果补齐,再问模型下一步。
      */
-    private String drive(TaskEntity task, boolean autoRecovery) {
+    private String drive(TaskEntity task, boolean autoRecovery, TaskToolCatalog catalog) {
         String taskId = task.getId();
         // 单机内"同一任务不并发驱动"护栏:挡住"自动恢复 + 手动 resume 撞车"——否则两个 drive
         // 会撞 message.seq、还会把同一工具跑两遍(账本 DONE 检查与执行之间不是原子的)。
@@ -204,7 +217,7 @@ public class AgentRunner {
                     .setAttribute(Trace.WORKER_ID, workerIdentity.id())   // M7:标出本次由哪个 worker 驱动(失败转移后可见接管)
                     .startSpan();
             try (Scope ignored = taskSpan.makeCurrent()) {
-                return driveLoop(token);
+                return driveLoop(token, catalog);
             } catch (RuntimeException ex) {
                 taskSpan.recordException(ex);
                 taskSpan.setStatus(StatusCode.ERROR);
@@ -224,7 +237,7 @@ public class AgentRunner {
     }
 
     /** 实际的 ReAct 驱动循环(被 {@link #drive} 包上"同一任务单飞"护栏后调用)。 */
-    private String driveLoop(TaskRunToken token) {
+    private String driveLoop(TaskRunToken token, TaskToolCatalog catalog) {
         String taskId = token.taskId();
         Context ctx = stateStore.loadContext(taskId);
         // 本任务的工具执行上下文:taskId + 独立工作目录(沙箱 cwd / 挂载点),一次解析、全程复用
@@ -248,14 +261,14 @@ public class AgentRunner {
                     if (!pending.isEmpty()) {
                         stepSpan.setAttribute(Trace.STEP_PENDING, true);
                         log.info("--- 第 {} 步:补跑 {} 个未完成的工具调用 ---", step, pending.size());
-                        executeTools(toolCtx, ctx, pending);
+                        executeTools(catalog, toolCtx, ctx, pending);
                         workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
                         continue;
                     }
 
                     // 2. 问大脑:下一步干什么
                     log.info("--- 第 {} 步:询问模型 ---", step);
-                    Decision decision = llm.chatStream(ctx, registry.toOpenAiSpec(),
+                    Decision decision = llm.chatStream(ctx, catalog.toOpenAiSpec(),
                             tokenText -> bus.publish(token, TaskEvent.Type.TOKEN, Map.of("text", tokenText)));
 
                     // 安全点②(LLM 调用可能耗时,期间若被取消/暂停,在启动工具【之前】停)
@@ -279,7 +292,7 @@ public class AgentRunner {
                         bus.publish(token, TaskEvent.Type.TOOL_CALL,
                                 Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
                     }
-                    executeTools(toolCtx, ctx, decision.getToolCalls());
+                    executeTools(catalog, toolCtx, ctx, decision.getToolCalls());
                     workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
                 } finally {
                     stepSpan.end();
@@ -377,7 +390,8 @@ public class AgentRunner {
      * <p>第 3 步串行的原因不变:message.seq 在 task 行锁下由 max+1 生成、Context 是普通 ArrayList;
      * 落库很轻,真正耗时的执行已在第 2 步并发掉,串行可保持账本、消息与内存上下文顺序一致。</p>
      */
-    private void executeTools(ToolContext toolCtx, Context ctx, List<ToolCall> calls) {
+    private void executeTools(TaskToolCatalog catalog, ToolContext toolCtx,
+                              Context ctx, List<ToolCall> calls) {
         String taskId = toolCtx.taskId();
         TaskRunToken token = toolCtx.runToken().orElseThrow(
                 () -> new IllegalStateException("Agent tool context is missing its run token"));
@@ -396,7 +410,7 @@ public class AgentRunner {
                 }
                 case IN_PROGRESS -> {
                     // 上一世开跑过没收尾 = in-doubt 窗口
-                    if (canSafelyReplay(call)) {
+                    if (canSafelyReplay(catalog, call)) {
                         log.info("in-doubt 但工具可安全重放,重跑: {}", call.name());
                         toRun.add(call);
                     } else {
@@ -428,7 +442,7 @@ public class AgentRunner {
                 stateStore.markInProgress(token, call);
             }
             log.info("并发执行本轮 {} 个工具调用", toRun.size());
-            results.putAll(executor.executeConcurrently(toRun, toolCtx));
+            results.putAll(executor.executeConcurrently(catalog, toRun, toolCtx));
         }
 
         // 3b:执行期间收到 force-cancel(硬杀)?清中断位(免后续落库被打断),刚跑的工具按"被中途打断"处理
@@ -444,7 +458,7 @@ public class AgentRunner {
         }
         for (ToolCall call : calls) {
             if (ran.contains(call.id())) {
-                if (forced && !canSafelyReplay(call)) {
+                if (forced && !canSafelyReplay(catalog, call)) {
                     // 3b 硬杀:非幂等工具被 force-cancel 中途打断,不谎报 DONE——留在 markInProgress 的 IN_PROGRESS
                     // (=in-doubt,等同"崩在执行中途");任务随后被标 CANCELLED,绝不重放副作用(复用 exactly-once)。
                     log.warn("force-cancel 中途打断 SIDE_EFFECTFUL 工具,留 IN_PROGRESS(in-doubt)、不记 DONE: {}", call.name());
@@ -476,12 +490,12 @@ public class AgentRunner {
     }
 
     /** 这次 in-doubt 的调用能否安全重放:只读 / 幂等工具可以;有副作用 / 未知工具一律不重放(fail-closed)。 */
-    private boolean canSafelyReplay(ToolCall call) {
-        Tool tool = registry.get(call.name());
+    private boolean canSafelyReplay(TaskToolCatalog catalog, ToolCall call) {
+        ToolSnapshot tool = catalog.snapshot(call.name());
         if (tool == null) {
             return false;
         }
-        IdempotencyClass cls = tool.idempotency();
+        IdempotencyClass cls = tool.idempotencyClass();
         return cls == IdempotencyClass.READ_ONLY || cls == IdempotencyClass.IDEMPOTENT;
     }
 

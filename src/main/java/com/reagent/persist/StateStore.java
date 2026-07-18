@@ -6,6 +6,8 @@ import com.reagent.core.Context;
 import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
 import com.reagent.core.WorkerIdentity;
+import com.reagent.profile.AgentProfileRegistry;
+import com.reagent.profile.TaskProfileSnapshot;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
@@ -13,6 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,13 +41,18 @@ public class StateStore {
     private final MessageRepository messageRepo;
     private final ToolCallRepository toolCallRepo;
     private final ObjectMapper mapper;
+    private final AgentProfileRegistry profileRegistry;
     private final WorkerIdentity worker;        // M7:本 worker 身份(claim 的 owner)
     private final long leaseTtlMs;              // M7:租约时长
     private final Clock clock;
     private final TaskLeaseGuard leaseGuard;
 
+    @Value("${reagent.profiles.max-snapshot-bytes:262144}")
+    private int maxProfileSnapshotBytes = 262_144;
+
     public StateStore(TaskRepository taskRepo, MessageRepository messageRepo,
                       ToolCallRepository toolCallRepo, ObjectMapper mapper,
+                      AgentProfileRegistry profileRegistry,
                       WorkerIdentity worker,
                       @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs,
                       Clock clock,
@@ -53,6 +61,7 @@ public class StateStore {
         this.messageRepo = messageRepo;
         this.toolCallRepo = toolCallRepo;
         this.mapper = mapper;
+        this.profileRegistry = profileRegistry;
         this.worker = worker;
         this.leaseTtlMs = leaseTtlMs;
         this.clock = clock;
@@ -75,9 +84,43 @@ public class StateStore {
         return task;
     }
 
+    @Transactional
+    public TaskEntity createTask(String goal, TaskProfileSnapshot snapshot) {
+        String snapshotJson = serializeProfile(snapshot);
+        Instant now = clock.instant();
+        TaskEntity task = TaskEntity.newTask(goal, now);
+        task.freezeProfile(snapshot.profileId(), snapshotJson);
+        task.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
+        TaskEntity saved = taskRepo.save(task);
+        appendMessage(saved.getId(), "system", snapshot.systemPrompt(), null, null, now);
+        appendMessage(saved.getId(), "user", goal, null, null, now);
+        return saved;
+    }
+
+    @Transactional
+    public TaskProfileSnapshot loadProfile(String taskId) {
+        TaskEntity task = taskRepo.findByIdForUpdate(taskId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+        String snapshotJson = task.getProfileSnapshot();
+        if (snapshotJson == null) {
+            if (task.getProfileId() != null && !"coding".equals(task.getProfileId())) {
+                throw new IllegalStateException("Legacy task has unsupported profile: " + task.getProfileId());
+            }
+            TaskProfileSnapshot coding = profileRegistry.snapshot("coding");
+            snapshotJson = serializeProfile(coding);
+            task.freezeProfile(coding.profileId(), snapshotJson);
+            taskRepo.save(task);
+        }
+        TaskProfileSnapshot snapshot = deserializeProfile(snapshotJson);
+        if (!snapshot.profileId().equals(task.getProfileId())) {
+            throw new IllegalStateException("Task profile ID does not match persisted snapshot: " + taskId);
+        }
+        return snapshot;
+    }
+
     public TaskEntity getTask(String taskId) {
         return taskRepo.findById(taskId)
-                .orElseThrow(() -> new IllegalArgumentException("找不到任务: " + taskId));
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
     }
 
     /** 崩溃恢复扫描:所有仍处于 RUNNING 的任务 */
@@ -206,7 +249,7 @@ public class StateStore {
         Object toolCalls = assistantMessage.get("tool_calls");
         String toolCallsJson = toolCalls == null ? null : toJson(toolCalls);
 
-        Map<String, ToolCallEntity> callsToCreate = new LinkedHashMap<>();
+        Map<String, PendingToolCall> callsToCreate = new LinkedHashMap<>();
         if (toolCalls instanceof List<?> list) {
             for (Object o : list) {
                 if (!(o instanceof Map<?, ?> tc)) continue;
@@ -217,12 +260,17 @@ public class StateStore {
                 // 先校验整批 call 的任务归属,再落 assistant 消息:外任务同 ID 必须在任何持久化之前 fail closed。
                 if (!callsToCreate.containsKey(id)
                         && ownedToolCall(task.getId(), id).isEmpty()) {
-                    callsToCreate.put(id, new ToolCallEntity(id, task.getId(), name, args, now));
+                    callsToCreate.put(id, new PendingToolCall(name, args));
                 }
             }
         }
         int sequence = appendMessage(task.getId(), "assistant", content, toolCallsJson, null, now);
-        toolCallRepo.saveAll(callsToCreate.values());
+        List<ToolCallEntity> ledgerRows = callsToCreate.entrySet().stream()
+                .map(entry -> new ToolCallEntity(
+                        entry.getKey(), task.getId(), entry.getValue().name(), entry.getValue().arguments(),
+                        now, sequence))
+                .toList();
+        toolCallRepo.saveAll(ledgerRows);
         return sequence;
     }
 
@@ -343,6 +391,32 @@ public class StateStore {
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("序列化失败: " + o, ex);
         }
+    }
+
+    private String serializeProfile(TaskProfileSnapshot snapshot) {
+        String json = toJson(snapshot);
+        int bytes = json.getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > maxProfileSnapshotBytes) {
+            throw new IllegalArgumentException(
+                    "Task profile snapshot exceeds " + maxProfileSnapshotBytes + " bytes: " + bytes);
+        }
+        return json;
+    }
+
+    private TaskProfileSnapshot deserializeProfile(String json) {
+        int bytes = json.getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > maxProfileSnapshotBytes) {
+            throw new IllegalStateException(
+                    "Persisted task profile snapshot exceeds " + maxProfileSnapshotBytes + " bytes: " + bytes);
+        }
+        try {
+            return mapper.readValue(json, TaskProfileSnapshot.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Cannot deserialize task profile snapshot", ex);
+        }
+    }
+
+    private record PendingToolCall(String name, String arguments) {
     }
 
     @SuppressWarnings("unchecked")

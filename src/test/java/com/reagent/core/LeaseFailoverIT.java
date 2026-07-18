@@ -121,7 +121,7 @@ class LeaseFailoverIT extends InfrastructureIT {
 
     private StateStore stateStore(String workerId) {
         return new StateStore(taskRepository, messageRepository, toolCallRepository, objectMapper,
-                new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
+                null, new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
     }
 
     private Optional<TaskRunToken> claimAfterBarrier(StateStore store, String taskId, CyclicBarrier barrier) {

@@ -54,12 +54,13 @@ public class TaskController {
     @PostMapping
     public ResponseEntity<Map<String, String>> submit(@RequestBody TaskRequest request,
                                                       @RequestParam(defaultValue = "false") boolean sync) {
+        String profile = defaultProfile(request.profile());
         if (sync) {
-            AgentRunner.RunResult r = runner.run(request.goal());
+            AgentRunner.RunResult r = runner.run(request.goal(), profile);
             return ResponseEntity.ok(Map.of(
                     "taskId", r.taskId(), "goal", request.goal(), "result", r.result()));
         }
-        String taskId = runner.submit(request.goal());
+        String taskId = runner.submit(request.goal(), profile);
         return ResponseEntity.accepted().body(Map.of("taskId", taskId, "status", "RUNNING"));
     }
 
@@ -114,7 +115,8 @@ public class TaskController {
                 "taskId", t.getId(),
                 "status", t.getStatus().name(),
                 "goal", t.getGoal(),
-                "result", t.getResult() == null ? "" : t.getResult());
+                "result", t.getResult() == null ? "" : t.getResult(),
+                "profile", t.getProfileId() == null ? "" : t.getProfileId());
     }
 
     /** M4:取消任务。默认优雅(当前工具跑完后于安全点停);?force=true 硬杀(Stage3b)。 */
@@ -188,7 +190,11 @@ public class TaskController {
         }
     }
 
-    /** 请求体:{ "goal": "..." } */
-    public record TaskRequest(String goal) {
+    private static String defaultProfile(String profile) {
+        return profile == null || profile.isBlank() ? "coding" : profile;
+    }
+
+    /** 请求体:{ "goal": "...", "profile": "coding" } */
+    public record TaskRequest(String goal, String profile) {
     }
 }

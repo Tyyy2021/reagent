@@ -47,5 +47,7 @@ class ToolIdempotencyTest {
         };
         assertEquals(IdempotencyClass.SIDE_EFFECTFUL, unclassified.idempotency(),
                 "fail-closed:忘了声明就当有副作用,绝不悄悄重放");
+        assertEquals(ApprovalPolicy.NONE, unclassified.approvalPolicy(),
+                "本地工具必须继续默认无需审批,且审批与重放等级是独立轴");
     }
 }

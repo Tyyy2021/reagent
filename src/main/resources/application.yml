@@ -27,6 +27,25 @@ spring:
       timeout: 2000ms
 
 reagent:
+  # ====== Task 3:agent profile 与冻结工具目录 ======
+  profiles:
+    default-id: coding
+    max-snapshot-bytes: 262144
+    definitions:
+      coding:
+        version: v1
+        system-prompt: |
+          你是一个能够调用工具来完成任务的智能体(agent)。
+          根据用户给出的目标,自主判断需要哪些信息,调用合适的工具一步步推进。
+          每次只需决定下一步:要么调用一个工具,要么在信息足够时直接给出最终回答。
+          当你认为任务已经完成,用简洁的自然语言给出最终结论,不要再调用工具。
+        tool-names:
+          - read_file
+          - list_dir
+          - write_file
+          - run_command
+          - sleep_ms
+        mcp-server-ids: []
   # ====== M7:分布式 worker 身份 + 租约 ======
   worker:
     # 本实例 id;留空(默认)则取 "主机名:端口" —— 同机多实例靠端口区分(本地双 worker:8080 / 8081),
