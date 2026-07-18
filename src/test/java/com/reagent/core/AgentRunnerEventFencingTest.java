@@ -86,6 +86,34 @@ class AgentRunnerEventFencingTest {
         assertEquals(List.of(TaskEvent.Type.TASK_STARTED, TaskEvent.Type.STEP), transport.fencedTypes);
     }
 
+    @Test
+    void takeoverDuringAutoRecoveryPreludeStopsWithoutPublishingFailed(@TempDir Path workspace) {
+        TaskEntity task = TaskEntity.newTask("recover then fence", Instant.EPOCH);
+        String taskId = task.getId();
+        TaskRunToken token = new TaskRunToken(taskId, "worker-a", 7);
+        StateStore stateStore = new FenceOnRecoveryCountStateStore(task, token);
+        RecordingTransport transport = new RecordingTransport();
+        AgentRunner runner = new AgentRunner(
+                new FinalAnswerLlm(),
+                new ToolRegistry(List.of()),
+                null,
+                stateStore,
+                new ShutdownState(),
+                new FixedWorkspaceStore(workspace),
+                new InFlightTasks(),
+                transport,
+                new TaskControl(),
+                OpenTelemetry.noop().getTracer("agent-runner-recovery-fencing-test"),
+                new WorkerIdentity("worker-a", "0"),
+                3);
+
+        String result = runner.recover(taskId);
+
+        assertEquals("本任务已被其它 worker 接管(fence),本 worker 停止驱动。", result);
+        assertEquals(List.of(), transport.controlPlaneTypes);
+        assertEquals(List.of(), transport.fencedTypes);
+    }
+
     private static class FinalAnswerStateStore extends StateStore {
         private final TaskEntity task;
         private final TaskRunToken token;
@@ -148,6 +176,21 @@ class AgentRunnerEventFencingTest {
 
         @Override
         public void failTask(TaskRunToken token, String error) {
+            throw new FencedExecutionException(
+                    this.token, "worker-b", this.token.leaseEpoch() + 1, TaskStatus.RUNNING);
+        }
+    }
+
+    private static final class FenceOnRecoveryCountStateStore extends FinalAnswerStateStore {
+        private final TaskRunToken token;
+
+        private FenceOnRecoveryCountStateStore(TaskEntity task, TaskRunToken token) {
+            super(task, token);
+            this.token = token;
+        }
+
+        @Override
+        public int incrementRecoveryCount(TaskRunToken token) {
             throw new FencedExecutionException(
                     this.token, "worker-b", this.token.leaseEpoch() + 1, TaskStatus.RUNNING);
         }

@@ -179,13 +179,18 @@ public class AgentRunner {
             // M7 Stage2:只有【自动恢复 / 失败转移】路径才计恢复次数并止损(手动 resume / 新任务不计)。
             // 放在 claim 之后:只有真抢到执行权的 worker 才 +1,落败的 worker 直接跳过、绝不误加计数。
             if (autoRecovery) {
-                int attempt = stateStore.incrementRecoveryCount(token);
-                if (attempt > maxAttempts) {
-                    log.warn("任务 {} 已自动恢复 {} 次仍未完成,超上限 {},止损标记 FAILED。", taskId, attempt - 1, maxAttempts);
-                    stateStore.failTask(token, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。");
-                    return "超过最大自动恢复次数,已止损标记 FAILED。";
+                try {
+                    int attempt = stateStore.incrementRecoveryCount(token);
+                    if (attempt > maxAttempts) {
+                        log.warn("任务 {} 已自动恢复 {} 次仍未完成,超上限 {},止损标记 FAILED。", taskId, attempt - 1, maxAttempts);
+                        stateStore.failTask(token, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。");
+                        return "超过最大自动恢复次数,已止损标记 FAILED。";
+                    }
+                    log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
+                } catch (FencedExecutionException ex) {
+                    log.warn("任务 {} 的自动恢复前置写已被 fence,停止旧驱动且不写 FAILED: {}", taskId, ex.getMessage());
+                    return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
                 }
-                log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
             }
             taskControl.begin(token);   // 登记驱动线程 + 打断信号槽 + 本次运行 token(M4 / M7 Stage3)
             // M6:任务 root span —— 用 taskId 派生 traceId,新任务与每次恢复都落在【同一条 trace】下(跨崩溃可视);
@@ -382,7 +387,7 @@ public class AgentRunner {
         Map<String, String> inDoubt = new LinkedHashMap<>();      // id -> 存疑提示(待落库 IN_DOUBT)
         Map<String, String> reconciled = new LinkedHashMap<>();   // id -> 对账完成提示(L3:journal 有完成记录 -> 落库 DONE)
         for (ToolCall call : calls) {
-            ToolCallStatus status = stateStore.statusOf(call.id());
+            ToolCallStatus status = stateStore.statusOf(taskId, call.id());
             switch (status) {
                 case DONE, IN_DOUBT -> {
                     // 终态:正常路径到不了这;恢复时这类已带 tool 消息、被 pendingToolCalls 滤掉。

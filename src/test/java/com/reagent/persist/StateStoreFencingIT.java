@@ -30,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -213,6 +214,24 @@ class StateStoreFencingIT extends InfrastructureIT {
         assertEquals("NONE", cancelled.getControlSignal());
     }
 
+    @Test
+    void taskCannotReadOrMutateAnotherTasksLedgerWhenCallIdCollides() {
+        assertAll(
+                () -> {
+                    ForeignLedgerFixture fixture = foreignLedgerFixture("status");
+                    assertEquals(ToolCallStatus.PENDING,
+                            workerA.statusOf(fixture.taskAId(), fixture.call().id()));
+                },
+                () -> assertForeignLedgerMutationRejected("appendAssistant", (store, token, call) ->
+                        store.appendAssistant(token, assistantWithCall(call))),
+                () -> assertForeignLedgerMutationRejected("markInProgress", (store, token, call) ->
+                        store.markInProgress(token, call)),
+                () -> assertForeignLedgerMutationRejected("recordToolResult", (store, token, call) ->
+                        store.recordToolResult(token, call, "task-a result")),
+                () -> assertForeignLedgerMutationRejected("markInDoubt", (store, token, call) ->
+                        store.markInDoubt(token, call, "task-a doubt")));
+    }
+
     private static Stream<Arguments> staleMutators() {
         return Stream.of(
                 Arguments.of("incrementRecoveryCount", (StaleMutation) (store, token, call) ->
@@ -250,6 +269,34 @@ class StateStoreFencingIT extends InfrastructureIT {
         return new FencingFixture(task.getId(), oldToken, call);
     }
 
+    private ForeignLedgerFixture foreignLedgerFixture(String name) {
+        TaskEntity taskA = taskRepository.save(TaskEntity.newTask("task A " + name, clock.instant()));
+        TaskEntity taskB = taskRepository.save(TaskEntity.newTask("task B " + name, clock.instant()));
+        ToolCall call = new ToolCall(
+                "shared-call-" + taskA.getId(), "read_file", "{\"path\":\"README.md\"}");
+        ToolCallEntity taskBCall = new ToolCallEntity(
+                call.id(), taskB.getId(), call.name(), call.arguments(), clock.instant());
+        taskBCall.markDone("task-b result", clock.instant());
+        toolCallRepository.save(taskBCall);
+        TaskRunToken taskAToken = inTransaction(() -> workerA.claim(taskA.getId())).orElseThrow();
+        return new ForeignLedgerFixture(taskA.getId(), taskAToken, call);
+    }
+
+    private void assertForeignLedgerMutationRejected(String name, ForeignLedgerMutation mutation) {
+        ForeignLedgerFixture fixture = foreignLedgerFixture(name);
+        long taskAMessageCountBefore = messageRepository.countByTaskId(fixture.taskAId());
+        LedgerSnapshot taskBLedgerBefore = ledgerSnapshot(fixture.call().id());
+
+        assertAll(name,
+                () -> assertThrows(IllegalStateException.class, () -> inTransaction(() -> {
+                    mutation.run(workerA, fixture.taskAToken(), fixture.call());
+                    return null;
+                })),
+                () -> assertEquals(taskAMessageCountBefore,
+                        messageRepository.countByTaskId(fixture.taskAId())),
+                () -> assertEquals(taskBLedgerBefore, ledgerSnapshot(fixture.call().id())));
+    }
+
     private StateStore stateStore(String workerId, TaskLeaseGuard leaseGuard) {
         return new StateStore(taskRepository, messageRepository, toolCallRepository, objectMapper,
                 new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
@@ -264,7 +311,8 @@ class StateStoreFencingIT extends InfrastructureIT {
 
     private LedgerSnapshot ledgerSnapshot(String callId) {
         ToolCallEntity call = toolCallRepository.findById(callId).orElseThrow();
-        return new LedgerSnapshot(call.getStatus(), call.getResult(), call.getAttemptCount(), call.getStartedAt());
+        return new LedgerSnapshot(call.getTaskId(), call.getStatus(), call.getResult(),
+                call.getAttemptCount(), call.getStartedAt());
     }
 
     private <T> T inTransaction(Supplier<T> work) {
@@ -306,7 +354,15 @@ class StateStoreFencingIT extends InfrastructureIT {
         void run(StateStore store, TaskRunToken token, ToolCall call);
     }
 
+    @FunctionalInterface
+    private interface ForeignLedgerMutation {
+        void run(StateStore store, TaskRunToken token, ToolCall call);
+    }
+
     private record FencingFixture(String taskId, TaskRunToken oldToken, ToolCall call) {
+    }
+
+    private record ForeignLedgerFixture(String taskAId, TaskRunToken taskAToken, ToolCall call) {
     }
 
     private record TaskSnapshot(TaskStatus status, String result, int recoveryCount,
@@ -314,6 +370,7 @@ class StateStoreFencingIT extends InfrastructureIT {
                                 String controlSignal, Instant updatedAt) {
     }
 
-    private record LedgerSnapshot(ToolCallStatus status, String result, int attemptCount, Instant startedAt) {
+    private record LedgerSnapshot(String taskId, ToolCallStatus status, String result,
+                                  int attemptCount, Instant startedAt) {
     }
 }

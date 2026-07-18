@@ -206,8 +206,7 @@ public class StateStore {
         Object toolCalls = assistantMessage.get("tool_calls");
         String toolCallsJson = toolCalls == null ? null : toJson(toolCalls);
 
-        int sequence = appendMessage(task.getId(), "assistant", content, toolCallsJson, null, now);
-
+        Map<String, ToolCallEntity> callsToCreate = new LinkedHashMap<>();
         if (toolCalls instanceof List<?> list) {
             for (Object o : list) {
                 if (!(o instanceof Map<?, ?> tc)) continue;
@@ -215,12 +214,15 @@ public class StateStore {
                 Map<?, ?> fn = (Map<?, ?>) tc.get("function");
                 String name = String.valueOf(fn.get("name"));
                 String args = asArguments(fn.get("arguments"));
-                // 同一 id 不重复登记(恢复路径里 assistant 不会被重复落库,这里仅作防御)
-                if (!toolCallRepo.existsById(id)) {
-                    toolCallRepo.save(new ToolCallEntity(id, task.getId(), name, args, now));
+                // 先校验整批 call 的任务归属,再落 assistant 消息:外任务同 ID 必须在任何持久化之前 fail closed。
+                if (!callsToCreate.containsKey(id)
+                        && ownedToolCall(task.getId(), id).isEmpty()) {
+                    callsToCreate.put(id, new ToolCallEntity(id, task.getId(), name, args, now));
                 }
             }
         }
+        int sequence = appendMessage(task.getId(), "assistant", content, toolCallsJson, null, now);
+        toolCallRepo.saveAll(callsToCreate.values());
         return sequence;
     }
 
@@ -233,7 +235,7 @@ public class StateStore {
     public void markInProgress(TaskRunToken token, ToolCall call) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
-        ToolCallEntity e = toolCallRepo.findById(call.id())
+        ToolCallEntity e = ownedToolCall(task.getId(), call.id())
                 .orElseGet(() -> new ToolCallEntity(
                         call.id(), task.getId(), call.name(), call.arguments(), now));
         e.markInProgress(now);
@@ -248,7 +250,7 @@ public class StateStore {
     public void recordToolResult(TaskRunToken token, ToolCall call, String result) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
-        ToolCallEntity e = toolCallRepo.findById(call.id())
+        ToolCallEntity e = ownedToolCall(task.getId(), call.id())
                 .orElseGet(() -> new ToolCallEntity(
                         call.id(), task.getId(), call.name(), call.arguments(), now));
         e.markDone(result, now);
@@ -264,7 +266,7 @@ public class StateStore {
     public void markInDoubt(TaskRunToken token, ToolCall call, String result) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
-        ToolCallEntity e = toolCallRepo.findById(call.id())
+        ToolCallEntity e = ownedToolCall(task.getId(), call.id())
                 .orElseGet(() -> new ToolCallEntity(
                         call.id(), task.getId(), call.name(), call.arguments(), now));
         e.markInDoubt(result, now);
@@ -272,9 +274,9 @@ public class StateStore {
         appendMessage(task.getId(), "tool", result, null, call.id(), now);
     }
 
-    /** 账本当前状态(用于恢复决策表);账本里没有这条 = 从没登记过 → 当 PENDING(安全重跑)处理。 */
-    public ToolCallStatus statusOf(String toolCallId) {
-        return toolCallRepo.findById(toolCallId)
+    /** 任务内账本当前状态;本任务没有这条(含其它任务占用同 ID)=从没登记过 → 当 PENDING 处理。 */
+    public ToolCallStatus statusOf(String taskId, String toolCallId) {
+        return toolCallRepo.findByIdAndTaskId(toolCallId, taskId)
                 .map(ToolCallEntity::getStatus)
                 .orElse(ToolCallStatus.PENDING);
     }
@@ -307,6 +309,16 @@ public class StateStore {
     }
 
     // ===================== 内部小工具 =====================
+
+    /** 返回本任务账本行；同 ID 已属于其它任务时在调用方修改任何实体前 fail closed。 */
+    private Optional<ToolCallEntity> ownedToolCall(String taskId, String toolCallId) {
+        Optional<ToolCallEntity> owned = toolCallRepo.findByIdAndTaskId(toolCallId, taskId);
+        if (owned.isEmpty() && toolCallRepo.existsByIdAndTaskIdNot(toolCallId, taskId)) {
+            throw new IllegalStateException(
+                    "tool_call_id 已属于其它任务: " + toolCallId + ", 当前任务: " + taskId);
+        }
+        return owned;
+    }
 
     private int appendMessage(String taskId, String role, String content,
                               String toolCallsJson, String toolCallId, Instant now) {

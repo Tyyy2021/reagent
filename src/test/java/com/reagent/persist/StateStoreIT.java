@@ -57,7 +57,7 @@ class StateStoreIT extends InfrastructureIT {
                 (List<Map<String, Object>>) restored.messages().get(2).get("tool_calls");
         assertEquals(call.id(), restoredCalls.getFirst().get("id"));
         assertEquals(call.id(), restored.messages().get(3).get("tool_call_id"));
-        assertEquals(ToolCallStatus.DONE, stateStore.statusOf(call.id()));
+        assertEquals(ToolCallStatus.DONE, stateStore.statusOf(task.getId(), call.id()));
         assertEquals(List.of(0, 1, 2, 3), messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
                 .map(MessageEntity::getSeq)
                 .toList());
