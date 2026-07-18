@@ -5,6 +5,7 @@ import com.reagent.core.FencedExecutionException;
 import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
 import com.reagent.core.WorkerIdentity;
+import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.stream.StreamTransport;
 import com.reagent.stream.TaskEvent;
 import com.reagent.testsupport.InfrastructureIT;
@@ -32,6 +33,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class StateStoreFencingIT extends InfrastructureIT {
@@ -56,6 +58,9 @@ class StateStoreFencingIT extends InfrastructureIT {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private AgentProfileRegistry profileRegistry;
 
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -156,6 +161,24 @@ class StateStoreFencingIT extends InfrastructureIT {
                         fixture.oldToken(), TaskEvent.Type.STEP, Map.of("step", "stale"))));
 
         assertEquals(eventCountBefore, eventRepository.count());
+    }
+
+    @Test
+    void staleTokenCannotMaterializeLegacyNullProfile() {
+        TaskEntity task = TaskEntity.newTask("legacy profile fencing", clock.instant());
+        task.freezeProfile("coding", null);
+        taskRepository.save(task);
+        TaskRunToken staleToken = inTransaction(() -> workerA.claim(task.getId())).orElseThrow();
+        clock.advance(Duration.ofMillis(LEASE_TTL_MS + 1));
+        TaskRunToken winningToken = inTransaction(() -> workerB.claim(task.getId())).orElseThrow();
+
+        assertThrows(FencedExecutionException.class, () -> inTransaction(() ->
+                workerA.loadProfile(staleToken)));
+
+        TaskEntity unchanged = taskRepository.findById(task.getId()).orElseThrow();
+        assertNull(unchanged.getProfileSnapshot());
+        assertEquals(winningToken.workerId(), unchanged.getOwnerId());
+        assertEquals(winningToken.leaseEpoch(), unchanged.getLeaseEpoch());
     }
 
     @Test
@@ -339,7 +362,7 @@ class StateStoreFencingIT extends InfrastructureIT {
 
     private StateStore stateStore(String workerId, TaskLeaseGuard leaseGuard) {
         return new StateStore(taskRepository, messageRepository, toolCallRepository, objectMapper,
-                null, new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
+                profileRegistry, new WorkerIdentity(workerId, "0"), LEASE_TTL_MS, clock, leaseGuard);
     }
 
     private TaskSnapshot taskSnapshot(String taskId) {

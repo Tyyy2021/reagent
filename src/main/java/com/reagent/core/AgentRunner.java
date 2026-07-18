@@ -136,12 +136,11 @@ public class AgentRunner {
     /** 恢复一个半截任务:从库里重建上下文接着跑(崩溃恢复 / 手动续跑都走这里)。 */
     public String resume(String taskId) {
         log.info("====== 恢复任务:{} ======", taskId);
-        TaskToolCatalog catalog = catalogResolver.resolve(stateStore.loadProfile(taskId));
         TaskEntity task = stateStore.getTask(taskId);
         if (task.getStatus() == TaskStatus.PAUSED) {
             stateStore.markRunning(taskId);   // 暂停的任务:先 PAUSED -> RUNNING 再续跑
         }
-        return drive(task, false, catalog);
+        return drive(task, false, null);
     }
 
     /**
@@ -151,9 +150,8 @@ public class AgentRunner {
      */
     public String recover(String taskId) {
         log.info("====== 接管 / 恢复任务:{} ======", taskId);
-        TaskToolCatalog catalog = catalogResolver.resolve(stateStore.loadProfile(taskId));
         TaskEntity task = stateStore.getTask(taskId);
-        return drive(task, true, catalog);
+        return drive(task, true, null);
     }
 
     /** M4:异步恢复(给 resume 端点用)——在虚拟线程上续跑、立即返回,过程经 SSE 流式推。 */
@@ -189,10 +187,15 @@ public class AgentRunner {
                 return "任务已被其它 worker 持有,本次驱动跳过。";
             }
             TaskRunToken token = claimed.orElseThrow();
-            // M7 Stage2:只有【自动恢复 / 失败转移】路径才计恢复次数并止损(手动 resume / 新任务不计)。
-            // 放在 claim 之后:只有真抢到执行权的 worker 才 +1,落败的 worker 直接跳过、绝不误加计数。
-            if (autoRecovery) {
-                try {
+            try {
+                // Recovery/resume resolves the frozen catalog only after this worker wins the lease.
+                // Legacy NULL snapshots are materialized by the token-guarded StateStore overload.
+                if (catalog == null) {
+                    catalog = catalogResolver.resolve(stateStore.loadProfile(token));
+                }
+                // M7 Stage2:只有【自动恢复 / 失败转移】路径才计恢复次数并止损(手动 resume / 新任务不计)。
+                // 放在 claim 之后:只有真抢到执行权的 worker 才 +1,落败的 worker 直接跳过、绝不误加计数。
+                if (autoRecovery) {
                     int attempt = stateStore.incrementRecoveryCount(token);
                     if (attempt > maxAttempts) {
                         log.warn("任务 {} 已自动恢复 {} 次仍未完成,超上限 {},止损标记 FAILED。", taskId, attempt - 1, maxAttempts);
@@ -200,10 +203,10 @@ public class AgentRunner {
                         return "超过最大自动恢复次数,已止损标记 FAILED。";
                     }
                     log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
-                } catch (FencedExecutionException ex) {
-                    log.warn("任务 {} 的自动恢复前置写已被 fence,停止旧驱动且不写 FAILED: {}", taskId, ex.getMessage());
-                    return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
                 }
+            } catch (FencedExecutionException ex) {
+                log.warn("任务 {} 的恢复前置步骤已被 fence,停止旧驱动且不写 FAILED: {}", taskId, ex.getMessage());
+                return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
             }
             taskControl.begin(token);   // 登记驱动线程 + 打断信号槽 + 本次运行 token(M4 / M7 Stage3)
             // M6:任务 root span —— 用 taskId 派生 traceId,新任务与每次恢复都落在【同一条 trace】下(跨崩溃可视);

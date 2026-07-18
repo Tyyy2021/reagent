@@ -33,6 +33,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentRunnerEventFencingTest {
 
@@ -136,6 +137,57 @@ class AgentRunnerEventFencingTest {
     }
 
     @Test
+    void losingRecoveryClaimDoesNotLoadProfileOrCallLlm(@TempDir Path workspace) {
+        TaskEntity task = TaskEntity.newTask("lose recovery claim", Instant.EPOCH);
+        LosingClaimStateStore stateStore = new LosingClaimStateStore(
+                task, new TaskRunToken(task.getId(), "worker-a", 7));
+        FinalAnswerLlm llm = new FinalAnswerLlm();
+        ToolCatalogResolver resolver = codingResolver();
+        AgentRunner runner = runner(llm, stateStore, resolver, new RecordingTransport(), workspace);
+
+        String result = runner.recover(task.getId());
+
+        assertEquals("任务已被其它 worker 持有,本次驱动跳过。", result);
+        assertEquals(0, stateStore.profileLoads);
+        assertEquals(List.of(), llm.seenToolNames);
+    }
+
+    @Test
+    void winningRecoveryLoadsProfileAfterClaimAndBeforeLlm(@TempDir Path workspace) {
+        TaskEntity task = TaskEntity.newTask("ordered recovery prelude", Instant.EPOCH);
+        List<String> events = new ArrayList<>();
+        OrderedRecoveryStateStore stateStore = new OrderedRecoveryStateStore(
+                task, new TaskRunToken(task.getId(), "worker-a", 7), events);
+        ToolCatalogResolver resolver = codingResolver();
+        AgentRunner runner = runner(
+                new OrderedFinalAnswerLlm(events), stateStore, resolver,
+                new RecordingTransport(), workspace);
+
+        assertEquals("done", runner.recover(task.getId()));
+
+        assertTrue(events.indexOf("claim") < events.indexOf("profile"), events.toString());
+        assertTrue(events.indexOf("profile") < events.indexOf("llm"), events.toString());
+    }
+
+    @Test
+    void fencingDuringRecoveryProfilePreludeStopsBeforeEventsOrLlm(@TempDir Path workspace) {
+        TaskEntity task = TaskEntity.newTask("fenced recovery profile", Instant.EPOCH);
+        TaskRunToken token = new TaskRunToken(task.getId(), "worker-a", 7);
+        StateStore stateStore = new FenceOnProfileLoadStateStore(task, token);
+        FinalAnswerLlm llm = new FinalAnswerLlm();
+        RecordingTransport transport = new RecordingTransport();
+        ToolCatalogResolver resolver = codingResolver();
+        AgentRunner runner = runner(llm, stateStore, resolver, transport, workspace);
+
+        String result = runner.recover(task.getId());
+
+        assertEquals("本任务已被其它 worker 接管(fence),本 worker 停止驱动。", result);
+        assertEquals(List.of(), llm.seenToolNames);
+        assertEquals(List.of(), transport.controlPlaneTypes);
+        assertEquals(List.of(), transport.fencedTypes);
+    }
+
+    @Test
     void unknownProfileFailsBeforeTaskCreation(@TempDir Path workspace) {
         TaskEntity task = TaskEntity.newTask("must not create", Instant.EPOCH);
         TaskRunToken token = new TaskRunToken(task.getId(), "worker-a", 7);
@@ -179,6 +231,11 @@ class AgentRunnerEventFencingTest {
 
         @Override
         public TaskProfileSnapshot loadProfile(String taskId) {
+            return codingResolver().snapshot(com.reagent.profile.AgentProfileDefinition.coding());
+        }
+
+        @Override
+        public TaskProfileSnapshot loadProfile(TaskRunToken token) {
             return codingResolver().snapshot(com.reagent.profile.AgentProfileDefinition.coding());
         }
 
@@ -248,6 +305,83 @@ class AgentRunnerEventFencingTest {
         }
     }
 
+    private static final class LosingClaimStateStore extends FinalAnswerStateStore {
+        private int profileLoads;
+
+        private LosingClaimStateStore(TaskEntity task, TaskRunToken token) {
+            super(task, token);
+        }
+
+        @Override
+        public TaskProfileSnapshot loadProfile(String taskId) {
+            profileLoads++;
+            return super.loadProfile(taskId);
+        }
+
+        @Override
+        public TaskProfileSnapshot loadProfile(TaskRunToken token) {
+            profileLoads++;
+            return super.loadProfile(token);
+        }
+
+        @Override
+        public Optional<TaskRunToken> claim(String taskId) {
+            return Optional.empty();
+        }
+    }
+
+    private static final class OrderedRecoveryStateStore extends FinalAnswerStateStore {
+        private final List<String> events;
+
+        private OrderedRecoveryStateStore(TaskEntity task, TaskRunToken token, List<String> events) {
+            super(task, token);
+            this.events = events;
+        }
+
+        @Override
+        public TaskProfileSnapshot loadProfile(String taskId) {
+            events.add("profile");
+            return super.loadProfile(taskId);
+        }
+
+        @Override
+        public TaskProfileSnapshot loadProfile(TaskRunToken token) {
+            events.add("profile");
+            return super.loadProfile(token);
+        }
+
+        @Override
+        public Optional<TaskRunToken> claim(String taskId) {
+            events.add("claim");
+            return super.claim(taskId);
+        }
+
+        @Override
+        public int incrementRecoveryCount(TaskRunToken token) {
+            return 1;
+        }
+    }
+
+    private static final class FenceOnProfileLoadStateStore extends FinalAnswerStateStore {
+        private final TaskRunToken token;
+
+        private FenceOnProfileLoadStateStore(TaskEntity task, TaskRunToken token) {
+            super(task, token);
+            this.token = token;
+        }
+
+        @Override
+        public TaskProfileSnapshot loadProfile(TaskRunToken token) {
+            throw new FencedExecutionException(
+                    this.token, "worker-b", this.token.leaseEpoch() + 1, TaskStatus.RUNNING);
+        }
+
+        @Override
+        public int incrementRecoveryCount(TaskRunToken token) {
+            return 1;
+        }
+    }
+
     private static final class CountingStateStore extends FinalAnswerStateStore {
         private int creations;
 
@@ -277,6 +411,39 @@ class AgentRunnerEventFencingTest {
             onToken.accept("done");
             return Decision.finalAnswer("done", Map.of("role", "assistant", "content", "done"));
         }
+    }
+
+    private record OrderedFinalAnswerLlm(List<String> events) implements LlmClient {
+        @Override
+        public Decision chat(Context context, List<Map<String, Object>> toolSpecs) {
+            throw new UnsupportedOperationException("AgentRunner uses chatStream");
+        }
+
+        @Override
+        public Decision chatStream(Context context, List<Map<String, Object>> toolSpecs,
+                                   java.util.function.Consumer<String> onToken) {
+            events.add("llm");
+            return Decision.finalAnswer("done", Map.of("role", "assistant", "content", "done"));
+        }
+    }
+
+    private static AgentRunner runner(LlmClient llm, StateStore stateStore,
+                                      ToolCatalogResolver resolver, RecordingTransport transport,
+                                      Path workspace) {
+        return new AgentRunner(
+                llm,
+                profileRegistry(resolver),
+                resolver,
+                null,
+                stateStore,
+                new ShutdownState(),
+                new FixedWorkspaceStore(workspace),
+                new InFlightTasks(),
+                transport,
+                new TaskControl(),
+                OpenTelemetry.noop().getTracer("agent-runner-profile-fencing-test"),
+                new WorkerIdentity("worker-a", "0"),
+                3);
     }
 
     private static ToolCatalogResolver codingResolver() {

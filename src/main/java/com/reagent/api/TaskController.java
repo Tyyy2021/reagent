@@ -134,6 +134,7 @@ public class TaskController {
                     "message", "已请求取消(跨 worker:owner 将在安全点优雅停"
                             + (force ? ";force 跨 worker 退化为优雅)" : ")")));
         }
+        stateStore.getTask(id); // Distinguish an absent task (404 advice) from an existing non-running task (409).
         return ResponseEntity.status(409).body(Map.of(
                 "taskId", id, "message", "任务不在运行中(可能已结束),无法取消"));
     }
@@ -150,6 +151,7 @@ public class TaskController {
             return ResponseEntity.accepted().body(Map.of("taskId", id,
                     "message", "已请求暂停(跨 worker:owner 将在安全点停)"));
         }
+        stateStore.getTask(id); // Distinguish an absent task (404 advice) from an existing non-running task (409).
         return ResponseEntity.status(409).body(Map.of(
                 "taskId", id, "message", "任务不在运行中,无法暂停"));
     }

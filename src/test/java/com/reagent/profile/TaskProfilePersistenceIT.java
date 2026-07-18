@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -146,15 +147,33 @@ class TaskProfilePersistenceIT extends InfrastructureIT {
     }
 
     @Test
-    void legacyNullSnapshotIsMaterializedBeforeRecovery() {
+    void legacyNullSnapshotIsNotMaterializedWithoutRunToken() {
+        jdbc.update("""
+                INSERT INTO task (
+                    id, goal, status, created_at, updated_at, recovery_count,
+                    lease_epoch, profile_id, profile_snapshot
+                ) VALUES (?, ?, 'RUNNING', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0, 0, 'coding', NULL)
+                """, "legacy-readonly-profile-task", "legacy goal");
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> stateStore.loadProfile("legacy-readonly-profile-task"));
+        entityManager.clear();
+
+        assertTrue(error.getMessage().contains("run token"));
+        assertNull(stateStore.getTask("legacy-readonly-profile-task").getProfileSnapshot());
+    }
+
+    @Test
+    void winningTokenMaterializesLegacyNullSnapshotBeforeRecovery() {
         jdbc.update("""
                 INSERT INTO task (
                     id, goal, status, created_at, updated_at, recovery_count,
                     lease_epoch, profile_id, profile_snapshot
                 ) VALUES (?, ?, 'RUNNING', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0, 0, 'coding', NULL)
                 """, "legacy-profile-task", "legacy goal");
+        TaskRunToken token = stateStore.claim("legacy-profile-task").orElseThrow();
 
-        TaskProfileSnapshot materialized = stateStore.loadProfile("legacy-profile-task");
+        TaskProfileSnapshot materialized = stateStore.loadProfile(token);
         entityManager.clear();
         TaskEntity reloaded = stateStore.getTask("legacy-profile-task");
 

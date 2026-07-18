@@ -97,23 +97,35 @@ public class StateStore {
         return saved;
     }
 
-    @Transactional
+    @Transactional(readOnly = true)
     public TaskProfileSnapshot loadProfile(String taskId) {
-        TaskEntity task = taskRepo.findByIdForUpdate(taskId)
+        TaskEntity task = taskRepo.findById(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
-        String snapshotJson = task.getProfileSnapshot();
-        if (snapshotJson == null) {
+        if (task.getProfileSnapshot() == null) {
+            throw new IllegalStateException(
+                    "Legacy task profile materialization requires a claimed task run token: " + taskId);
+        }
+        return deserializeAndValidateProfile(task);
+    }
+
+    @Transactional
+    public TaskProfileSnapshot loadProfile(TaskRunToken token) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        if (task.getProfileSnapshot() == null) {
             if (task.getProfileId() != null && !"coding".equals(task.getProfileId())) {
                 throw new IllegalStateException("Legacy task has unsupported profile: " + task.getProfileId());
             }
             TaskProfileSnapshot coding = profileRegistry.snapshot("coding");
-            snapshotJson = serializeProfile(coding);
-            task.freezeProfile(coding.profileId(), snapshotJson);
+            task.freezeProfile(coding.profileId(), serializeProfile(coding));
             taskRepo.save(task);
         }
-        TaskProfileSnapshot snapshot = deserializeProfile(snapshotJson);
+        return deserializeAndValidateProfile(task);
+    }
+
+    private TaskProfileSnapshot deserializeAndValidateProfile(TaskEntity task) {
+        TaskProfileSnapshot snapshot = deserializeProfile(task.getProfileSnapshot());
         if (!snapshot.profileId().equals(task.getProfileId())) {
-            throw new IllegalStateException("Task profile ID does not match persisted snapshot: " + taskId);
+            throw new IllegalStateException("Task profile ID does not match persisted snapshot: " + task.getId());
         }
         return snapshot;
     }

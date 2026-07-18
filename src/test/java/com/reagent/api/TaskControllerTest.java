@@ -112,4 +112,42 @@ class TaskControllerTest {
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error").value("Task not found: missing"));
     }
+
+    @Test
+    void cancellingMissingTaskReturnsNotFound() throws Exception {
+        when(stateStore.getTask("missing-cancel"))
+                .thenThrow(new TaskNotFoundException("missing-cancel"));
+
+        mvc.perform(post("/api/tasks/missing-cancel/cancel"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("Task not found: missing-cancel"));
+    }
+
+    @Test
+    void pausingMissingTaskReturnsNotFound() throws Exception {
+        when(stateStore.getTask("missing-pause"))
+                .thenThrow(new TaskNotFoundException("missing-pause"));
+
+        mvc.perform(post("/api/tasks/missing-pause/pause"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("Task not found: missing-pause"));
+    }
+
+    @Test
+    void cancellingExistingNonRunningTaskRemainsConflict() throws Exception {
+        when(stateStore.getTask("completed-cancel")).thenReturn(mock(TaskEntity.class));
+
+        mvc.perform(post("/api/tasks/completed-cancel/cancel"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.taskId").value("completed-cancel"));
+    }
+
+    @Test
+    void pausingExistingNonRunningTaskRemainsConflict() throws Exception {
+        when(stateStore.getTask("completed-pause")).thenReturn(mock(TaskEntity.class));
+
+        mvc.perform(post("/api/tasks/completed-pause/pause"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.taskId").value("completed-pause"));
+    }
 }
