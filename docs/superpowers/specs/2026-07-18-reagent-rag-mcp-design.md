@@ -236,7 +236,7 @@ LLM 最终答案只能引用工具实际返回的 `chunkId`；无命中时必须
 
 ### 7.3 Embedding
 
-生产演示使用 LangChain4j 独立的 `langchain4j-embeddings-all-minilm-l6-v2:1.18.0-beta28` 进程内 ONNX 模块及量化模型：
+生产演示使用 LangChain4j 独立的 `langchain4j-embeddings-all-minilm-l6-v2-q:1.18.0-beta28` 进程内 ONNX 量化模型：
 
 - 不采用 LangChain4j Agent/RAG 框架；
 - 不增加 Ollama、TEI 或外部 Embedding API；
