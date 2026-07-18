@@ -20,5 +20,8 @@ application-local.yml
 .DS_Store
 Thumbs.db
 
+# ===== 本地 Git worktree =====
+.worktrees/
+
 # 设计文档(含面试 Q&A 等私有 prep),本地保留、暂不公开
 DESIGN.md
