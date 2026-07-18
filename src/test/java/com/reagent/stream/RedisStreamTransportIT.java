@@ -1,0 +1,133 @@
+package com.reagent.stream;
+
+import com.reagent.testsupport.InfrastructureIT;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.test.context.TestPropertySource;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+@TestPropertySource(properties = {
+        "reagent.streaming.transport=redis",
+        "reagent.streaming.redis-stream-ttl-sec=30"
+})
+class RedisStreamTransportIT extends InfrastructureIT {
+
+    private static final String KEY_PREFIX = "reagent:stream:";
+
+    @Autowired
+    private RedisStreamTransport transport;
+
+    @Autowired
+    private StreamTransport selectedTransport;
+
+    @Autowired
+    private EventStore eventStore;
+
+    @Autowired
+    private StringRedisTemplate redis;
+
+    @Test
+    void replaysPersistedStepThenDeliversLiveToolResultWithoutLossOrDuplicate() throws InterruptedException {
+        assertSame(transport, selectedTransport, "Redis transport must be the active StreamTransport");
+        String taskId = taskId();
+        transport.publish(taskId, TaskEvent.Type.STEP, Map.of("step", 1));
+
+        List<TaskEvent> received = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch replayReceived = new CountDownLatch(1);
+        CountDownLatch bothReceived = new CountDownLatch(2);
+        StreamTransport.Subscription subscription = transport.subscribeWithReplay(taskId, "0", event -> {
+            received.add(event);
+            if (event.type() == TaskEvent.Type.STEP) {
+                replayReceived.countDown();
+            }
+            bothReceived.countDown();
+            return true;
+        });
+
+        assertAwait(replayReceived, "Persisted STEP was not replayed");
+        transport.publish(taskId, TaskEvent.Type.TOOL_RESULT, Map.of("result", "ok"));
+        assertAwait(bothReceived, "Live TOOL_RESULT was not delivered");
+        subscription.close();
+
+        assertEquals(List.of(TaskEvent.Type.STEP, TaskEvent.Type.TOOL_RESULT), types(received));
+        assertEquals(2, received.stream().map(TaskEvent::eventId).distinct().count());
+    }
+
+    @Test
+    void tokenIsDeliveredLiveButAbsentFromMysqlReplay() throws InterruptedException {
+        String taskId = taskId();
+        TaskEvent step = transport.publish(taskId, TaskEvent.Type.STEP, Map.of("step", 1));
+        List<TaskEvent> received = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch tokenReceived = new CountDownLatch(1);
+        StreamTransport.Subscription subscription = transport.subscribeWithReplay(taskId, step.eventId(), event -> {
+            received.add(event);
+            tokenReceived.countDown();
+            return true;
+        });
+
+        transport.publish(taskId, TaskEvent.Type.TOKEN, Map.of("text", "hello"));
+        assertAwait(tokenReceived, "Live TOKEN was not delivered");
+        subscription.close();
+
+        assertEquals(List.of(TaskEvent.Type.TOKEN), types(received));
+        assertNull(received.getFirst().eventId(), "TOKEN must not expose a durable cursor");
+        assertEquals(List.of(TaskEvent.Type.STEP), types(eventStore.replayAfter(taskId, 0L)),
+                "TOKEN must not be persisted to MySQL event replay");
+    }
+
+    @Test
+    void terminalEventSetsPositiveStreamTtl() {
+        String taskId = taskId();
+
+        transport.publish(taskId, TaskEvent.Type.COMPLETED, Map.of("answer", "done"));
+
+        Long ttlSeconds = redis.getExpire(KEY_PREFIX + taskId, TimeUnit.SECONDS);
+        assertTrue(ttlSeconds != null && ttlSeconds > 0,
+                () -> "Terminal stream must have a positive TTL, actual=" + ttlSeconds);
+    }
+
+    @Test
+    void missingExpiredStreamFallsBackToDurableMysqlReplay() throws InterruptedException {
+        String taskId = taskId();
+        transport.publish(taskId, TaskEvent.Type.STEP, Map.of("step", 1));
+        transport.publish(taskId, TaskEvent.Type.TOOL_RESULT, Map.of("result", "durable"));
+        assertTrue(Boolean.TRUE.equals(redis.delete(KEY_PREFIX + taskId)), "Test stream must exist before expiry");
+
+        List<TaskEvent> received = new ArrayList<>();
+        CountDownLatch replayed = new CountDownLatch(2);
+        transport.subscribeWithReplay(taskId, "ignored-after-expiry", event -> {
+            received.add(event);
+            replayed.countDown();
+            return true;
+        });
+
+        assertAwait(replayed, "Durable MySQL fallback did not replay both events");
+        assertEquals(List.of(TaskEvent.Type.STEP, TaskEvent.Type.TOOL_RESULT), types(received));
+        assertTrue(received.stream().allMatch(event -> event.eventId() != null));
+    }
+
+    private static List<TaskEvent.Type> types(List<TaskEvent> events) {
+        return events.stream().map(TaskEvent::type).toList();
+    }
+
+    private static void assertAwait(CountDownLatch latch, String message) throws InterruptedException {
+        assertTrue(latch.await(10, TimeUnit.SECONDS), message);
+    }
+
+    private static String taskId() {
+        return "redis-it-" + UUID.randomUUID();
+    }
+}

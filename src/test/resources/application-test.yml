@@ -1,0 +1,23 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    open-in-view: false
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: 1
+  data:
+    redis:
+      timeout: 5s
+
+reagent:
+  streaming:
+    transport: in-process
+  tracing:
+    enabled: false
+  recovery:
+    enabled: false
+  sandbox:
+    workspace-root: ${reagent.test.workspace-root}
