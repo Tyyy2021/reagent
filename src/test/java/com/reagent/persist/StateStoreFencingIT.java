@@ -97,28 +97,49 @@ class StateStoreFencingIT extends InfrastructureIT {
     void currentTokenWritesDenseMessagesUnderConcurrentEventTraffic() throws Exception {
         TaskEntity task = taskRepository.save(TaskEntity.newTask("dense concurrent messages", clock.instant()));
         TaskRunToken token = inTransaction(() -> workerA.claim(task.getId())).orElseThrow();
-        int writers = 12;
-        CyclicBarrier start = new CyclicBarrier(writers + 1);
-        List<CompletableFuture<Integer>> writes = new ArrayList<>();
+        int messageWriters = 12;
+        int eventWriters = 12;
+        CyclicBarrier start = new CyclicBarrier(messageWriters + eventWriters + 1);
+        List<CompletableFuture<Integer>> messageWrites = new ArrayList<>();
+        List<CompletableFuture<TaskEvent>> eventWrites = new ArrayList<>();
 
-        try (ExecutorService executor = Executors.newFixedThreadPool(writers)) {
-            for (int i = 0; i < writers; i++) {
-                int eventNumber = i;
-                writes.add(CompletableFuture.supplyAsync(() -> {
+        try (ExecutorService executor = Executors.newFixedThreadPool(messageWriters + eventWriters)) {
+            for (int i = 0; i < messageWriters; i++) {
+                int messageNumber = i;
+                messageWrites.add(CompletableFuture.supplyAsync(() -> {
                     await(start);
                     return inTransaction(() -> workerA.appendAssistant(
-                            token, Map.of("role", "assistant", "content", "event-" + eventNumber)));
+                            token, Map.of("role", "assistant", "content", "message-" + messageNumber)));
+                }, executor));
+            }
+            for (int i = 0; i < eventWriters; i++) {
+                int eventNumber = i;
+                eventWrites.add(CompletableFuture.supplyAsync(() -> {
+                    await(start);
+                    return streamTransport.publish(
+                            token, TaskEvent.Type.STEP, Map.of("event", eventNumber));
                 }, executor));
             }
             start.await();
-            List<Integer> returnedSequences = writes.stream()
+            List<Integer> returnedSequences = messageWrites.stream()
                     .map(CompletableFuture::join)
                     .sorted()
                     .toList();
+            eventWrites.forEach(CompletableFuture::join);
 
-            assertEquals(range(writers), returnedSequences);
-            assertEquals(range(writers), messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
+            assertEquals(range(messageWriters), returnedSequences);
+            assertEquals(range(messageWriters), messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
                     .map(MessageEntity::getSeq)
+                    .sorted()
+                    .toList());
+            List<EventEntity> durableEvents =
+                    eventRepository.findByTaskIdAndIdGreaterThanOrderByIdAsc(task.getId(), 0L);
+            assertEquals(eventWriters, durableEvents.size());
+            assertEquals(eventWriters, durableEvents.stream()
+                    .filter(event -> TaskEvent.Type.STEP.name().equals(event.getType()))
+                    .count());
+            assertEquals(range(eventWriters), durableEvents.stream()
+                    .map(event -> eventNumber(event.getData()))
                     .sorted()
                     .toList());
         }
@@ -152,6 +173,44 @@ class StateStoreFencingIT extends InfrastructureIT {
         assertEquals(eventCountBefore + 1, eventRepository.count());
         assertEquals(TaskEvent.Type.COMPLETED.name(),
                 eventRepository.findById(Long.parseLong(event.eventId())).orElseThrow().getType());
+    }
+
+    @Test
+    void pauseTaskAtomicallyConsumesControlSignal() {
+        TaskEntity task = taskRepository.save(TaskEntity.newTask("atomic pause", clock.instant()));
+        TaskRunToken token = inTransaction(() -> workerA.claim(task.getId())).orElseThrow();
+        inTransaction(() -> {
+            workerA.requestControl(task.getId(), "PAUSE");
+            return null;
+        });
+
+        inTransaction(() -> {
+            workerA.pauseTask(token);
+            return null;
+        });
+
+        TaskEntity paused = taskRepository.findById(task.getId()).orElseThrow();
+        assertEquals(TaskStatus.PAUSED, paused.getStatus());
+        assertEquals("NONE", paused.getControlSignal());
+    }
+
+    @Test
+    void cancelTaskAtomicallyConsumesControlSignal() {
+        TaskEntity task = taskRepository.save(TaskEntity.newTask("atomic cancel", clock.instant()));
+        TaskRunToken token = inTransaction(() -> workerA.claim(task.getId())).orElseThrow();
+        inTransaction(() -> {
+            workerA.requestControl(task.getId(), "CANCEL");
+            return null;
+        });
+
+        inTransaction(() -> {
+            workerA.cancelTask(token, "cancelled");
+            return null;
+        });
+
+        TaskEntity cancelled = taskRepository.findById(task.getId()).orElseThrow();
+        assertEquals(TaskStatus.CANCELLED, cancelled.getStatus());
+        assertEquals("NONE", cancelled.getControlSignal());
     }
 
     private static Stream<Arguments> staleMutators() {
@@ -224,6 +283,14 @@ class StateStoreFencingIT extends InfrastructureIT {
 
     private static List<Integer> range(int endExclusive) {
         return java.util.stream.IntStream.range(0, endExclusive).boxed().toList();
+    }
+
+    private int eventNumber(String data) {
+        try {
+            return objectMapper.readTree(data).path("event").asInt(-1);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException exception) {
+            throw new IllegalStateException("invalid durable event data: " + data, exception);
+        }
     }
 
     private static void await(CyclicBarrier barrier) {

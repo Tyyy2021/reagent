@@ -340,7 +340,6 @@ public class AgentRunner {
             }
         }
         if (sig == TaskControl.Signal.CANCEL) {
-            stateStore.clearControlSignal(token);   // 消费后清(幂等;防冗余触发)
             String msg = "任务已被用户取消。";
             stateStore.cancelTask(token, msg);
             bus.publish(token, TaskEvent.Type.CANCELLED, Map.of("status", "CANCELLED"));
@@ -348,7 +347,6 @@ public class AgentRunner {
             return msg;
         }
         if (sig == TaskControl.Signal.PAUSE) {
-            stateStore.clearControlSignal(token);   // 必须清:否则 resume 续跑后第一个安全点又读到 PAUSE、再次暂停
             String msg = "任务已暂停,可通过 resume 续跑。";
             stateStore.pauseTask(token);
             bus.publish(token, TaskEvent.Type.PAUSED, Map.of("status", "PAUSED"));

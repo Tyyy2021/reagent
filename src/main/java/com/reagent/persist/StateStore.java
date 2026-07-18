@@ -162,6 +162,7 @@ public class StateStore {
     public void cancelTask(TaskRunToken token, String note) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         task.cancel(note, clock.instant());
+        task.clearControlSignal();
         taskRepo.save(task);
     }
 
@@ -170,6 +171,7 @@ public class StateStore {
     public void pauseTask(TaskRunToken token) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         task.pause(clock.instant());
+        task.clearControlSignal();
         taskRepo.save(task);
     }
 

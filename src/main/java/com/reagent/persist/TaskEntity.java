@@ -106,6 +106,11 @@ public class TaskEntity {
         this.leaseExpiresAt = null;
     }
 
+    /** Owner consumes a persisted control request as part of the guarded state transition. */
+    public void clearControlSignal() {
+        this.controlSignal = "NONE";
+    }
+
     public void complete(String answer, Instant now) {
         this.status = TaskStatus.COMPLETED;
         this.result = answer;
