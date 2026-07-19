@@ -1,5 +1,7 @@
 # ReAgent RAG + MCP Interview Edition Implementation Plan
 
+> **已部分替代：** Runtime Task 1–4 仍按本计划套件中的 `2026-07-18-reagent-runtime-evidence.md` 执行；Task 5–14 已由 `2026-07-19-reagent-java-python-hybrid-roadmap.md` 及其三个子计划替代，不得继续按本文件的 Java-only RAG/Fake MCP 路线实施。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn the approved ReAgent design into a reproducible interview project that proves runtime recovery with automation and demonstrates one complete RAG → MCP → durable approval → idempotent ticket workflow.

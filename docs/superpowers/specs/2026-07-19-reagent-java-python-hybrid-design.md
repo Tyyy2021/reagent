@@ -1,7 +1,7 @@
 # ReAgent Java + Python 混合面试工程版设计规格
 
 - 日期：2026-07-19
-- 状态：待用户书面复核
+- 状态：已批准（2026-07-19）
 - 目标项目：/root/reagent
 - 适用范围：Runtime Task 4 收口，以及全局 Task 5–14 的替代设计
 - 前置规格：docs/superpowers/specs/2026-07-18-reagent-rag-mcp-design.md
@@ -231,7 +231,7 @@ Python 根应用使用 ASGI，提供：
 - /internal/acceptance；
 - /mcp。
 
-MCP 服务使用官方 MCP Python SDK 稳定版 mcp==1.28.0。当前 2.0 仍是预发布且官方明确提示可能逐版本破坏，不在本项目中采用。依赖升级必须显式修改 pyproject.toml 与锁文件并重跑跨语言协议测试。
+MCP 服务使用官方 MCP Python SDK 稳定版 mcp==1.28.1。当前 2.0 仍是预发布且官方明确提示可能逐版本破坏，不在本项目中采用。依赖升级必须显式修改 pyproject.toml 与锁文件并重跑跨语言协议测试。
 
 MCP Server 使用 FastMCP 的 Streamable HTTP，配置 stateless_http=true、json_response=true 和 streamable_http_path="/"，再挂载到根 ASGI 应用的 /mcp，因此 Java Client 的最终连接地址就是 /mcp，而不是 /mcp/mcp。ASGI lifespan 必须启动和关闭 FastMCP session manager。业务持久性来自 MySQL 工单表，而不是 MCP session。
 
@@ -736,7 +736,7 @@ Python Alembic：
 |---|---|
 | 两种语言增加复杂度 | 只有一个 Python 服务；契约版本、锁文件和端到端测试 |
 | Python 变成第二控制面 | 禁止保存 Agent 状态；Java 是唯一任务真相源 |
-| MCP Python 2.0 预发布变化 | 精确固定稳定版 1.28.0；不自动升级 |
+| MCP Python 2.0 预发布变化 | 精确固定稳定版 1.28.1；不自动升级 |
 | Java/Python 协议不兼容 | 真实 Streamable HTTP initialize/list/call 作为合并门禁 |
 | MiniLM 对中文不佳 | 首版英文语料和查询；真实离线阈值 |
 | Python 镜像过大 | 单一MiniLM CPU模型、Docker分层缓存；首版不引入第二个推理框架 |

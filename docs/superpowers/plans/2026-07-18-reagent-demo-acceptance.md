@@ -1,5 +1,7 @@
 # ReAgent Demo, Acceptance, and CI Implementation Plan
 
+> **已替代：** 本单 Java 可执行体交付计划不再执行。Task 12–14 以 `2026-07-19-reagent-demo-delivery.md` 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Package the proven runtime/RAG/MCP workflow into a readable static console and a one-command local stack, with downloadable CI evidence and a fully automated Worker-crash demonstration.

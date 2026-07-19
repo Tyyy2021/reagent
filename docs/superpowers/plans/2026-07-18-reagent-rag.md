@@ -1,5 +1,7 @@
 # ReAgent RAG Implementation Plan
 
+> **已替代：** 本 Java-only RAG 计划不再执行。Task 5–7 以 `2026-07-19-reagent-python-rag.md` 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a deterministic, locally embedded operations knowledge base whose Redis 8 vector search returns bounded, stable, source-verifiable citations through the existing ReAgent tool path.

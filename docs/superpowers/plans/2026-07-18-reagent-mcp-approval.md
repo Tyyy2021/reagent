@@ -1,5 +1,7 @@
 # ReAgent MCP and Durable Approval Implementation Plan
 
+> **已替代：** 本 Java Fake MCP 计划不再执行。Task 8–11 以 `2026-07-19-reagent-mcp-incident.md` 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Connect ReAgent to a real Streamable HTTP MCP server, persist approval before write tools, and automatically prove that a crash after remote ticket creation but before local bookkeeping still yields one unique ticket.
