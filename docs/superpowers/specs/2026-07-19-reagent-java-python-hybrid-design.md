@@ -24,8 +24,7 @@
 - RAG 的切片、Embedding、索引、检索和离线评测由 Python 服务负责；
 - Fake Ops MCP Server 由 Python 服务负责；
 - Java 保留 RAG Tool 适配器、MCP Client、审批、恢复和唯一控制面；
-- 增加告警接入与去重；
-- 每个实现 Task 同步交付面试材料。
+- 增加告警接入与去重。
 
 若两份规格对 Task 5–14 有冲突，以本规格为准。Task 1–4 不因本次语言调整返工、重写或重置。
 
@@ -630,35 +629,16 @@ Java Spring Boot 提供无 Node 构建的静态页面，显示：
 - demo-down.sh：停止并保留数据；
 - demo-reset.sh：显式重置。
 
-## 17. 面试材料双轨交付
+## 17. 文档交付范围
 
-每个 Task 的 Definition of Done 增加：
+本轮每个 Task 的 Definition of Done 只包含：
 
 - 代码和测试；
 - RED/GREEN 与集成证据；
-- 一张主题面试卡；
-- 30 秒回答；
-- 2 分钟深入回答；
-- 至少 5 个追问；
-- 替代方案和边界；
-- 可重复演示步骤。
+- 为运行、维护和复现测试所必需的技术文档；
+- 可重复的验收或演示步骤。
 
-建议目录：
-
-~~~text
-docs/interview/
-├── 00-project-pitch.md
-├── 01-architecture.md
-├── 02-runtime.md
-├── 03-rag.md
-├── 04-mcp-approval.md
-├── 05-testing.md
-├── 06-tradeoffs.md
-├── question-bank.md
-└── demo-script.md
-~~~
-
-面试材料只能陈述已经通过测试或演示证明的行为。尚未完成的能力只能列为 roadmap。
+本轮不要求每个 Task 同步产出面试卡、口述稿或追问题库，也不创建专用 docs/interview 目录。全部功能稳定后是否集中整理面试材料，由用户另行决定，不作为 Task 5–14 的完成门禁。
 
 ## 18. Task 重排
 
@@ -674,7 +654,7 @@ docs/interview/
 | 11 | 整批屏障、事故闭环和崩溃矩阵 | Java + Python |
 | 12 | Readiness、Trace、验收报告 | Java + Python |
 | 13 | 薄控制台和浏览器流程 | Java + JS |
-| 14 | Compose、CI、脚本、README和面试材料收口 | 全栈 |
+| 14 | Compose、CI、脚本、README和验收文档收口 | 全栈 |
 
 Task 4 必须先完成 Step 4.7、全量验证、单一提交和独立审查。Task 5 之前不得修改或覆盖现有 21 个 Task 4 工作路径。
 
@@ -747,7 +727,7 @@ Python Alembic：
 - 一条命令启动完整栈；
 - 一个按钮或脚本触发告警；
 - 页面展示取证、审批、崩溃、接管和唯一工单；
-- README 提供 30 秒介绍、5 分钟演示和深挖入口；
+- README 提供架构说明、启动步骤、正常演示和故障演示入口；
 - 普通演示不随机故障，故障演示必须显式开启。
 
 ## 22. 风险与缓解
@@ -764,7 +744,7 @@ Python Alembic：
 | 告警重复创建任务 | 数据库唯一约束和事务返回已有taskId |
 | 工单远端成功、本地未知 | tool_call_id幂等键、唯一约束和故障矩阵 |
 | 项目被认为造轮子 | 明确受限Runtime定位、替代方案和非目标 |
-| 面试材料脱离代码 | 每Task同提交更新，只写已验证事实 |
+| 文档描述超过实际能力 | README和验收文档只陈述已通过测试或演示的行为 |
 
 ## 23. 官方技术依据
 
@@ -780,5 +760,4 @@ Python Alembic：
 2. 在现有 worktree 原地完成 Runtime Task 4 Step 4.7；
 3. 更新总路线图；
 4. 为 Task 5–14 生成新的逐测试 TDD 实施计划；
-5. 从 Task 5 起采用“实现 + 面试材料”双轨交付；
-6. 未经用户复核，不开始 Python 服务或 Task 5。
+5. 未经用户复核，不开始 Python 服务或 Task 5。
