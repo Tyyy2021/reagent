@@ -189,7 +189,7 @@ public class AgentRunner {
                 // M7 Stage2:只有【自动恢复 / 失败转移】路径才计恢复次数并止损(手动 resume / 新任务不计)。
                 // 放在 claim 之后:只有真抢到执行权的 worker 才 +1,落败的 worker 直接跳过、绝不误加计数。
                 if (autoRecovery) {
-                    int completedAttempts = stateStore.getTask(taskId).getRecoveryCount();
+                    int completedAttempts = stateStore.recoveryCount(token);
                     if (completedAttempts >= maxAttempts) {
                         log.warn("任务 {} 已自动恢复 {} 次仍未完成,达到上限 {},止损标记 FAILED。",
                                 taskId, completedAttempts, maxAttempts);
@@ -295,10 +295,6 @@ public class AgentRunner {
                                     token.taskId(), token.workerId(), token.leaseEpoch(),
                                     Optional.empty(), Optional.of(assistantSequence)));
                     ctx.addAssistant(decision.getAssistantMessage());
-                    for (ToolCall call : decision.getToolCalls()) {
-                        bus.publish(token, TaskEvent.Type.TOOL_CALL,
-                                Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
-                    }
                     BatchDisposition disposition = toolBatchCoordinator.process(
                             token, toolCtx, ctx, catalog, decision.getToolCalls());
                     if (disposition == BatchDisposition.WAITING_APPROVAL) {

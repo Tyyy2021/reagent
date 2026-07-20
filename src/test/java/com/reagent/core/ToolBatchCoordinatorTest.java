@@ -52,7 +52,7 @@ class ToolBatchCoordinatorTest {
         TaskToolCatalog catalog = catalog(read);
         ToolCall call = new ToolCall("call-pending", read.name(), "{}");
         Fixture fixture = fixture(workspace);
-        when(fixture.stateStore.statusOf(TASK_ID, call.id())).thenReturn(ToolCallStatus.PENDING);
+        when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.PENDING);
         when(fixture.executor.executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext)))
                 .thenReturn(Map.of(call.id(), "pending-result"));
 
@@ -60,14 +60,16 @@ class ToolBatchCoordinatorTest {
                 TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
 
         assertEquals(BatchDisposition.EXECUTED, disposition);
-        InOrder durableOrder = inOrder(fixture.stateStore, fixture.executor);
+        InOrder durableOrder = inOrder(fixture.stateStore, fixture.transport, fixture.executor);
         durableOrder.verify(fixture.stateStore).markInProgress(TOKEN, call);
+        durableOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
+                "id", call.id(), "name", call.name(), "arguments", call.arguments()));
         durableOrder.verify(fixture.executor)
                 .executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext));
         durableOrder.verify(fixture.stateStore).recordToolResult(TOKEN, call, "pending-result");
-        assertToolMessages(fixture.context, List.of(call.id()), List.of("pending-result"));
-        verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
+        durableOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
                 "id", call.id(), "name", call.name(), "result", "pending-result"));
+        assertToolMessages(fixture.context, List.of(call.id()), List.of("pending-result"));
     }
 
     @Test
@@ -79,8 +81,8 @@ class ToolBatchCoordinatorTest {
         ToolCall writeCall = new ToolCall("call-write-replay", write.name(), "{}");
         List<ToolCall> calls = List.of(readCall, writeCall);
         Fixture fixture = fixture(workspace);
-        when(fixture.stateStore.statusOf(TASK_ID, readCall.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
-        when(fixture.stateStore.statusOf(TASK_ID, writeCall.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
+        when(fixture.stateStore.statusOf(TOKEN, readCall.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
+        when(fixture.stateStore.statusOf(TOKEN, writeCall.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
         when(fixture.executor.executeConcurrently(same(catalog), eq(calls), same(fixture.toolContext)))
                 .thenReturn(Map.of(readCall.id(), "read-result", writeCall.id(), "write-result"));
 
@@ -91,6 +93,15 @@ class ToolBatchCoordinatorTest {
         verify(fixture.executor).executeConcurrently(same(catalog), eq(calls), same(fixture.toolContext));
         verify(fixture.stateStore).recordToolResult(TOKEN, readCall, "read-result");
         verify(fixture.stateStore).recordToolResult(TOKEN, writeCall, "write-result");
+        InOrder eventOrder = inOrder(fixture.transport);
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
+                "id", readCall.id(), "name", readCall.name(), "arguments", readCall.arguments()));
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
+                "id", writeCall.id(), "name", writeCall.name(), "arguments", writeCall.arguments()));
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
+                "id", readCall.id(), "name", readCall.name(), "result", "read-result"));
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
+                "id", writeCall.id(), "name", writeCall.name(), "result", "write-result"));
     }
 
     @Test
@@ -99,13 +110,17 @@ class ToolBatchCoordinatorTest {
         TaskToolCatalog catalog = catalog(sideEffect);
         ToolCall call = new ToolCall("call-in-doubt", sideEffect.name(), "{}");
         Fixture fixture = fixture(workspace);
-        when(fixture.stateStore.statusOf(TASK_ID, call.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
+        when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
 
         fixture.coordinator.process(TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
 
         verifyNoInteractions(fixture.executor);
         verify(fixture.stateStore, never()).markInProgress(any(), any());
         verify(fixture.stateStore).markInDoubt(eq(TOKEN), eq(call), any(String.class));
+        InOrder eventOrder = inOrder(fixture.transport);
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
+                "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+        eventOrder.verify(fixture.transport).publish(eq(TOKEN), eq(TaskEvent.Type.TOOL_RESULT), any());
         Map<String, Object> toolMessage = fixture.context.messages().getLast();
         assertEquals(call.id(), toolMessage.get("tool_call_id"));
         assertTrue(String.valueOf(toolMessage.get("content")).contains("副作用是否已生效【未知】"));
@@ -119,13 +134,17 @@ class ToolBatchCoordinatorTest {
         Files.createDirectories(workspace.resolve(RunJournal.REL_DIR));
         Files.writeString(RunJournal.file(workspace, call.id()), "17\n");
         Fixture fixture = fixture(workspace);
-        when(fixture.stateStore.statusOf(TASK_ID, call.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
+        when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
 
         fixture.coordinator.process(TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
 
         verifyNoInteractions(fixture.executor);
         verify(fixture.stateStore, never()).markInProgress(any(), any());
         verify(fixture.stateStore).recordToolResult(eq(TOKEN), eq(call), any(String.class));
+        InOrder eventOrder = inOrder(fixture.transport);
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
+                "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+        eventOrder.verify(fixture.transport).publish(eq(TOKEN), eq(TaskEvent.Type.TOOL_RESULT), any());
         String result = String.valueOf(fixture.context.messages().getLast().get("content"));
         assertTrue(result.contains("退出码 17"));
         assertTrue(result.contains("未重复执行"));
@@ -140,8 +159,8 @@ class ToolBatchCoordinatorTest {
         ToolCall secondCall = new ToolCall("call-second", second.name(), "{}");
         List<ToolCall> calls = List.of(firstCall, secondCall);
         Fixture fixture = fixture(workspace);
-        when(fixture.stateStore.statusOf(TASK_ID, firstCall.id())).thenReturn(ToolCallStatus.PENDING);
-        when(fixture.stateStore.statusOf(TASK_ID, secondCall.id())).thenReturn(ToolCallStatus.PENDING);
+        when(fixture.stateStore.statusOf(TOKEN, firstCall.id())).thenReturn(ToolCallStatus.PENDING);
+        when(fixture.stateStore.statusOf(TOKEN, secondCall.id())).thenReturn(ToolCallStatus.PENDING);
         Map<String, String> reverseResultOrder = new LinkedHashMap<>();
         reverseResultOrder.put(secondCall.id(), "second-result");
         reverseResultOrder.put(firstCall.id(), "first-result");
@@ -165,8 +184,8 @@ class ToolBatchCoordinatorTest {
         ToolCall done = new ToolCall("call-done", read.name(), "{}");
         ToolCall inDoubt = new ToolCall("call-terminal-doubt", read.name(), "{}");
         Fixture fixture = fixture(workspace);
-        when(fixture.stateStore.statusOf(TASK_ID, done.id())).thenReturn(ToolCallStatus.DONE);
-        when(fixture.stateStore.statusOf(TASK_ID, inDoubt.id())).thenReturn(ToolCallStatus.IN_DOUBT);
+        when(fixture.stateStore.statusOf(TOKEN, done.id())).thenReturn(ToolCallStatus.DONE);
+        when(fixture.stateStore.statusOf(TOKEN, inDoubt.id())).thenReturn(ToolCallStatus.IN_DOUBT);
 
         BatchDisposition disposition = fixture.coordinator.process(
                 TOKEN, fixture.toolContext, fixture.context, catalog, List.of(done, inDoubt));
@@ -176,6 +195,7 @@ class ToolBatchCoordinatorTest {
         verify(fixture.stateStore, never()).markInProgress(any(), any());
         verify(fixture.stateStore, never()).recordToolResult(any(), any(), any());
         verify(fixture.stateStore, never()).markInDoubt(any(), any(), any());
+        verifyNoInteractions(fixture.transport);
         assertEquals(1, fixture.context.size());
     }
 
@@ -195,7 +215,7 @@ class ToolBatchCoordinatorTest {
             }
         };
         Fixture fixture = fixture(workspace, injector);
-        when(fixture.stateStore.statusOf(TASK_ID, call.id())).thenReturn(ToolCallStatus.PENDING);
+        when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.PENDING);
         doAnswer(invocation -> {
             durableStatus.set(ToolCallStatus.IN_PROGRESS);
             return null;
@@ -232,7 +252,7 @@ class ToolBatchCoordinatorTest {
         };
         Fixture fixture = fixture(workspace, injector);
         holder[0] = fixture;
-        when(fixture.stateStore.statusOf(TASK_ID, call.id())).thenReturn(ToolCallStatus.PENDING);
+        when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.PENDING);
         doAnswer(invocation -> {
             durableStatus.set(ToolCallStatus.IN_PROGRESS);
             return null;

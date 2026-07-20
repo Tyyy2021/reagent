@@ -274,6 +274,11 @@ class AgentRunnerEventFencingTest {
         }
 
         @Override
+        public int recoveryCount(TaskRunToken token) {
+            return task.getRecoveryCount();
+        }
+
+        @Override
         public TaskEntity getTask(String taskId) {
             return task;
         }
@@ -303,7 +308,7 @@ class AgentRunnerEventFencingTest {
         }
 
         @Override
-        public int incrementRecoveryCount(TaskRunToken token) {
+        public int recoveryCount(TaskRunToken token) {
             throw new FencedExecutionException(
                     this.token, "worker-b", this.token.leaseEpoch() + 1, TaskStatus.RUNNING);
         }

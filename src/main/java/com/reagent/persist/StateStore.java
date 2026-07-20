@@ -247,6 +247,12 @@ public class StateStore {
         return n;
     }
 
+    /** 运行期恢复止损判定读取;先锁定并校验本次 run token，旧 worker 不得据此继续做控制决策。 */
+    @Transactional
+    public int recoveryCount(TaskRunToken token) {
+        return leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING)).getRecoveryCount();
+    }
+
     // ===================== 落库:每步 =====================
 
     /**
@@ -339,6 +345,13 @@ public class StateStore {
         return toolCallRepo.findByIdAndTaskId(toolCallId, taskId)
                 .map(ToolCallEntity::getStatus)
                 .orElse(ToolCallStatus.PENDING);
+    }
+
+    /** 运行期工具分类读取;先锁定并校验本次 run token，再按任务边界查询账本。 */
+    @Transactional
+    public ToolCallStatus statusOf(TaskRunToken token, String toolCallId) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        return statusOf(task.getId(), toolCallId);
     }
 
     // ===================== 重建上下文 =====================

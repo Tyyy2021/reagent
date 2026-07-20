@@ -91,6 +91,23 @@ class AgentRunnerFaultInjectionTest {
         verify(fixture.stateStore).completeTask(fixture.token, "done");
     }
 
+    @Test
+    void delegatesToolEventPublicationToCoordinator(@TempDir Path workspace) {
+        Fixture fixture = fixture(workspace, toolDecision());
+        when(fixture.coordinator.process(
+                same(fixture.token), any(), same(fixture.context), same(fixture.catalog), any()))
+                .thenReturn(BatchDisposition.WAITING_APPROVAL);
+        AgentRunner runner = fixture.runner(FaultInjector.none());
+
+        AgentRunner.RunResult result = runner.run("goal", "coding");
+
+        assertEquals("任务正在等待审批。", result.result());
+        verify(fixture.coordinator).process(
+                same(fixture.token), any(), same(fixture.context), same(fixture.catalog), any());
+        verify(fixture.transport, never()).publish(
+                same(fixture.token), eq(TaskEvent.Type.TOOL_CALL), any());
+    }
+
     private static Decision toolDecision() {
         Map<String, Object> assistant = new LinkedHashMap<>();
         assistant.put("role", "assistant");

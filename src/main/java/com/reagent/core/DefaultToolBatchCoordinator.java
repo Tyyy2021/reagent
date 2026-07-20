@@ -62,14 +62,16 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
         }
 
         List<ToolCall> toRun = new ArrayList<>();
+        List<ToolCall> actionable = new ArrayList<>();
         Map<String, String> inDoubt = new LinkedHashMap<>();
         Map<String, String> reconciled = new LinkedHashMap<>();
         for (ToolCall call : calls) {
-            ToolCallStatus status = stateStore.statusOf(token.taskId(), call.id());
+            ToolCallStatus status = stateStore.statusOf(token, call.id());
             switch (status) {
                 case DONE, IN_DOUBT ->
                         log.info("账本已是终态 {},跳过: {}", status, call.name());
                 case IN_PROGRESS -> {
+                    actionable.add(call);
                     if (canSafelyReplay(catalog, call)) {
                         log.info("in-doubt 但工具可安全重放,重跑: {}", call.name());
                         toRun.add(call);
@@ -85,7 +87,10 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         }
                     }
                 }
-                default -> toRun.add(call);
+                default -> {
+                    actionable.add(call);
+                    toRun.add(call);
+                }
             }
         }
 
@@ -97,8 +102,17 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         FaultPoint.AFTER_TOOL_MARKED_IN_PROGRESS,
                         faultContext(token, call));
             }
+            for (ToolCall call : actionable) {
+                bus.publish(token, TaskEvent.Type.TOOL_CALL, Map.of(
+                        "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+            }
             log.info("并发执行本轮 {} 个工具调用", toRun.size());
             results.putAll(executor.executeConcurrently(catalog, toRun, toolContext));
+        } else {
+            for (ToolCall call : actionable) {
+                bus.publish(token, TaskEvent.Type.TOOL_CALL, Map.of(
+                        "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+            }
         }
 
         boolean forced = taskControl.signalOf(token.taskId()) == TaskControl.Signal.CANCEL

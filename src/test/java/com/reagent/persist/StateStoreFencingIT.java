@@ -1,17 +1,25 @@
 package com.reagent.persist;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.core.Context;
+import com.reagent.core.DefaultToolBatchCoordinator;
+import com.reagent.core.FaultInjector;
 import com.reagent.core.FencedExecutionException;
+import com.reagent.core.TaskControl;
 import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
+import com.reagent.core.ToolBatchCoordinator;
 import com.reagent.core.WorkerIdentity;
 import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.stream.StreamTransport;
 import com.reagent.stream.TaskEvent;
 import com.reagent.testsupport.InfrastructureIT;
 import com.reagent.testsupport.MutableClock;
+import com.reagent.tool.ToolContext;
+import com.reagent.tool.ToolExecutor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -21,6 +29,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +44,8 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 class StateStoreFencingIT extends InfrastructureIT {
 
@@ -161,6 +172,39 @@ class StateStoreFencingIT extends InfrastructureIT {
                         fixture.oldToken(), TaskEvent.Type.STEP, Map.of("step", "stale"))));
 
         assertEquals(eventCountBefore, eventRepository.count());
+    }
+
+    @Test
+    void staleTokenCannotClassifyTerminalToolLedgerAfterTakeover(@TempDir Path workspace) {
+        TaskEntity task = taskRepository.save(TaskEntity.newTask("stale terminal classification", clock.instant()));
+        ToolCall call = new ToolCall("terminal-" + task.getId(), "read_file", "{}");
+        ToolCallEntity ledger = new ToolCallEntity(
+                call.id(), task.getId(), call.name(), call.arguments(), clock.instant());
+        ledger.markDone("already done", clock.instant());
+        toolCallRepository.save(ledger);
+        TaskRunToken staleToken = inTransaction(() -> workerA.claim(task.getId())).orElseThrow();
+        clock.advance(Duration.ofMillis(LEASE_TTL_MS + 1));
+        TaskRunToken winningToken = inTransaction(() -> workerB.claim(task.getId())).orElseThrow();
+        ToolExecutor executor = mock(ToolExecutor.class);
+        StreamTransport transport = mock(StreamTransport.class);
+        ToolBatchCoordinator coordinator = new DefaultToolBatchCoordinator(
+                workerA, executor, transport, new TaskControl(), FaultInjector.none());
+
+        assertThrows(FencedExecutionException.class, () -> inTransaction(() -> {
+            coordinator.process(
+                    staleToken,
+                    new ToolContext(staleToken, workspace),
+                    new Context("system"),
+                    null,
+                    List.of(call));
+            return null;
+        }));
+
+        verifyNoInteractions(executor, transport);
+        TaskEntity unchanged = taskRepository.findById(task.getId()).orElseThrow();
+        assertEquals(winningToken.workerId(), unchanged.getOwnerId());
+        assertEquals(winningToken.leaseEpoch(), unchanged.getLeaseEpoch());
+        assertEquals(ToolCallStatus.DONE, ledgerSnapshot(call.id()).status());
     }
 
     @Test

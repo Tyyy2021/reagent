@@ -57,6 +57,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -65,6 +66,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @Import(AgentRunnerRecoveryIT.TestBeans.class)
 class AgentRunnerRecoveryIT extends InfrastructureIT {
@@ -179,15 +182,19 @@ class AgentRunnerRecoveryIT extends InfrastructureIT {
 
         CapturingFencedTransport workerATransport = new CapturingFencedTransport(
                 new TaskEventBus(eventStore, clock));
+        AtomicReference<FencedExecutionException> workerAClassificationFence = new AtomicReference<>();
         WorkerRuntime workerA = worker(
-                "worker-a", workerAScript, blockingCrash, workerATransport, MAX_RECOVERY_ATTEMPTS);
+                "worker-a", workerAScript, blockingCrash, workerATransport,
+                MAX_RECOVERY_ATTEMPTS, workerAClassificationFence);
         WorkerRuntime workerB = worker(
                 "worker-b", workerBScript, FaultInjector.none(),
                 new TaskEventBus(eventStore, clock), MAX_RECOVERY_ATTEMPTS);
         int toolCallsBefore = recordingTool.callCount();
 
-        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
-            Future<AgentRunner.RunResult> staleRun = executor.submit(
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<AgentRunner.RunResult> staleRun = null;
+        try {
+            staleRun = executor.submit(
                     () -> workerA.runner().run("recover committed assistant", "coding"));
             await(assistantCommitted, "assistant commit crash boundary");
 
@@ -236,19 +243,93 @@ class AgentRunnerRecoveryIT extends InfrastructureIT {
             assertEquals("worker-b", recordingTool.lastContext().orElseThrow()
                     .runToken().orElseThrow().workerId());
             assertEquals(List.of("system", "user", "assistant", "tool", "assistant"), roles(taskId));
+            assertEquals(List.of(TaskEvent.Type.TOOL_CALL, TaskEvent.Type.TOOL_RESULT),
+                    durableTypes(taskId).stream()
+                            .filter(type -> type == TaskEvent.Type.TOOL_CALL || type == TaskEvent.Type.TOOL_RESULT)
+                            .toList());
 
-            FencedExecutionException fenced = workerATransport.fencedException();
-            assertNotNull(fenced, "Worker A's first post-release durable write must hit the fence");
+            FencedExecutionException fenced = workerAClassificationFence.get();
+            assertNotNull(fenced, "Worker A's first post-release classification must hit the fence");
             assertEquals(taskId, fenced.token().taskId());
             assertEquals("worker-a", fenced.token().workerId());
             assertEquals(completed.getLeaseEpoch(), fenced.actualEpoch());
             assertEquals(TaskStatus.COMPLETED, fenced.actualStatus());
+            assertNull(workerATransport.fencedException(),
+                    "classification must stop stale Worker A before it attempts another durable event");
             assertFalse(durableTypes(taskId).contains(TaskEvent.Type.FAILED));
             assertEquals(TaskStatus.COMPLETED,
                     taskRepository.findById(taskId).orElseThrow().getStatus());
         } finally {
-            releaseWorkerA.countDown();
+            closeRecoveryExecutor(releaseWorkerA, staleRun, executor);
         }
+    }
+
+    @Test
+    void staleWorkerCannotUseUnguardedTaskReadForRecoveryCapDecision() {
+        AtomicInteger getTaskCalls = new AtomicInteger();
+        WorkerIdentity workerAIdentity = new WorkerIdentity("worker-cap-a", "0");
+        WorkerIdentity workerBIdentity = new WorkerIdentity("worker-cap-b", "0");
+        StateStore workerA = transactionalStateStore(workerAIdentity, getTaskCalls);
+        StateStore workerB = transactionalStateStore(workerBIdentity);
+        TaskProfileSnapshot snapshot = profiles.snapshot("coding");
+        TaskEntity created = workerA.createTask("fence recovery cap read", snapshot);
+        TaskEntity atCap = taskRepository.findById(created.getId()).orElseThrow();
+        for (int attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; attempt++) {
+            atCap.incrementRecovery(clock.instant());
+        }
+        taskRepository.save(atCap);
+        var catalog = catalogResolver.resolve(snapshot);
+        ToolCatalogResolver takeoverResolver = mock(ToolCatalogResolver.class);
+        AtomicReference<TaskRunToken> winningToken = new AtomicReference<>();
+        when(takeoverResolver.resolve(snapshot)).thenAnswer(invocation -> {
+            clock.advance(Duration.ofMillis(LEASE_TTL_MS + 1));
+            winningToken.set(workerB.claim(created.getId()).orElseThrow());
+            return catalog;
+        });
+        TaskControl taskControl = new TaskControl();
+        AgentRunner runner = new AgentRunner(
+                new ScriptedLlmClient(List.of()),
+                profiles,
+                takeoverResolver,
+                mock(ToolBatchCoordinator.class),
+                FaultInjector.none(),
+                workerA,
+                new ShutdownState(),
+                workspaceStore,
+                new InFlightTasks(),
+                new TaskEventBus(eventStore, clock),
+                taskControl,
+                OpenTelemetry.noop().getTracer("agent-runner-stale-cap-it"),
+                workerAIdentity,
+                MAX_RECOVERY_ATTEMPTS);
+
+        String result = runner.recover(created.getId());
+
+        assertEquals("本任务已被其它 worker 接管(fence),本 worker 停止驱动。", result);
+        assertEquals(1, getTaskCalls.get(),
+                "only the recover entry may use the unguarded observability read; the cap decision must use the token");
+        TaskEntity unchanged = taskRepository.findById(created.getId()).orElseThrow();
+        assertEquals(winningToken.get().workerId(), unchanged.getOwnerId());
+        assertEquals(winningToken.get().leaseEpoch(), unchanged.getLeaseEpoch());
+        assertEquals(MAX_RECOVERY_ATTEMPTS, unchanged.getRecoveryCount());
+        assertEquals(TaskStatus.RUNNING, unchanged.getStatus());
+    }
+
+    @Test
+    void recoveryExecutorCleanupReleasesGateBeforeBoundedShutdown() {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<?> held = executor.submit(() -> {
+            entered.countDown();
+            await(release, "cleanup release");
+        });
+        await(entered, "cleanup worker entry");
+
+        closeRecoveryExecutor(release, held, executor);
+
+        assertTrue(held.isDone());
+        assertTrue(executor.isTerminated());
     }
 
     @Test
@@ -307,8 +388,19 @@ class AgentRunnerRecoveryIT extends InfrastructureIT {
             StreamTransport transport,
             int maxAttempts
     ) {
+        return worker(workerId, llm, faultInjector, transport, maxAttempts, null);
+    }
+
+    private WorkerRuntime worker(
+            String workerId,
+            LlmClient llm,
+            FaultInjector faultInjector,
+            StreamTransport transport,
+            int maxAttempts,
+            AtomicReference<FencedExecutionException> classificationFence
+    ) {
         WorkerIdentity identity = new WorkerIdentity(workerId, "0");
-        StateStore stateStore = transactionalStateStore(identity);
+        StateStore stateStore = transactionalStateStore(identity, null, classificationFence);
         TaskControl taskControl = new TaskControl();
         ToolBatchCoordinator coordinator = new DefaultToolBatchCoordinator(
                 stateStore, toolExecutor, transport, taskControl, faultInjector);
@@ -331,6 +423,18 @@ class AgentRunnerRecoveryIT extends InfrastructureIT {
     }
 
     private StateStore transactionalStateStore(WorkerIdentity identity) {
+        return transactionalStateStore(identity, null);
+    }
+
+    private StateStore transactionalStateStore(WorkerIdentity identity, AtomicInteger getTaskCalls) {
+        return transactionalStateStore(identity, getTaskCalls, null);
+    }
+
+    private StateStore transactionalStateStore(
+            WorkerIdentity identity,
+            AtomicInteger getTaskCalls,
+            AtomicReference<FencedExecutionException> classificationFence
+    ) {
         StateStore target = new StateStore(
                 taskRepository,
                 messageRepository,
@@ -340,7 +444,28 @@ class AgentRunnerRecoveryIT extends InfrastructureIT {
                 identity,
                 LEASE_TTL_MS,
                 clock,
-                new TaskLeaseGuard(taskRepository));
+                new TaskLeaseGuard(taskRepository)) {
+            @Override
+            public TaskEntity getTask(String taskId) {
+                if (getTaskCalls != null) {
+                    getTaskCalls.incrementAndGet();
+                }
+                return super.getTask(taskId);
+            }
+
+            @Override
+            @org.springframework.transaction.annotation.Transactional
+            public ToolCallStatus statusOf(TaskRunToken token, String toolCallId) {
+                try {
+                    return super.statusOf(token, toolCallId);
+                } catch (FencedExecutionException exception) {
+                    if (classificationFence != null) {
+                        classificationFence.compareAndSet(null, exception);
+                    }
+                    throw exception;
+                }
+            }
+        };
         ProxyFactory factory = new ProxyFactory(target);
         factory.setProxyTargetClass(true);
         factory.addAdvice(new TransactionInterceptor(
@@ -400,6 +525,26 @@ class AgentRunnerRecoveryIT extends InfrastructureIT {
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new AssertionError("Interrupted while waiting for " + description, exception);
+        }
+    }
+
+    private static void closeRecoveryExecutor(
+            CountDownLatch release,
+            Future<?> outstanding,
+            ExecutorService executor
+    ) {
+        release.countDown();
+        if (outstanding != null) {
+            outstanding.cancel(true);
+        }
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(AWAIT_TIMEOUT.toNanos(), TimeUnit.NANOSECONDS)) {
+                throw new AssertionError("Timed out closing recovery test executor");
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Interrupted while closing recovery test executor", exception);
         }
     }
 
