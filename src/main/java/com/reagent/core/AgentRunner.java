@@ -5,19 +5,14 @@ import com.reagent.obs.Trace;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
-import com.reagent.persist.ToolCallStatus;
 import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.profile.TaskProfileSnapshot;
 import com.reagent.profile.TaskToolCatalog;
 import com.reagent.profile.ToolCatalogResolver;
-import com.reagent.profile.ToolSnapshot;
-import com.reagent.sandbox.RunJournal;
 import com.reagent.sandbox.WorkspaceStore;
 import com.reagent.stream.TaskEvent;
 import com.reagent.stream.StreamTransport;
-import com.reagent.tool.IdempotencyClass;
 import com.reagent.tool.ToolContext;
-import com.reagent.tool.ToolExecutor;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
@@ -28,14 +23,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 /**
  * ★ 整个项目的心脏:ReAct 主循环。
@@ -61,7 +51,8 @@ public class AgentRunner {
     private final LlmClient llm;
     private final AgentProfileRegistry profileRegistry;
     private final ToolCatalogResolver catalogResolver;
-    private final ToolExecutor executor;
+    private final ToolBatchCoordinator toolBatchCoordinator;
+    private final FaultInjector faultInjector;
     private final StateStore stateStore;
     private final ShutdownState shutdownState;
     private final WorkspaceStore workspaceStore;
@@ -73,7 +64,8 @@ public class AgentRunner {
     private final int maxAttempts;                 // M7 Stage2:单任务自动恢复次数上限(止损)
 
     public AgentRunner(LlmClient llm, AgentProfileRegistry profileRegistry,
-                       ToolCatalogResolver catalogResolver, ToolExecutor executor,
+                       ToolCatalogResolver catalogResolver, ToolBatchCoordinator toolBatchCoordinator,
+                       FaultInjector faultInjector,
                        StateStore stateStore, ShutdownState shutdownState,
                        WorkspaceStore workspaceStore, InFlightTasks inFlight,
                        StreamTransport bus, TaskControl taskControl, Tracer tracer,
@@ -82,7 +74,8 @@ public class AgentRunner {
         this.llm = llm;
         this.profileRegistry = profileRegistry;
         this.catalogResolver = catalogResolver;
-        this.executor = executor;
+        this.toolBatchCoordinator = toolBatchCoordinator;
+        this.faultInjector = faultInjector;
         this.stateStore = stateStore;
         this.shutdownState = shutdownState;
         this.workspaceStore = workspaceStore;
@@ -196,12 +189,14 @@ public class AgentRunner {
                 // M7 Stage2:只有【自动恢复 / 失败转移】路径才计恢复次数并止损(手动 resume / 新任务不计)。
                 // 放在 claim 之后:只有真抢到执行权的 worker 才 +1,落败的 worker 直接跳过、绝不误加计数。
                 if (autoRecovery) {
-                    int attempt = stateStore.incrementRecoveryCount(token);
-                    if (attempt > maxAttempts) {
-                        log.warn("任务 {} 已自动恢复 {} 次仍未完成,超上限 {},止损标记 FAILED。", taskId, attempt - 1, maxAttempts);
+                    int completedAttempts = stateStore.getTask(taskId).getRecoveryCount();
+                    if (completedAttempts >= maxAttempts) {
+                        log.warn("任务 {} 已自动恢复 {} 次仍未完成,达到上限 {},止损标记 FAILED。",
+                                taskId, completedAttempts, maxAttempts);
                         stateStore.failTask(token, "超过最大自动恢复次数(" + maxAttempts + "),停止自动恢复以免反复烧钱。");
                         return "超过最大自动恢复次数,已止损标记 FAILED。";
                     }
+                    int attempt = stateStore.incrementRecoveryCount(token);
                     log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
                 }
             } catch (FencedExecutionException ex) {
@@ -264,7 +259,11 @@ public class AgentRunner {
                     if (!pending.isEmpty()) {
                         stepSpan.setAttribute(Trace.STEP_PENDING, true);
                         log.info("--- 第 {} 步:补跑 {} 个未完成的工具调用 ---", step, pending.size());
-                        executeTools(catalog, toolCtx, ctx, pending);
+                        BatchDisposition disposition = toolBatchCoordinator.process(
+                                token, toolCtx, ctx, catalog, pending);
+                        if (disposition == BatchDisposition.WAITING_APPROVAL) {
+                            return "任务正在等待审批。";
+                        }
                         workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
                         continue;
                     }
@@ -289,13 +288,22 @@ public class AgentRunner {
                     }
 
                     // 4. 大脑要调工具:先落库 assistant(顺带登记 PENDING 账本),再执行
-                    stateStore.appendAssistant(token, decision.getAssistantMessage());
+                    int assistantSequence = stateStore.appendAssistant(token, decision.getAssistantMessage());
+                    faultInjector.hit(
+                            FaultPoint.AFTER_ASSISTANT_PERSISTED_BEFORE_APPROVAL,
+                            new FaultContext(
+                                    token.taskId(), token.workerId(), token.leaseEpoch(),
+                                    Optional.empty(), Optional.of(assistantSequence)));
                     ctx.addAssistant(decision.getAssistantMessage());
                     for (ToolCall call : decision.getToolCalls()) {
                         bus.publish(token, TaskEvent.Type.TOOL_CALL,
                                 Map.of("id", call.id(), "name", call.name(), "arguments", call.arguments()));
                     }
-                    executeTools(catalog, toolCtx, ctx, decision.getToolCalls());
+                    BatchDisposition disposition = toolBatchCoordinator.process(
+                            token, toolCtx, ctx, catalog, decision.getToolCalls());
+                    if (disposition == BatchDisposition.WAITING_APPROVAL) {
+                        return "任务正在等待审批。";
+                    }
                     workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
                 } finally {
                     stepSpan.end();
@@ -308,6 +316,10 @@ public class AgentRunner {
             bus.publish(token, TaskEvent.Type.FAILED, Map.of("error", msg));
             return msg;
 
+        } catch (InjectedWorkerCrashException ex) {
+            log.warn("任务 {} 在受控故障点 {} 模拟进程消失,保持 RUNNING 且不写 FAILED。",
+                    taskId, ex.point());
+            throw ex;
         } catch (FencedExecutionException ex) {
             log.warn("任务 {} 的运行 token 已被 fence,停止旧驱动且不写 FAILED: {}", taskId, ex.getMessage());
             return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
@@ -375,144 +387,6 @@ public class AgentRunner {
             return msg;
         }
         return null;
-    }
-
-    /**
-     * 执行本轮所有工具,并为【每个】tool_call_id 回一条结果(协议硬性要求)。
-     *
-     * <p>exactly-once 的核心落点 —— 三步,中间夹一道"在途"持久化栅栏:</p>
-     * <ol>
-     *  <li><b>决策表分流</b>:查账本状态决定每个 call 怎么处理——{@code DONE/IN_DOUBT}=终态跳过;
-     *      {@code IN_PROGRESS}=上一世崩在 in-doubt 窗口(只读/幂等工具安全重跑、有副作用工具不盲目重试而上报存疑);
-     *      {@code PENDING}=从没开跑、安全执行。</li>
-     *  <li><b>栅栏 + 并发执行</b>:对要跑的工具先逐个 {@link StateStore#markInProgress} 把"在途" <b>commit</b>
-     *      (在副作用之前!这样崩溃后能区分"一定没做"与"可能做了"),再交 {@link ToolExecutor#executeConcurrently} 并发跑。</li>
-     *  <li><b>串行落库</b>:按【原始顺序】把结果写账本(DONE)/存疑(IN_DOUBT)+ 写回上下文。</li>
-     * </ol>
-     *
-     * <p>第 3 步串行的原因不变:message.seq 在 task 行锁下由 max+1 生成、Context 是普通 ArrayList;
-     * 落库很轻,真正耗时的执行已在第 2 步并发掉,串行可保持账本、消息与内存上下文顺序一致。</p>
-     */
-    private void executeTools(TaskToolCatalog catalog, ToolContext toolCtx,
-                              Context ctx, List<ToolCall> calls) {
-        String taskId = toolCtx.taskId();
-        TaskRunToken token = toolCtx.runToken().orElseThrow(
-                () -> new IllegalStateException("Agent tool context is missing its run token"));
-
-        // 1. 恢复决策表分流
-        List<ToolCall> toRun = new ArrayList<>();
-        Map<String, String> inDoubt = new LinkedHashMap<>();      // id -> 存疑提示(待落库 IN_DOUBT)
-        Map<String, String> reconciled = new LinkedHashMap<>();   // id -> 对账完成提示(L3:journal 有完成记录 -> 落库 DONE)
-        for (ToolCall call : calls) {
-            ToolCallStatus status = stateStore.statusOf(taskId, call.id());
-            switch (status) {
-                case DONE, IN_DOUBT -> {
-                    // 终态:正常路径到不了这;恢复时这类已带 tool 消息、被 pendingToolCalls 滤掉。
-                    // 结果已在持久历史 / 重建后的 ctx 里 → 不重跑、不重复落库。
-                    log.info("账本已是终态 {},跳过: {}", status, call.name());
-                }
-                case IN_PROGRESS -> {
-                    // 上一世开跑过没收尾 = in-doubt 窗口
-                    if (canSafelyReplay(catalog, call)) {
-                        log.info("in-doubt 但工具可安全重放,重跑: {}", call.name());
-                        toRun.add(call);
-                    } else {
-                        // 非幂等工具崩在 in-doubt 窗口。L3:先查沙箱完成日志(journal)对账——
-                        //   有完成记录 = 命令其实跑完了(只是没记账)-> 标 DONE、不重跑(把"保守上报"救回成"确定完成");
-                        //   无完成记录 = 真崩在执行中途 -> 上报存疑(任意 shell 的理论下限,诚实接受)。
-                        Optional<String> journaled = RunJournal.completion(toolCtx.workspaceDir(), call.id());
-                        if (journaled.isPresent()) {
-                            log.info("in-doubt 但 journal 有完成记录(exit={}),对账标 DONE、不重跑: {}",
-                                    journaled.get(), call.name());
-                            reconciled.put(call.id(), reconciledMessage(call, journaled.get()));
-                        } else {
-                            log.warn("in-doubt 且无 journal 完成记录,未自动重试,上报存疑: {}", call.name());
-                            inDoubt.put(call.id(), inDoubtMessage(call));
-                        }
-                    }
-                }
-                default -> {
-                    // PENDING / 未登记:从没开跑 → 副作用一定没发生 → 安全执行
-                    toRun.add(call);
-                }
-            }
-        }
-
-        // 2. 栅栏 + 并发执行:先把"在途"持久化(必须在副作用之前 commit),再并发跑
-        Map<String, String> results = new HashMap<>();
-        if (!toRun.isEmpty()) {
-            for (ToolCall call : toRun) {
-                stateStore.markInProgress(token, call);
-            }
-            log.info("并发执行本轮 {} 个工具调用", toRun.size());
-            results.putAll(executor.executeConcurrently(catalog, toRun, toolCtx));
-        }
-
-        // 3b:执行期间收到 force-cancel(硬杀)?清中断位(免后续落库被打断),刚跑的工具按"被中途打断"处理
-        boolean forced = taskControl.signalOf(taskId) == TaskControl.Signal.CANCEL && taskControl.isForced(taskId);
-        if (forced) {
-            Thread.interrupted();
-        }
-
-        // 3. 按【原始顺序】串行落库 + 写回上下文
-        Set<String> ran = new HashSet<>();
-        for (ToolCall c : toRun) {
-            ran.add(c.id());
-        }
-        for (ToolCall call : calls) {
-            if (ran.contains(call.id())) {
-                if (forced && !canSafelyReplay(catalog, call)) {
-                    // 3b 硬杀:非幂等工具被 force-cancel 中途打断,不谎报 DONE——留在 markInProgress 的 IN_PROGRESS
-                    // (=in-doubt,等同"崩在执行中途");任务随后被标 CANCELLED,绝不重放副作用(复用 exactly-once)。
-                    log.warn("force-cancel 中途打断 SIDE_EFFECTFUL 工具,留 IN_PROGRESS(in-doubt)、不记 DONE: {}", call.name());
-                    bus.publish(token, TaskEvent.Type.TOOL_RESULT, Map.of(
-                            "id", call.id(), "name", call.name(),
-                            "result", "(被 force 取消中途打断,副作用是否生效未知=in-doubt)", "inDoubt", true));
-                } else {
-                    String result = results.get(call.id());
-                    stateStore.recordToolResult(token, call, result);   // 账本 DONE + tool 消息
-                    ctx.addToolResult(call.id(), result);
-                    bus.publish(token, TaskEvent.Type.TOOL_RESULT,
-                            Map.of("id", call.id(), "name", call.name(), "result", String.valueOf(result)));
-                }
-            } else if (reconciled.containsKey(call.id())) {
-                String msg = reconciled.get(call.id());
-                stateStore.recordToolResult(token, call, msg);      // L3 对账:账本 DONE + tool 消息(不重放副作用)
-                ctx.addToolResult(call.id(), msg);
-                bus.publish(token, TaskEvent.Type.TOOL_RESULT,
-                        Map.of("id", call.id(), "name", call.name(), "result", msg, "reconciled", true));
-            } else if (inDoubt.containsKey(call.id())) {
-                String msg = inDoubt.get(call.id());
-                stateStore.markInDoubt(token, call, msg);            // 账本 IN_DOUBT + tool 消息
-                ctx.addToolResult(call.id(), msg);
-                bus.publish(token, TaskEvent.Type.TOOL_RESULT,
-                        Map.of("id", call.id(), "name", call.name(), "result", msg, "inDoubt", true));
-            }
-            // else: 终态,跳过(结果已在历史 / ctx)
-        }
-    }
-
-    /** 这次 in-doubt 的调用能否安全重放:只读 / 幂等工具可以;有副作用 / 未知工具一律不重放(fail-closed)。 */
-    private boolean canSafelyReplay(TaskToolCatalog catalog, ToolCall call) {
-        ToolSnapshot tool = catalog.snapshot(call.name());
-        if (tool == null) {
-            return false;
-        }
-        IdempotencyClass cls = tool.idempotencyClass();
-        return cls == IdempotencyClass.READ_ONLY || cls == IdempotencyClass.IDEMPOTENT;
-    }
-
-    /** L3 对账:journal 证明命令上次已执行完成,标 DONE 回给模型(绝不重放副作用)。 */
-    private static String reconciledMessage(ToolCall call, String exitCode) {
-        return "ℹ️ 工具 " + call.name() + " 在上次执行中已【完成】(退出码 " + exitCode + "),"
-                + "但进程在记账前崩溃;系统据沙箱完成日志(journal)对账确认,未重复执行。"
-                + "(注:崩溃前的命令输出未留存,如需可用只读方式查看当前状态。)";
-    }
-
-    /** 给模型看的"结果存疑"观察:崩在 in-doubt 窗口、未自动重试,交由模型核对 / 重发。 */
-    private static String inDoubtMessage(ToolCall call) {
-        return "⚠️ 工具 " + call.name() + " 在上次执行中已开始、但进程崩溃前未确认完成,其副作用是否已生效【未知】。"
-                + "为避免重复副作用,系统未自动重试。如有需要,请先用只读方式核对当前状态,再决定是否重新执行。";
     }
 
     /** goal 等放进 span 属性前截断,避免超大属性。 */

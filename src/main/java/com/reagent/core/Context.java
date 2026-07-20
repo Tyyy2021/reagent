@@ -1,6 +1,7 @@
 package com.reagent.core;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -59,6 +60,18 @@ public class Context {
 
     public List<Map<String, Object>> messages() {
         return messages;
+    }
+
+    /**
+     * Detached, deeply immutable view for observers that must inspect persisted conversation state
+     * without gaining a mutation path into the live Agent loop.
+     */
+    public List<Map<String, Object>> messageSnapshot() {
+        List<Map<String, Object>> snapshot = new ArrayList<>(messages.size());
+        for (Map<String, Object> message : messages) {
+            snapshot.add(immutableMap(message));
+        }
+        return Collections.unmodifiableList(snapshot);
     }
 
     /** 当前消息条数,粗略用于停止条件 / 调试 */
@@ -120,5 +133,34 @@ public class Context {
         m.put("role", role);
         m.put("content", content);
         return m;
+    }
+
+    private static Map<String, Object> immutableMap(Map<?, ?> source) {
+        Map<String, Object> copy = new LinkedHashMap<>();
+        source.forEach((key, value) -> {
+            if (!(key instanceof String stringKey)) {
+                throw new IllegalStateException("Context message key is not a string: " + key);
+            }
+            copy.put(stringKey, immutableValue(value));
+        });
+        return Collections.unmodifiableMap(copy);
+    }
+
+    private static Object immutableValue(Object value) {
+        if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return value;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return immutableMap(map);
+        }
+        if (value instanceof List<?> list) {
+            List<Object> copy = new ArrayList<>(list.size());
+            for (Object item : list) {
+                copy.add(immutableValue(item));
+            }
+            return Collections.unmodifiableList(copy);
+        }
+        throw new IllegalStateException(
+                "Context message contains unsupported mutable value: " + value.getClass().getName());
     }
 }
