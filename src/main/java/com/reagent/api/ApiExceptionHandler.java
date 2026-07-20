@@ -12,6 +12,11 @@ import java.util.Map;
 @RestControllerAdvice
 public class ApiExceptionHandler {
 
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, String>> invalidRequest(IllegalArgumentException exception) {
+        return ResponseEntity.badRequest().body(Map.of("error", exception.getMessage()));
+    }
+
     @ExceptionHandler(UnknownProfileException.class)
     public ResponseEntity<Map<String, String>> unknownProfile(UnknownProfileException exception) {
         return ResponseEntity.badRequest().body(Map.of("error", exception.getMessage()));

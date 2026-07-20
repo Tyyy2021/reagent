@@ -1,0 +1,13 @@
+{
+  "source": "fake-alertmanager",
+  "externalAlertId": "ALERT-CHECKOUT-001",
+  "service": "checkout",
+  "severity": "critical",
+  "title": "Checkout error rate is above threshold",
+  "summary": "5xx error rate exceeded 10% for five minutes",
+  "startedAt": "2026-07-19T10:00:00Z",
+  "labels": {
+    "environment": "demo",
+    "region": "cn-east"
+  }
+}

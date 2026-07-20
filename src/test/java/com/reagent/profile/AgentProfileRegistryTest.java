@@ -40,14 +40,17 @@ class AgentProfileRegistryTest {
     }
 
     @Test
-    void explicitUnknownOrDisabledProfileIsRejected() {
+    void incidentOpsResolvesWithEmptyFrozenCatalogWhileUnknownIdsFailClosed() {
         AgentProfileRegistry registry = registry();
+        TaskProfileSnapshot incidentOps = registry.snapshot("incident-ops");
 
         assertAll(
+                () -> assertEquals("incident-ops", incidentOps.profileId()),
+                () -> assertEquals("intake-v1", incidentOps.profileVersion()),
+                () -> assertEquals(List.of(), incidentOps.tools()),
+                () -> assertEquals(List.of(), incidentOps.mcpServerIds()),
                 () -> assertThrows(UnknownProfileException.class,
-                        () -> registry.snapshot("does-not-exist")),
-                () -> assertThrows(UnknownProfileException.class,
-                        () -> registry.snapshot("incident-ops"))
+                        () -> registry.snapshot("does-not-exist"))
         );
     }
 
@@ -66,9 +69,16 @@ class AgentProfileRegistryTest {
         coding.setSystemPrompt("configured coding prompt");
         coding.setToolNames(names);
         coding.setMcpServerIds(List.of());
+        AgentProfileProperties.Profile incidentOps = new AgentProfileProperties.Profile();
+        incidentOps.setVersion("intake-v1");
+        incidentOps.setSystemPrompt("configured incident prompt");
+        incidentOps.setToolNames(List.of());
+        incidentOps.setMcpServerIds(List.of());
         AgentProfileProperties properties = new AgentProfileProperties();
         properties.setDefaultId("coding");
-        properties.setDefinitions(new LinkedHashMap<>(Map.of("coding", coding)));
+        properties.setDefinitions(new LinkedHashMap<>(Map.of(
+                "coding", coding,
+                "incident-ops", incidentOps)));
         return new AgentProfileRegistry(properties, resolver);
     }
 

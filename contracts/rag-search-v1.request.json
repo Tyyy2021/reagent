@@ -1,0 +1,7 @@
+{
+  "contractVersion": 1,
+  "knowledgeBaseId": "incident-ops",
+  "indexVersion": "v1-0123456789abcdef",
+  "query": "How should checkout connection pool exhaustion be investigated?",
+  "topK": 3
+}
