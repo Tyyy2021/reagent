@@ -103,7 +103,7 @@ Run readiness tests; expected GREEN.
 
 Make `OpenAiCompatibleClient` conditional on `reagent.llm.mode=openai` with match-if-missing. Register `ScriptedIncidentLlmClient` only when `reagent.llm.mode=scripted`; `DemoModeGuard` rejects scripted mode unless active profile is `demo-smoke` or `demo-chaos`.
 
-The scripted client uses `IncidentScenarioFixture` but derives final citation and ticket IDs from actual prior tool messages. Tests assert production profile + scripted mode fails startup, wrong catalog/messages fail immediately, and extra/missing turns fail.
+The scripted client uses `IncidentScenarioFixture` but derives final citation and ticket IDs from actual prior tool messages. In demo profiles, it parses the already persisted first user goal and derives tool-call IDs from its unique `externalAlertId` (for example `call-create-ticket-<sha256(externalAlertId)[:16]>`), so no LLM interface change is needed and a rerun cannot reuse a prior task's Python idempotency key. Tests assert production profile + scripted mode fails startup, wrong catalog/messages fail immediately, extra/missing turns fail, and two external alert IDs produce different call IDs.
 
 Run:
 
@@ -176,7 +176,21 @@ public record AcceptanceEvidence(
 ) {}
 ```
 
-`GET /api/acceptance/tasks/{taskId}` is enabled only in demo-smoke/demo-chaos/test. It never exposes messages, arguments, evidence or full output.
+`PythonAcceptanceClient` deserializes the shared fixture into this strict internal record and rejects unknown fields, negative counts, more than 16 ticket IDs, invalid ticket IDs or an unexpected scope:
+
+```java
+record PythonAcceptanceResponse(
+        int contractVersion,
+        String scope,
+        Map<String, Integer> toolAttempts,
+        int createTicketAttempts,
+        int uniqueTicketCount,
+        List<String> ticketIds,
+        String faultGateState
+) {}
+```
+
+`PythonAcceptanceClient` obtains the task's persisted `create_ticket` call ID from the Java ledger and calls `/internal/acceptance?idempotencyKey={urlEncodedToolCallId}`; reject paths query the REJECTED call ID and therefore receive zero attempts rather than global counts from older scenarios. If a no-hit or pre-ticket failure has no `create_ticket` ledger row, Java returns zero attempts/unique tickets without issuing an unscoped Python query. `GET /api/acceptance/tasks/{taskId}` is enabled only in demo-smoke/demo-chaos/test. It never exposes messages, arguments, evidence or full output.
 
 - [ ] **Step 12.7: Generate machine-readable acceptance reports in tests**
 
@@ -188,10 +202,11 @@ Run:
 ./mvnw -B -Dit.test=IncidentAcceptanceIT verify
 test -s target/acceptance/incident-evidence.json
 test -s target/acceptance/incident-evidence.md
-! rg -ni "api.?key|password|arguments_snapshot|full.?content|evidence" target/acceptance
+! rg -ni 'api.?key|password|authorization|arguments_snapshot|idempotency_key|mysql://|redis://|private.?key' target/acceptance
+! rg -n 'SECRET_SENTINEL|ARGUMENT_SENTINEL|FULL_LOG_SENTINEL' target/acceptance
 ```
 
-Expected GREEN and no sensitive match.
+Expected GREEN and no sensitive match. Do not scan the generic word `evidence`, because it is part of the safe report title and field vocabulary; instead seed the three sentinel values into hidden task/tool/log inputs and prove their exact absence.
 
 - [ ] **Step 12.8: Verify and commit Task 12**
 
@@ -220,6 +235,7 @@ git commit -m "feat: add readiness traces and acceptance evidence"
 **Files:**
 
 - Create: `src/main/java/com/reagent/api/TaskView.java`
+- Create: `src/main/java/com/reagent/api/IncidentSummaryView.java`
 - Modify: `src/main/java/com/reagent/api/TaskController.java`
 - Modify: `src/main/java/com/reagent/api/IncidentController.java`
 - Modify: `src/main/java/com/reagent/api/ApprovalController.java`
@@ -242,7 +258,7 @@ Before editing static assets, invoke `frontend-design` and preserve the approved
 
 `DemoApiContractTest` covers task view, incident accepted response, approvals, readiness, acceptance and SSE `cursor` query fallback. `Last-Event-ID` header wins over query cursor.
 
-`DemoConsoleContractTest` asserts landmark IDs, event names, approve/reject actions, `EventSource`, `textContent`, and zero unsafe DOM APIs.
+`DemoConsoleContractTest` asserts landmark IDs, event names, approve/reject actions, `EventSource`, the two exact `localStorage` keys, absence of `sessionStorage`, `textContent`, and zero unsafe DOM APIs.
 
 Run:
 
@@ -254,7 +270,33 @@ Expected RED: bounded task view and static files are absent.
 
 - [ ] **Step 13.2: Add bounded task/API views and replay cursor**
 
-Replace controller-internal maps with immutable `TaskView` while preserving existing JSON fields. Add profile ID, recovery count, owner/epoch and timestamps; exclude system prompt, profile snapshot, arguments and messages.
+Replace controller-internal maps with immutable views while preserving existing JSON fields:
+
+```java
+public record IncidentSummaryView(
+        String source,
+        String externalAlertId,
+        String service,
+        String severity,
+        Instant startedAt
+) {}
+
+public record TaskView(
+        String taskId,
+        String status,
+        String goal,
+        String result,
+        String profile,
+        int recoveryCount,
+        String ownerId,
+        long leaseEpoch,
+        Instant createdAt,
+        Instant updatedAt,
+        IncidentSummaryView incident
+) {}
+```
+
+`TaskController` looks up `IncidentIntakeRepository.findByTaskId(taskId)` and maps only the five bounded incident fields above; coding tasks return `incident=null`. Exclude system prompt, profile snapshot, tool arguments and messages. This safe summary lets a fresh browser process restore the alert header using only its stored task ID.
 
 Extend SSE with `@RequestParam(required=false) String cursor`; normalize header/query to one opaque cursor, header first. Do not change event persistence or live transport semantics.
 
@@ -291,8 +333,9 @@ function textElement(tag, className, value) {
 The client must:
 
 - trigger `POST /api/incidents` with the fixed alert;
-- store task ID and last durable event ID in `sessionStorage`;
+- store only task ID and last durable event ID in `localStorage` under versioned keys (`reagent.demo.v1.taskId` and `reagent.demo.v1.cursor`); never store alert text, messages, tool arguments, approval reasons, citations, logs, ticket content or credentials;
 - open EventSource with `?cursor=` after browser restart;
+- validate task IDs with `/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/` and cursors with `/^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/`; discard malformed values and pass valid cursors through `URLSearchParams`, never string concatenation;
 - deduplicate only durable event IDs, never TOKEN text by content;
 - parse only known event shapes and render unknown data as bounded plain text;
 - re-fetch task/approvals/readiness on reconnect, WAITING and terminal events;
@@ -302,7 +345,7 @@ The client must:
 
 - [ ] **Step 13.5: Prove the console-facing flow over HTTP**
 
-`DemoConsoleFlowIT` starts the app with scripted mode and real Python infrastructure, fetches all static resources, posts the alert, consumes SSE to WAITING, checks citations/metrics/logs, approves, reconnects from last event ID and asserts COMPLETED with ticket. A second test rejects and asserts no ticket. A third reconnects after simulated browser restart and asserts no duplicate durable IDs.
+`DemoConsoleFlowIT` starts the app with scripted mode and real Python infrastructure, fetches all static resources, posts the alert, consumes SSE to WAITING, checks citations/metrics/logs, approves, reconnects from last event ID and asserts COMPLETED with ticket. A second test rejects and asserts no ticket. A third creates a fresh client state with only the two persisted IDs, re-fetches `TaskView`/approvals/readiness, asserts the incident header is restored, reconnects from the cursor and observes no duplicate durable IDs.
 
 Run:
 
@@ -365,7 +408,7 @@ git commit -m "feat: add incident response console"
 
 - [ ] **Step 14.1: Write packaging and shell safety tests first**
 
-`ComposeContractTest` asserts services `mysql`, `redis`, `jaeger`, `agent-capabilities`, `reagent-worker-a`, and failover-profile `reagent-worker-b`; no global `container_name`; health conditions; Redis 8; MySQL 8; internal network; named volumes; no real key; normal profile excludes chaos; only Java UI port is mapped for normal demo.
+`ComposeContractTest` asserts services `mysql`, `redis`, `jaeger`, `agent-capabilities`, `reagent-worker-a`, and failover-profile `reagent-worker-b`; no global `container_name`; health conditions; Redis 8; MySQL 8; internal network; named volumes; no real key; normal profile excludes chaos. The only normal host mappings are Java UI/API `8080` and Jaeger UI `16686`; MySQL, Redis, Python and OTLP stay internal.
 
 `ShellScriptContractTest` asserts every script uses `set -Eeuo pipefail`, fixed compose project/file, bounded wait, no `docker system prune`, no broad `rm -rf`, no `down -v` outside reset, and failover resolves Worker A via `docker compose ps -q reagent-worker-a` before kill.
 
@@ -385,7 +428,19 @@ Java Dockerfile uses Maven/JDK 21 build stage and JRE 21 runtime stage, copies o
 
 - [ ] **Step 14.3: Compose the two-service application and persistent stores**
 
-MySQL init creates `reagent` and `fake_ops` schemas and grants the configured application user both, while ownership remains separated by migration tools. Redis uses `redis:8` with a named data volume. Jaeger exposes UI/OTLP. Python depends on MySQL/Redis health; Java depends on Python/MySQL/Redis health.
+MySQL init creates two schema-scoped demo accounts; neither account receives privileges on the other service's schema:
+
+```sql
+CREATE DATABASE IF NOT EXISTS reagent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS fake_ops CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'reagent_app'@'%' IDENTIFIED BY 'reagent-local-only';
+CREATE USER IF NOT EXISTS 'fake_ops_app'@'%' IDENTIFIED BY 'fake-ops-local-only';
+GRANT ALL PRIVILEGES ON reagent.* TO 'reagent_app'@'%';
+GRANT ALL PRIVILEGES ON fake_ops.* TO 'fake_ops_app'@'%';
+FLUSH PRIVILEGES;
+```
+
+These are visibly local-only demo credentials in `.env.example`, not production secrets. Compose points Java only at `reagent_app`/`reagent` and Python only at `fake_ops_app`/`fake_ops`. Fast `ComposeContractTest` parses the rendered Compose/init SQL and asserts separate credentials plus no cross-schema grant; Step 14.5 performs the real login checks and requires a cross-schema `SELECT` to fail for each account. Redis uses `redis:8` with a named data volume. Jaeger maps only UI `16686`; OTLP remains internal. Python depends on MySQL/Redis health; Java depends on Python/MySQL/Redis health.
 
 Worker A and B share Java DB, Redis Streams and workspace volume, use different worker IDs and identical trusted Python URL/server ID. Worker B exists only in Compose profile `failover`. `demo-smoke` enables scripted LLM and acceptance; `demo-chaos` additionally enables the Python/Java deterministic fault gates.
 
@@ -393,20 +448,40 @@ Worker A and B share Java DB, Redis Streams and workspace volume, use different 
 
 `scripts/lib/demo-common.sh` defines project name `reagent-demo`, compose command, `wait_http`, `wait_json_field`, and stable JSON string extraction without jq. All waits use a deadline and print compose status/log tails on failure.
 
+Generate a fresh, bounded ID for every invocation; never fall back to the shared fixture ID:
+
+```bash
+new_external_alert_id() {
+  local scenario="${1:?scenario is required}"
+  local stamp nonce value
+  case "$scenario" in
+    alert|smoke|reject|failover) ;;
+    *) echo "invalid scenario: $scenario" >&2; return 2 ;;
+  esac
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  nonce="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  value="ALERT-CHECKOUT-${scenario^^}-${stamp}-${nonce}"
+  [[ "$value" =~ ^ALERT-CHECKOUT-(ALERT|SMOKE|REJECT|FAILOVER)-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]
+  printf '%s\n' "$value"
+}
+```
+
+`json_field` uses the host Python 3 standard library to parse one named top-level field from stdin; it never uses regex to parse JSON. `demo-alert.sh` accepts the generated ID as its only optional argument, validates the same regex, obtains the request JSON from `$COMPOSE exec -T agent-capabilities python -m agent_capabilities.fake_ops.alerts "$external_alert_id"`, posts it, and requires a nonblank task ID plus `deduplicated=false`.
+
 Script behavior:
 
 | Script | Exact outcome |
 |---|---|
 | `demo-up.sh` | build/start normal stack, initialize RAG, wait aggregate readiness |
-| `demo-alert.sh` | post fixed alert and print task ID |
-| `demo-smoke.sh` | start demo-smoke, trigger, wait approval, approve, assert COMPLETED/unique ticket 1 |
-| `demo-reject.sh` | trigger, reject, assert COMPLETED/create-ticket calls 0 |
-| `demo-failover.sh` | start demo-chaos + Worker B, arm gate, approve, wait committed, kill only Worker A, assert higher epoch/attempts≥2/unique=1 |
+| `demo-alert.sh` | generate or accept one valid run-scoped alert ID, post it, require `deduplicated=false`, and print alert/task IDs |
+| `demo-smoke.sh` | generate a unique `SMOKE` ID, start demo-smoke, trigger, wait approval, approve, assert task-scoped COMPLETED/unique ticket 1 |
+| `demo-reject.sh` | generate a unique `REJECT` ID, trigger, reject, assert task-scoped COMPLETED/create-ticket attempts 0 |
+| `demo-failover.sh` | generate a unique `FAILOVER` ID, start demo-chaos + Worker B, arm gate, approve, wait committed, kill only Worker A, assert task-scoped higher epoch/attempts≥2/unique=1 |
 | `demo-down.sh` | stop stack without deleting volumes |
 | `demo-reset.sh` | explicit project-scoped `down -v --remove-orphans` |
 | `verify-all.sh` | Java fast/integration, Python fast/integration/quality, compose smoke/failover |
 
-Every script is rerunnable; the fixed alert ID may deduplicate, so smoke scripts perform an explicit project reset or derive a run-scoped external ID from a safe CLI argument.
+Every script is rerunnable without deleting volumes: it generates and validates its own `externalAlertId`, requires the intake response to be fresh, and reads key-scoped acceptance evidence. A caller-supplied ID is allowed only for `demo-alert.sh` and must pass the same pattern; scenario scripts never reuse it.
 
 - [ ] **Step 14.5: Prove all three demo paths**
 
@@ -421,6 +496,8 @@ bash scripts/demo-down.sh
 ```
 
 Expected: each scenario prints its task ID, final status and evidence summary; failover prints Worker A/B epochs, attempt count at least two and unique ticket count one; down leaves named volumes.
+
+Before the scenario assertions, execute one permitted same-schema query and one forbidden cross-schema query as each application account from the MySQL container. Both permitted queries must succeed and both cross-schema queries must fail.
 
 - [ ] **Step 14.6: Split CI into four non-skipping gates**
 

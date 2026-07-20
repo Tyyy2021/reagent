@@ -49,6 +49,7 @@
 - Modify: `services/agent-capabilities/src/agent_capabilities/readiness.py`
 - Create: `services/agent-capabilities/tests/test_fake_metrics.py`
 - Create: `services/agent-capabilities/tests/test_fake_logs.py`
+- Create: `services/agent-capabilities/tests/test_alerts.py`
 - Create: `services/agent-capabilities/tests/test_ticket_repository_integration.py`
 - Create: `services/agent-capabilities/tests/test_fault_gate.py`
 - Create: `services/agent-capabilities/tests/test_mcp_protocol.py`
@@ -116,7 +117,9 @@ uv run pytest tests/test_ticket_repository_integration.py -m integration -q
 
 Expected GREEN: same key yields one row and one ticket ID; conflicting parameters raise and leave original content unchanged.
 
-- [ ] **Step 8.3: Add deterministic metrics and logs fixtures**
+- [ ] **Step 8.3: Add deterministic alert, metrics, and logs fixtures**
+
+`fake_ops.alerts.checkout_alert(external_alert_id)` returns the exact shared incident fixture with only `externalAlertId` replaced. It accepts `ALERT-CHECKOUT-(ALERT|SMOKE|REJECT|FAILOVER)-<UTC>-<12 lowercase hex>` IDs, returns a fresh deep copy, performs no HTTP request, and exposes a `python -m agent_capabilities.fake_ops.alerts <id>` CLI that writes one compact JSON object to stdout. `test_alerts.py` compares every other field byte-for-byte with `contracts/incident-intake-v1.example.json`, rejects invalid IDs and proves two calls cannot mutate one another.
 
 `query_metrics` accepts service/start/end and only supports the fixed checkout demo window. It returns bounded structured JSON with request rate, error rate `14.2`, p95 seconds `1.8`, pool max `40`, active `40`, idle `0`, pending `27`, and acquisition timeout count `83`.
 
@@ -125,7 +128,7 @@ Expected GREEN: same key yields one row and one ticket ID; conflicting parameter
 Run:
 
 ```bash
-uv run pytest tests/test_fake_metrics.py tests/test_fake_logs.py -q
+uv run pytest tests/test_alerts.py tests/test_fake_metrics.py tests/test_fake_logs.py -q
 ```
 
 Expected RED, then GREEN after deterministic providers are implemented.
@@ -208,9 +211,9 @@ uv run pytest tests/test_mcp_protocol.py -m integration -q
 
 Expected GREEN.
 
-- [ ] **Step 8.7: Add bounded acceptance state and verify Task 8**
+- [ ] **Step 8.7: Add bounded, key-scoped acceptance state and verify Task 8**
 
-`GET /internal/acceptance` is available only when enabled and returns contract version, per-tool attempt counts, unique ticket count, ticket IDs, last committed idempotency key, and fault gate state. It never returns full evidence, DB URL or secrets. Validate the shared fixture.
+`GET /internal/acceptance` is available only when enabled and returns the exact roadmap fixture fields: contract version, scope, per-tool attempts, create-ticket attempts, unique ticket count, bounded ticket IDs and fault-gate state. `GET /internal/acceptance?idempotencyKey={toolCallId}` validates a 1–255 character opaque ID and scopes create-ticket attempts, unique count and ticket IDs to that key; an absent row returns zero counts and an empty list. This scoped form is what Java Task 12 and rerunnable demo scripts use, so prior scenarios cannot satisfy a later assertion. The raw query key is never echoed, and neither form returns full evidence, DB URL or secrets. Validate the shared fixture and test global, matching-key, absent-key and invalid-key responses.
 
 Run:
 
@@ -285,7 +288,50 @@ Add:
 </dependency>
 ```
 
-Do not add `io.modelcontextprotocol.sdk:mcp`, because it brings the SDK's default Jackson 3 bundle. Characterization test imports `JacksonMcpJsonMapper`, creates `HttpClientStreamableHttpTransport.builder(baseUrl).endpoint("/mcp").build()`, creates `McpClient.sync(transport).requestTimeout(Duration.ofSeconds(3)).build()`, and closes it without network I/O.
+Do not add `io.modelcontextprotocol.sdk:mcp`, because it brings the SDK's default Jackson 3 bundle. Pin the characterization test to the official v2.0.0 signatures with an explicit Jackson 2 mapper, transport endpoint, connection timeout, request customizer and sync-client timeout:
+
+```java
+JacksonMcpJsonMapper jsonMapper = new JacksonMcpJsonMapper(objectMapper.copy());
+HttpClientStreamableHttpTransport transport = HttpClientStreamableHttpTransport.builder(baseUrl)
+        .jsonMapper(jsonMapper)
+        .endpoint("/mcp")
+        .connectTimeout(Duration.ofMillis(500))
+        .httpRequestCustomizer((request, method, endpoint, body, context) -> {
+            copyHeader(context, request, "traceparent");
+            copyHeader(context, request, "tracestate");
+        })
+        .build();
+McpSyncClient client = McpClient.sync(transport)
+        .transportContextProvider(OfficialMcpGateway::captureTraceContext)
+        .requestTimeout(Duration.ofSeconds(3))
+        .initializationTimeout(Duration.ofSeconds(3))
+        .build();
+client.close();
+```
+
+The helper methods use only the SDK's fixed context API; the request customizer must not read OTel thread-local state:
+
+```java
+static McpTransportContext captureTraceContext() {
+    Map<String, String> carrier = new LinkedHashMap<>();
+    W3CTraceContextPropagator.getInstance()
+            .inject(Context.current(), carrier, Map::put);
+    return McpTransportContext.create(new LinkedHashMap<>(carrier));
+}
+
+static void copyHeader(
+        McpTransportContext context,
+        HttpRequest.Builder request,
+        String name
+) {
+    Object value = context.get(name);
+    if (value instanceof String header && !header.isBlank()) {
+        request.setHeader(name, header);
+    }
+}
+```
+
+These names and signatures are verified against the official `modelcontextprotocol/java-sdk` `v2.0.0` tag: [`JacksonMcpJsonMapper(ObjectMapper)`](https://github.com/modelcontextprotocol/java-sdk/blob/v2.0.0/mcp-json-jackson2/src/main/java/io/modelcontextprotocol/json/jackson2/JacksonMcpJsonMapper.java), [`HttpClientStreamableHttpTransport.Builder`](https://github.com/modelcontextprotocol/java-sdk/blob/v2.0.0/mcp-core/src/main/java/io/modelcontextprotocol/client/transport/HttpClientStreamableHttpTransport.java), [`McpSyncHttpClientRequestCustomizer`](https://github.com/modelcontextprotocol/java-sdk/blob/v2.0.0/mcp-core/src/main/java/io/modelcontextprotocol/client/transport/customizer/McpSyncHttpClientRequestCustomizer.java), and [`McpClient.SyncSpec`](https://github.com/modelcontextprotocol/java-sdk/blob/v2.0.0/mcp-core/src/main/java/io/modelcontextprotocol/client/McpClient.java).
 
 Run:
 
@@ -322,7 +368,7 @@ public record McpCallResult(String text, boolean error) {}
 
 - [ ] **Step 9.3: Implement initialize/list/call and W3C propagation**
 
-For each configured server, build a sync client using the official JDK Streamable HTTP transport, call `initialize`, cache `listTools` for readiness, and recreate the client once after transport failure. Use the transport's HTTP request customizer to inject current W3C `traceparent`/`tracestate`; never send task goal or secret as headers.
+For each configured server, use the exact Step 9.1 construction, call `initialize`, cache `listTools` for readiness, and recreate the client once after transport failure. `transportContextProvider` captures the caller's W3C `traceparent`/`tracestate`; the request customizer copies only those two values from `McpTransportContext`. Never read OTel thread-local state inside the customizer and never send task goal or secret as headers.
 
 `call` uses:
 
@@ -423,6 +469,7 @@ git commit -m "feat: add official Java MCP gateway and adapters"
 - Create: `src/main/java/com/reagent/approval/ApprovalRequestEntity.java`
 - Create: `src/main/java/com/reagent/approval/ApprovalRequestRepository.java`
 - Create: `src/main/java/com/reagent/approval/ApprovalView.java`
+- Create: `src/main/java/com/reagent/approval/ApprovalDecisionRequest.java`
 - Create: `src/main/java/com/reagent/approval/ApprovalConflictException.java`
 - Create: `src/main/java/com/reagent/approval/ApprovalDecisionTransaction.java`
 - Create: `src/main/java/com/reagent/approval/ApprovalService.java`
@@ -454,7 +501,7 @@ Migration:
 ```sql
 CREATE TABLE approval_request (
     tool_call_id VARCHAR(255) NOT NULL,
-    task_id VARCHAR(36) NOT NULL,
+    task_id VARCHAR(255) NOT NULL,
     assistant_message_seq INT NOT NULL,
     tool_name VARCHAR(64) NOT NULL,
     arguments_snapshot MEDIUMTEXT NOT NULL,
@@ -506,6 +553,35 @@ Request:
 ```json
 {"decision":"APPROVE","reason":"Evidence confirms pool exhaustion"}
 ```
+
+Use these exact public decision/view shapes; the API never returns `arguments_snapshot` or the injected idempotency key:
+
+```java
+public enum ApprovalStatus { PENDING, APPROVED, REJECTED }
+
+public enum ApprovalDecision { APPROVE, REJECT }
+
+public record ApprovalView(
+        String taskId,
+        String toolCallId,
+        int assistantMessageSeq,
+        String toolName,
+        ApprovalStatus status,
+        String title,
+        String severity,
+        String evidencePreview,
+        String decisionReason,
+        Instant requestedAt,
+        Instant decidedAt
+) {}
+
+public record ApprovalDecisionRequest(
+        @NotNull ApprovalDecision decision,
+        @Size(max = 512) String reason
+) {}
+```
+
+For the current `create_ticket` policy, `title` is capped at 255 characters, `severity` at 16, and `evidencePreview` at 512 with an explicit truncation marker. Any unexpected stored shape fails closed instead of exposing raw JSON.
 
 `ApprovalDecisionTransaction.decide` locks task, approval and tool-call rows. Same decision replay returns current view; opposite decision throws `ApprovalConflictException` mapped to 409; missing/wrong task is 404; terminal/cancelled task is 409. APPROVE leaves tool call PENDING. REJECT sets approval and ledger REJECTED and appends exactly one bounded tool message stating no remote action occurred.
 
@@ -582,7 +658,7 @@ The scripted LLM must assert actual persisted messages and exact tool catalog on
 3. after metrics/logs, call `create_ticket` using bounded evidence and no idempotency key;
 4. after ticket or REJECTED result, return a final answer containing actual chunk ID, metrics facts, log fact, decision and actual ticket ID when present.
 
-Tool-call IDs are fixed constants per scenario so replay assertions are stable. The fake fails on missing evidence, extra turns, wrong tool names or hard-coded ticket output.
+Tool-call IDs are deterministic hashes of that scenario's fixed `externalAlertId`, so they remain stable through replay but differ across run-scoped alert IDs. The fake fails on missing evidence, extra turns, wrong tool names or hard-coded ticket output.
 
 - [ ] **Step 11.2: Prove happy and reject flows over real protocols**
 

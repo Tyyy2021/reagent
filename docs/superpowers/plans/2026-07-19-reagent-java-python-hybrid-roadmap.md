@@ -17,9 +17,11 @@
 - Python 固定 `requires-python = ">=3.12,<3.13"`，精确固定 `mcp==1.28.1`，并提交 `uv.lock`；MCP Java SDK 固定 `2.0.0`。
 - Spring Boot 3 使用 Jackson 2，因此 Java 依赖 `mcp-core` 与 `mcp-json-jackson2`，禁止引入默认 Jackson 3 的 `mcp` 聚合包。
 - Java Flyway 只修改 `reagent` schema；Python Alembic 只修改 `fake_ops` schema。Java 不直接查询 `demo_ticket`。
+- Compose 为 Java 使用仅授权 `reagent.*` 的 `reagent_app`，为 Python 使用仅授权 `fake_ops.*` 的 `fake_ops_app`；禁止共享跨 schema 应用账号。
 - Redis Streams 继续由 Java 管理；Python 只能读写 `rag:incident:*` 和 `idx:rag:incident:*`。
 - 所有跨服务 URL、告警 source、Profile、MCP server ID 和知识库 ID 均来自受信配置，不从 Task 或 LLM 参数接收动态 URL。
 - `idempotency_key` 不出现在 LLM 可见 Schema；Java 在调用 `create_ticket` 前强制注入 `tool_call_id`，Python 对同一键不同参数 fail-closed。
+- Python acceptance 的工单统计可按 Java 持久化的 `tool_call_id` 查询；Task 级验收和重复运行脚本不得用全局历史计数判定本次成功。
 - 所有跨服务请求设置连接、调用、响应体、字段长度和并发上限；外部错误转成结构化结果，不污染 Java 持久事实。
 - 每个行为先写失败测试并看到预期 RED，再写最小实现并看到 GREEN；fast test 不依赖 Docker，integration/quality/compose test 不得因基础设施缺失而静默跳过。
 - 每个全局 Task 独立提交。提交前执行 focused test、相关回归、`git diff --check` 和 `git status --short`，只暂存该 Task 文件。
@@ -65,7 +67,7 @@ git merge main
 ## Plan Suite and Required Order
 
 1. [`2026-07-19-reagent-python-rag.md`](./2026-07-19-reagent-python-rag.md)
-   - Task 5：告警去重、共享契约、Python ASGI 骨架。
+   - Task 5：告警去重、初始无工具 `incident-ops` Profile、提交后单次调度、共享契约、Python ASGI 骨架。
    - Task 6：确定性切片、MiniLM、Redis 8 HNSW、索引切换与离线评测。
    - Task 7：Java RAG Gateway、冻结 index version、`search_knowledge` 与边界验证。
 2. [`2026-07-19-reagent-mcp-incident.md`](./2026-07-19-reagent-mcp-incident.md)
@@ -144,6 +146,8 @@ public record RagSearchResponse(
 ) {}
 ```
 
+`search_knowledge` 的 model-visible `topK` 可省略；Java Tool 把省略值固定为 `3`、显式值只接受 1–5，并始终向 Python HTTP 契约发送该合法整数。
+
 端点：
 
 ```http
@@ -164,6 +168,28 @@ active-version 响应固定为：
   "ready": true
 }
 ```
+
+### Acceptance evidence
+
+`contracts/acceptance-v1.response.json` fixes the bounded Python response consumed by Java. The optional `idempotencyKey` query value is never echoed:
+
+```json
+{
+  "contractVersion": 1,
+  "scope": "idempotency-key",
+  "toolAttempts": {
+    "query_metrics": 0,
+    "search_logs": 0,
+    "create_ticket": 2
+  },
+  "createTicketAttempts": 2,
+  "uniqueTicketCount": 1,
+  "ticketIds": ["OPS-0123456789AB"],
+  "faultGateState": "released"
+}
+```
+
+`scope` is `all` without a query and `idempotency-key` with one. Counts are non-negative, `ticketIds` has at most 16 bounded IDs, and `faultGateState` is one of `disabled|idle|armed|blocked|released`.
 
 ## Shared MCP Contracts
 
@@ -252,7 +278,8 @@ AGENT_CAPABILITIES_OTLP_ENDPOINT
 | Required behavior | Owning task | Mandatory evidence |
 |---|---:|---|
 | 相同告警并发只建一个 task | 5 | `IncidentIntakeIT.concurrentDuplicateReturnsOneTask` |
-| 两语言解析同一 RAG fixture | 5 | Java `RagContractTest` + Python `test_contract.py` |
+| 新告警 commit 后只调度一次，重复告警不调度 | 5 | `IncidentIntakeIT.freshStartsOnceAndDuplicateDoesNotRestart` |
+| 两语言解析同一 RAG fixture | 5/7 | Python `test_contract.py` + Java `RagContractTest` |
 | 稳定 chunk ID、无重复初始化 | 6 | `test_chunker.py` + `test_initializer.py` |
 | Redis HNSW、失败版本不切 active | 6 | `test_redis_index_integration.py` |
 | MiniLM top-3、MRR ≥ 0.80 | 6 | `test_retrieval_quality.py` + JSON report |
@@ -267,6 +294,35 @@ AGENT_CAPABILITIES_OTLP_ENDPOINT
 | readiness 与 W3C trace 贯通 | 12 | `ReadinessIT` + `CrossServiceTraceIT` |
 | 浏览器批准/拒绝/重连 | 13 | API/static contract + Playwright-less HTTP flow |
 | 一键 happy/reject/failover | 14 | Compose smoke scripts 与 CI artifact |
+
+## Spec-to-Plan Coverage Matrix
+
+| Approved spec section | Owning plan/tasks | Executable evidence or gate |
+|---:|---|---|
+| 1. 决策与治理关系 | Roadmap Task 4 gate；Tasks 5–14 replacement order | Task 4 review must pass before merge/start of Task 5 |
+| 2. 产品定位 | Tasks 5, 11, 14 | Incident HTTP entry, full workflow IT, README boundary |
+| 3. 成功标准 | Tasks 11–14 | Scenario ITs, trace/evidence reports, console and scripts |
+| 4. 总体架构 | Tasks 5, 8, 14 | One Python ASGI image plus Java/MySQL/Redis/Jaeger Compose contract |
+| 5. 唯一控制面 | Tasks 5, 7, 9–11 | Java owns task/profile/tool/approval; Python tests expose capability-only APIs |
+| 6. 告警来源与接入 | Tasks 5, 13, 14 | `IncidentIntakeIT`, console trigger, unique-ID demo scripts |
+| 7. Python 服务 | Tasks 5, 8, 12, 14 | locked package, one lifespan, ownership/readiness tests, one image |
+| 8. RAG 设计 | Tasks 5–7 | contract tests, chunk/index integration, MiniLM report, Java gateway IT |
+| 9. MCP Fake Ops | Tasks 8–9 | Python and Java initialize/list/call protocol tests; ticket concurrency IT |
+| 10. 审批与可靠性 | Tasks 9–11 | unknown-outcome tests, approval restart/conflict tests, whole-batch barrier |
+| 11. 端到端流程 | Tasks 11, 14 | happy/reject/crash matrix/dangerous-window ITs and three demo scripts |
+| 12. 错误处理 | Tasks 5–11, 12 | duplicate/timeout/no-hit/drift/restart/recovery-limit tests plus readiness |
+| 13. 可观测性 | Tasks 7, 9, 11, 12 | bounded events, W3C MCP/RAG propagation and `CrossServiceTraceIT` |
+| 14. 安全边界 | Global constraints; Tasks 5, 7–9, 12–14 | trusted configuration, bounded bodies, hidden key, DOM/trace/Compose scans |
+| 15. 测试与自动化证据 | Every task; Task 14 CI | Java/Python fast, Docker integration, quality and Compose jobs without skip |
+| 16. 演示控制台 | Task 13 | static/API contract and reconnecting console flow IT |
+| 17. 文档交付范围 | Tasks 12, 14 | generated technical evidence and README; no `docs/interview` |
+| 18. Task 重排 | Plan Suite and Required Order | sequential Task 4 → 5–7 → 8–11 → 12–14 gates |
+| 19. 迁移所有权 | Tasks 5, 8, 10 | V3/V4 Flyway and Alembic 0001 fresh/legacy/ownership tests |
+| 20. 明确非目标 | Global constraints; Task 14 README | dependency/structure scans and documented limitations |
+| 21. 最终验收 | Task-to-Evidence table; all completion gates | top-3/MRR, unique ticket, failover, trace, UI and one-command evidence |
+| 22. 风险与缓解 | Tasks 5–14 | locks/pins, versioned contracts, scoped ownership, restart and drift tests |
+| 23. 官方技术依据 | Tasks 6, 8, 9 | locked MiniLM, MCP Python 1.28.1, MCP Java 2.0.0/Jackson 2 compile gates |
+| 24. 后续流程 | Task 4 gate and execution handoff | no Task 5 code before approved plans and Task 4 Step 4.7 review |
 
 ## Final Completion Gate
 
