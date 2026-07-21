@@ -195,16 +195,34 @@ class IncidentIntakeIT extends InfrastructureIT {
                 "an exact-limit body must reach normal request validation, not the 413 branch");
     }
 
+    @Test
+    void payloadLimitRejectsMatrixParameterPathVariantBeforeJackson() throws Exception {
+        byte[] oversized = ("{" + "x".repeat(MAX_PAYLOAD_BYTES))
+                .getBytes(StandardCharsets.UTF_8);
+
+        HttpResponse<String> response = postBytes(
+                "/api/incidents;x=1", oversized, false);
+
+        assertEquals(MAX_PAYLOAD_BYTES + 1, oversized.length);
+        assertEquals(413, response.statusCode());
+        assertEquals(0, jdbc.queryForObject("select count(*) from task", Integer.class));
+    }
+
     private HttpResponse<String> postJson(Object body) throws Exception {
         return postBytes(mapper.writeValueAsBytes(body), false);
     }
 
     private HttpResponse<String> postBytes(byte[] body, boolean chunked) throws Exception {
+        return postBytes("/api/incidents", body, chunked);
+    }
+
+    private HttpResponse<String> postBytes(String path, byte[] body, boolean chunked)
+            throws Exception {
         HttpRequest.BodyPublisher publisher = chunked
                 ? HttpRequest.BodyPublishers.ofInputStream(() -> new ByteArrayInputStream(body))
                 : HttpRequest.BodyPublishers.ofByteArray(body);
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + port + "/api/incidents"))
+                .uri(URI.create("http://localhost:" + port + path))
                 .header("content-type", "application/json")
                 .POST(publisher)
                 .build();

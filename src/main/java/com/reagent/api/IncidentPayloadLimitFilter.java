@@ -12,6 +12,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UrlPathHelper;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
@@ -28,8 +29,12 @@ public class IncidentPayloadLimitFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return !"POST".equals(request.getMethod())
-                || !"/api/incidents".equals(request.getRequestURI());
+        if (!"POST".equals(request.getMethod())) {
+            return true;
+        }
+        String pathWithinApplication =
+                UrlPathHelper.defaultInstance.getPathWithinApplication(request);
+        return !"/api/incidents".equals(pathWithinApplication);
     }
 
     @Override
