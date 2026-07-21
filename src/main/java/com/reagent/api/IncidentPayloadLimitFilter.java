@@ -32,9 +32,8 @@ public class IncidentPayloadLimitFilter extends OncePerRequestFilter {
         if (!"POST".equals(request.getMethod())) {
             return true;
         }
-        String pathWithinApplication =
-                UrlPathHelper.defaultInstance.getPathWithinApplication(request);
-        return !"/api/incidents".equals(pathWithinApplication);
+        String lookupPath = UrlPathHelper.defaultInstance.getLookupPathForRequest(request);
+        return !"/api/incidents".equals(lookupPath);
     }
 
     @Override
