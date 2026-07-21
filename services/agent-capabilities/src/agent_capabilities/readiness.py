@@ -12,6 +12,9 @@ class CapabilityReadiness:
     def initial(cls) -> "CapabilityReadiness":
         return cls(False, "index-not-initialized", False, "not-configured")
 
+    def with_rag_ready(self) -> "CapabilityReadiness":
+        return CapabilityReadiness(True, "ready", self.fake_ops_ready, self.fake_ops_reason)
+
     def as_dict(self) -> dict[str, object]:
         return {
             "ready": self.rag_ready and self.fake_ops_ready,
