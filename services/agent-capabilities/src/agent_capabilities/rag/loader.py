@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from agent_capabilities.rag.domain import KnowledgeDocument
@@ -10,11 +11,13 @@ _SOURCE_ROOT = PurePosixPath("knowledge/incident-ops")
 def load_documents(knowledge_root: Path) -> list[KnowledgeDocument]:
     root = knowledge_root.resolve()
     manifest = root / "manifest.txt"
-    entries = manifest.read_text(encoding="utf-8").splitlines()
+    entries = re.split(r"\r\n|\r|\n", manifest.read_text(encoding="utf-8"))
     documents: list[KnowledgeDocument] = []
     seen_sources: set[str] = set()
 
     for raw_entry in entries:
+        if any(unicodedata.category(character) == "Cc" for character in raw_entry):
+            raise ValueError(f"unsafe manifest path: {raw_entry!r}")
         entry = raw_entry.strip()
         if not entry:
             continue

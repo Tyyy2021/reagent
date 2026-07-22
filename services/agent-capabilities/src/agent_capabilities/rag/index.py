@@ -81,6 +81,7 @@ end
 if redis.call('GET', KEYS[3]) == ARGV[4] then
   return -1
 end
+redis.call('DEL', KEYS[1])
 local dropped = redis.pcall('FT.DROPINDEX', ARGV[2], 'DD')
 if type(dropped) == 'table' and dropped.err then
   if not string.find(dropped.err, 'Unknown Index name', 1, true) then

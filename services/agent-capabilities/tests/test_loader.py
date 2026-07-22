@@ -57,6 +57,34 @@ def test_load_documents_rejects_unsafe_manifest_paths(
         load_documents(root)
 
 
+@pytest.mark.parametrize(
+    "manifest_entry",
+    [
+        "\trunbooks/valid.md",
+        "runbooks/valid.md\t",
+        "\x0brunbooks/valid.md",
+        "runbooks/valid.md\x0c",
+        "\x1crunbooks/valid.md",
+        "runbooks/valid.md\x1d",
+        "\x1erunbooks/valid.md",
+        "runbooks/valid.md\x1f",
+        "runbooks/valid.md\x7f",
+        "\x80runbooks/valid.md",
+        "runbooks/valid.md\x85",
+        "runbooks/valid.md\x9f",
+    ],
+)
+def test_load_documents_rejects_raw_manifest_controls_before_normalization(
+    tmp_path: Path, manifest_entry: str
+) -> None:
+    root = tmp_path / "incident-ops"
+    _write(root / "runbooks" / "valid.md", "# Valid\n")
+    _write(root / "manifest.txt", f"{manifest_entry}\n")
+
+    with pytest.raises(ValueError, match=r"^unsafe manifest path: "):
+        load_documents(root)
+
+
 def test_load_documents_rejects_symlink_escape(tmp_path: Path) -> None:
     root = tmp_path / "incident-ops"
     outside = tmp_path / "outside.md"

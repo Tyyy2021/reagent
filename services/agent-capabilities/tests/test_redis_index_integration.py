@@ -398,6 +398,35 @@ def test_cleanup_never_deletes_the_version_named_by_active_key(
     redis_client.execute_command("FT.INFO", index.index_name(_VERSION))
 
 
+def test_cleanup_revokes_owner_before_delayed_activation_can_commit(
+    redis_client: _TestRedisClient,
+) -> None:
+    knowledge_root = Path(__file__).resolve().parents[3] / "knowledge" / "incident-ops"
+    prior_version = "v1-prior-active"
+    delayed_client = _DelayedActivationAfterCleanupRedisClient(redis_client)
+    index = RedisKnowledgeIndex(delayed_client)
+    redis_client.set("rag:incident:active", prior_version)
+
+    with pytest.raises(RuntimeError, match="lost activation response"):
+        RagInitializer(
+            knowledge_root=knowledge_root,
+            embedding=_DeterministicEmbedding("model-delayed-activation"),
+            index=index,
+        ).initialize()
+
+    target_version = delayed_client.target_version
+    assert target_version is not None
+    assert delayed_client.cleanup_ran
+    assert not index.has_version(target_version)
+    assert list(redis_client.scan_iter(match=f"{index.chunk_prefix(target_version)}*")) == []
+    with pytest.raises(ResponseError):
+        redis_client.execute_command("FT.INFO", index.index_name(target_version))
+    assert (
+        delayed_client.delayed_activation_result,
+        index.active_version(),
+    ) == (0, prior_version)
+
+
 def test_second_initialization_of_same_active_version_performs_zero_writes(
     redis_client: _TestRedisClient,
 ) -> None:
@@ -635,6 +664,74 @@ class _CleanupBoundaryRedisClient:
             RedisKnowledgeIndex.ready_key(self._index_version), "successor-ready"
         )
         self.takeover_occurred = True
+
+
+class _DelayedActivationAfterCleanupRedisClient:
+    def __init__(self, delegate: _TestRedisClient) -> None:
+        self._delegate = delegate
+        self._deferred_activation: tuple[
+            str, int, tuple[str | bytes, ...]
+        ] | None = None
+        self.target_version: str | None = None
+        self.delayed_activation_result: int | None = None
+        self.cleanup_ran = False
+
+    def execute_command(self, *args: object) -> object:
+        return self._delegate.execute_command(*args)
+
+    def hset(self, name: str, *, mapping: Mapping[str, str | bytes]) -> int:
+        return self._delegate.hset(name, mapping=mapping)
+
+    def exists(self, name: str) -> int:
+        return self._delegate.exists(name)
+
+    def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        nx: bool = False,
+        px: int | None = None,
+    ) -> bool | None:
+        return self._delegate.set(name, value, nx=nx, px=px)
+
+    def get(self, name: str) -> bytes | None:
+        return self._delegate.get(name)
+
+    def eval(
+        self, script: str, numkeys: int, *keys_and_args: str | bytes
+    ) -> object:
+        active_key = "rag:incident:active"
+        if (
+            numkeys == 2
+            and len(keys_and_args) >= 5
+            and _text(keys_and_args[1]) == active_key
+        ):
+            assert self._deferred_activation is None
+            self._deferred_activation = (script, numkeys, keys_and_args)
+            self.target_version = _text(keys_and_args[4])
+            raise RuntimeError("lost activation response")
+
+        is_cleanup = (
+            numkeys == 3
+            and len(keys_and_args) >= 3
+            and _text(keys_and_args[2]) == active_key
+        )
+        result = self._delegate.eval(script, numkeys, *keys_and_args)
+        if is_cleanup:
+            self.cleanup_ran = True
+            deferred = self._deferred_activation
+            assert deferred is not None
+            delayed = self._delegate.eval(deferred[0], deferred[1], *deferred[2])
+            assert isinstance(delayed, int)
+            self.delayed_activation_result = delayed
+        return result
+
+    def scan_iter(self, *, match: str) -> Iterator[bytes]:
+        return self._delegate.scan_iter(match=match)
+
+    def delete(self, *names: bytes | str) -> int:
+        return self._delegate.delete(*names)
 
 
 def _embedded(chunk_id: str, vector_index: int) -> EmbeddedChunk:
