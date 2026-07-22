@@ -47,6 +47,33 @@ class RagContractTest {
         assertThrows(Exception.class, () -> RagSearchResponse.reader(mapper).readValue(unknownHit));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "\"excerpt\":\"Excerpt\"",
+            "\"score\":null,\"excerpt\":\"Excerpt\""
+    })
+    void strictResponseReaderRejectsMissingOrNullScore(String scoreAndExcerpt) {
+        String body = """
+                {"contractVersion":1,"indexVersion":"v1","hits":[{
+                 "chunkId":"chunk-1","title":"Title","section":"Section",
+                 "source":"knowledge/incident-ops/runbooks/a.md",%s}]}
+                """.formatted(scoreAndExcerpt);
+
+        assertThrows(Exception.class, () -> RagSearchResponse.reader(mapper).readValue(body));
+    }
+
+    @Test
+    void strictResponseReaderAcceptsLegitimateZeroScore() {
+        String body = """
+                {"contractVersion":1,"indexVersion":"v1","hits":[{
+                 "chunkId":"chunk-1","title":"Title","section":"Section",
+                 "source":"knowledge/incident-ops/runbooks/a.md","score":0.0,
+                 "excerpt":"Excerpt"}]}
+                """;
+
+        assertDoesNotThrow(() -> RagSearchResponse.reader(mapper).readValue(body));
+    }
+
     @Test
     void requestBoundsUseUnicodeCodePointsAndRequireContractV1() {
         String emoji = "\uD83D\uDE80";

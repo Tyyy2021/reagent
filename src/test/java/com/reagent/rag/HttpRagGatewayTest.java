@@ -14,6 +14,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -109,6 +110,37 @@ class HttpRagGatewayTest {
                 Thread.sleep(300);
             }
             respond(exchange, 200, response("v1", ""));
+        })) {
+            RagProperties properties = properties(server.baseUri());
+            properties.setRequestTimeout(Duration.ofMillis(120));
+            properties.setRetryBackoff(Duration.ofMillis(5));
+
+            RagSearchResponse response = new HttpRagGateway(properties, mapper).search(request("v1", 3));
+
+            assertTrue(response.hits().isEmpty());
+            assertEquals(2, attempts.get());
+        }
+    }
+
+    @Test
+    void retriesWhenResponseBodyStallsAfterHeadersAndPrefix() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        try (StubServer server = new StubServer(exchange -> {
+            String body = response("v1", "");
+            if (attempts.incrementAndGet() == 1) {
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                int prefixLength = bytes.length - 2;
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, bytes.length);
+                try (OutputStream responseBody = exchange.getResponseBody()) {
+                    responseBody.write(bytes, 0, prefixLength);
+                    responseBody.flush();
+                    Thread.sleep(300);
+                    responseBody.write(bytes, prefixLength, bytes.length - prefixLength);
+                }
+            } else {
+                respond(exchange, 200, body);
+            }
         })) {
             RagProperties properties = properties(server.baseUri());
             properties.setRequestTimeout(Duration.ofMillis(120));

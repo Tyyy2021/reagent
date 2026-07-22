@@ -14,9 +14,17 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HexFormat;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 
 /** Bounded HTTP implementation of the fixed internal RAG contract. */
 @Component
@@ -50,11 +58,14 @@ public class HttpRagGateway implements RagGateway {
         RagContract.requireCodePoints(knowledgeBaseId, 1, 64, "knowledgeBaseId");
         String path = "/internal/rag/indexes/" + encodePathSegment(knowledgeBaseId) + "/active";
         HttpRequest request = requestBuilder(endpoint(path)).GET().build();
-        ActiveIndexResponse response = exchange(request, activeReader, ActiveIndexResponse.class);
-        if (!knowledgeBaseId.equals(response.knowledgeBaseId()) || !response.ready()) {
-            throw new RagContractException(
-                    "RAG_RESPONSE_MISMATCH", "active index response does not match the request");
-        }
+        ActiveIndexResponse response = exchange(request, activeReader, ActiveIndexResponse.class,
+                value -> {
+                    if (!knowledgeBaseId.equals(value.knowledgeBaseId()) || !value.ready()) {
+                        throw new RagContractException(
+                                "RAG_RESPONSE_MISMATCH",
+                                "active index response does not match the request");
+                    }
+                });
         return response.indexVersion();
     }
 
@@ -70,14 +81,16 @@ public class HttpRagGateway implements RagGateway {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody))
                 .build();
-        RagSearchResponse response = exchange(httpRequest, searchReader, RagSearchResponse.class);
-        try {
-            response.validateFor(request);
-        } catch (IllegalArgumentException exception) {
-            throw new RagContractException(
-                    "RAG_RESPONSE_MISMATCH", "RAG search response does not match the request");
-        }
-        return response;
+        return exchange(httpRequest, searchReader, RagSearchResponse.class,
+                response -> {
+                    try {
+                        response.validateFor(request);
+                    } catch (IllegalArgumentException exception) {
+                        throw new RagContractException(
+                                "RAG_RESPONSE_MISMATCH",
+                                "RAG search response does not match the request");
+                    }
+                });
     }
 
     private HttpRequest.Builder requestBuilder(URI uri) {
@@ -88,12 +101,11 @@ public class HttpRagGateway implements RagGateway {
         return builder;
     }
 
-    private <T> T exchange(HttpRequest request, ObjectReader reader, Class<T> responseType) {
+    private <T> T exchange(HttpRequest request, ObjectReader reader, Class<T> responseType,
+                           Consumer<T> validator) {
         for (int attempt = 0; attempt <= properties.getRetries(); attempt++) {
             try {
-                HttpResponse<InputStream> response = client.send(
-                        request, HttpResponse.BodyHandlers.ofInputStream());
-                return readResponse(response, reader, responseType);
+                return completeAttempt(request, reader, responseType, validator);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw new RagContractException("RAG_INTERRUPTED", "RAG request was interrupted");
@@ -105,6 +117,53 @@ public class HttpRagGateway implements RagGateway {
             }
         }
         throw new IllegalStateException("unreachable retry state");
+    }
+
+    private <T> T completeAttempt(HttpRequest request, ObjectReader reader, Class<T> responseType,
+                                  Consumer<T> validator) throws IOException, InterruptedException {
+        AttemptCancellation cancellation = new AttemptCancellation();
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<T> inFlight = executor.submit(() -> {
+                HttpResponse<InputStream> response = client.send(
+                        request, HttpResponse.BodyHandlers.ofInputStream());
+                if (!cancellation.register(response.body())) {
+                    throw new InterruptedException("RAG request was cancelled");
+                }
+                T value = readResponse(response, reader, responseType);
+                validator.accept(value);
+                return value;
+            });
+            try {
+                return inFlight.get(properties.getRequestTimeout().toNanos(), TimeUnit.NANOSECONDS);
+            } catch (TimeoutException timeout) {
+                cancellation.cancel();
+                inFlight.cancel(true);
+                throw new HttpTimeoutException("RAG complete response deadline exceeded");
+            } catch (InterruptedException interrupted) {
+                cancellation.cancel();
+                inFlight.cancel(true);
+                throw interrupted;
+            } catch (ExecutionException failure) {
+                return rethrowAttemptFailure(failure.getCause());
+            }
+        }
+    }
+
+    private static <T> T rethrowAttemptFailure(Throwable failure)
+            throws IOException, InterruptedException {
+        if (failure instanceof IOException ioFailure) {
+            throw ioFailure;
+        }
+        if (failure instanceof InterruptedException interrupted) {
+            throw interrupted;
+        }
+        if (failure instanceof RuntimeException runtimeFailure) {
+            throw runtimeFailure;
+        }
+        if (failure instanceof Error error) {
+            throw error;
+        }
+        throw new IOException("RAG request failed", failure);
     }
 
     private <T> T readResponse(HttpResponse<InputStream> response, ObjectReader reader,
@@ -185,5 +244,37 @@ public class HttpRagGateway implements RagGateway {
             }
         }
         return encoded.toString();
+    }
+
+    private static final class AttemptCancellation {
+        private InputStream body;
+        private boolean cancelled;
+
+        private boolean register(InputStream candidate) throws IOException {
+            synchronized (this) {
+                if (!cancelled) {
+                    body = candidate;
+                    return true;
+                }
+            }
+            candidate.close();
+            return false;
+        }
+
+        private void cancel() {
+            InputStream current;
+            synchronized (this) {
+                cancelled = true;
+                current = body;
+                body = null;
+            }
+            if (current != null) {
+                try {
+                    current.close();
+                } catch (IOException ignored) {
+                    // Cancellation is already in progress; the bounded public error is fixed.
+                }
+            }
+        }
     }
 }

@@ -55,6 +55,9 @@ final class RagJson {
         ObjectMapper contractMapper = applicationMapper.copy()
                 .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
                 .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                .enable(DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES)
+                .enable(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)
+                .enable(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
                 .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT);
         return contractMapper.readerFor(targetType);
     }
