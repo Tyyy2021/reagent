@@ -5,7 +5,11 @@ import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.TraceFlags;
 import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * trace 辅助(M6)——集中三件事,别散在各埋点处:
@@ -80,5 +84,12 @@ public final class Trace {
         SpanContext root = SpanContext.createFromRemoteParent(
                 traceId, spanId, TraceFlags.getSampled(), TraceState.getDefault());
         return Context.root().with(Span.wrap(root));
+    }
+
+    /** Injects the current W3C trace context into a fresh immutable HTTP header map. */
+    public static Map<String, String> currentW3cHeaders() {
+        Map<String, String> headers = new LinkedHashMap<>();
+        W3CTraceContextPropagator.getInstance().inject(Context.current(), headers, Map::put);
+        return Map.copyOf(headers);
     }
 }

@@ -3,6 +3,7 @@ package com.reagent.incident;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.AgentRunner;
 import com.reagent.profile.AgentProfileRegistry;
+import com.reagent.rag.RagGateway;
 import com.reagent.testsupport.InfrastructureIT;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,6 +41,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class IncidentIntakeIT extends InfrastructureIT {
@@ -51,6 +53,7 @@ class IncidentIntakeIT extends InfrastructureIT {
     @Autowired private ObjectMapper mapper;
     @SpyBean private AgentProfileRegistry profiles;
     @MockBean private AgentRunner runner;
+    @MockBean private RagGateway ragGateway;
     @LocalServerPort private int port;
 
     private final HttpClient http = HttpClient.newBuilder()
@@ -64,7 +67,8 @@ class IncidentIntakeIT extends InfrastructureIT {
         jdbc.update("DELETE FROM tool_call");
         jdbc.update("DELETE FROM message");
         jdbc.update("DELETE FROM task");
-        reset(runner);
+        reset(runner, ragGateway);
+        when(ragGateway.requireActiveVersion("incident-ops")).thenReturn("v1-test");
     }
 
     @Test

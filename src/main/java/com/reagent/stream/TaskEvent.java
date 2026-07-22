@@ -27,6 +27,7 @@ public record TaskEvent(String taskId, String eventId, Type type, Object data, I
         TOKEN,          // 模型回答的一个文本增量(Stage2 token 级流式;live-only,不落库)
         TOOL_CALL,      // 要调某工具
         TOOL_RESULT,    // 某工具返回
+        KNOWLEDGE_RETRIEVED, // RAG citations retrieved; event data is metadata-only
         COMPLETED,      // 任务完成(终态)
         FAILED,         // 任务失败(终态)
         CANCELLED,      // 用户取消(终态)

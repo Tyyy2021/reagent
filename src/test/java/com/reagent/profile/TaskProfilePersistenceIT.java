@@ -10,6 +10,10 @@ import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskRepository;
 import com.reagent.persist.ToolCallEntity;
 import com.reagent.persist.ToolCallRepository;
+import com.reagent.rag.KnowledgeSearchTool;
+import com.reagent.rag.RagGateway;
+import com.reagent.rag.RagSearchRequest;
+import com.reagent.rag.RagSearchResponse;
 import com.reagent.testsupport.InfrastructureIT;
 import com.reagent.tool.Tool;
 import com.reagent.tool.ToolContext;
@@ -19,6 +23,10 @@ import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -28,6 +36,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -36,6 +46,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Import(TaskProfilePersistenceIT.RagTestConfiguration.class)
 class TaskProfilePersistenceIT extends InfrastructureIT {
 
     private static final int MAX_SNAPSHOT_BYTES = 16_384;
@@ -55,6 +66,9 @@ class TaskProfilePersistenceIT extends InfrastructureIT {
     @Autowired private ToolCallRepository toolCallRepository;
     @Autowired private EntityManager entityManager;
     @Autowired private JdbcTemplate jdbc;
+    @Autowired private AgentProfileRegistry profileRegistry;
+    @Autowired private KnowledgeSearchTool knowledgeSearchTool;
+    @Autowired private MutableRagGateway ragGateway;
 
     @BeforeEach
     void clearRuntimeRows() {
@@ -62,6 +76,38 @@ class TaskProfilePersistenceIT extends InfrastructureIT {
         jdbc.update("DELETE FROM tool_call");
         jdbc.update("DELETE FROM message");
         jdbc.update("DELETE FROM task");
+        ragGateway.reset("v1-a");
+    }
+
+    @Test
+    void incidentRecoveryKeepsCreationTimeIndexAndCodingProfileUnchanged() throws Exception {
+        TaskProfileSnapshot createdSnapshot = profileRegistry.snapshot("incident-ops");
+        assertEquals("v1-a", createdSnapshot.knowledgeIndexVersion());
+        assertEquals(List.of("search_knowledge"),
+                createdSnapshot.tools().stream().map(ToolSnapshot::name).toList());
+
+        TaskEntity created = stateStore.createTask("investigate checkout pool exhaustion", createdSnapshot);
+        ragGateway.activeVersion.set("v1-b");
+        TaskRunToken token = stateStore.claim(created.getId()).orElseThrow();
+
+        TaskProfileSnapshot recovered = stateStore.loadProfile(token);
+        assertEquals("v1-a", recovered.knowledgeIndexVersion());
+        String result = knowledgeSearchTool.execute(
+                mapper.readTree("{\"query\":\"checkout pool exhaustion\"}"),
+                new ToolContext(token, java.nio.file.Path.of(".")));
+
+        assertEquals("v1-a", ragGateway.lastSearch.get().indexVersion());
+        assertEquals(1, ragGateway.activeCalls.get(),
+                "persist/load/recovery/tool execution must not resolve active again");
+        assertTrue(mapper.readTree(result).path("hits").isEmpty());
+
+        TaskProfileSnapshot coding = profileRegistry.snapshot("coding");
+        assertEquals("coding", coding.profileId());
+        assertNull(coding.knowledgeBaseId());
+        assertNull(coding.knowledgeIndexVersion());
+        assertEquals(List.of("read_file", "list_dir", "write_file", "run_command", "sleep_ms"),
+                coding.tools().stream().map(ToolSnapshot::name).toList());
+        assertEquals(1, ragGateway.activeCalls.get(), "coding must not consult the provider");
     }
 
     @Test
@@ -233,6 +279,40 @@ class TaskProfilePersistenceIT extends InfrastructureIT {
             return mapper.readTree(json);
         } catch (Exception ex) {
             throw new IllegalStateException(ex);
+        }
+    }
+
+    @TestConfiguration
+    static class RagTestConfiguration {
+        @Bean
+        @Primary
+        MutableRagGateway mutableRagGateway() {
+            return new MutableRagGateway();
+        }
+    }
+
+    static final class MutableRagGateway implements RagGateway {
+        private final AtomicReference<String> activeVersion = new AtomicReference<>("v1-a");
+        private final AtomicInteger activeCalls = new AtomicInteger();
+        private final AtomicReference<RagSearchRequest> lastSearch = new AtomicReference<>();
+
+        void reset(String version) {
+            activeVersion.set(version);
+            activeCalls.set(0);
+            lastSearch.set(null);
+        }
+
+        @Override
+        public String requireActiveVersion(String knowledgeBaseId) {
+            assertEquals("incident-ops", knowledgeBaseId);
+            activeCalls.incrementAndGet();
+            return activeVersion.get();
+        }
+
+        @Override
+        public RagSearchResponse search(RagSearchRequest request) {
+            lastSearch.set(request);
+            return new RagSearchResponse(1, request.indexVersion(), List.of());
         }
     }
 }
