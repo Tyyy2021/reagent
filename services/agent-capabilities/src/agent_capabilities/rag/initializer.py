@@ -42,15 +42,21 @@ class InitializableKnowledgeIndex(Protocol):
     def release_initialization_lock(self, index_version: str, owner_token: str) -> None:
         raise NotImplementedError
 
-    def cleanup_failed_version(self, index_version: str, owner_token: str) -> None:
+    def renew_initialization_lock(self, index_version: str, owner_token: str) -> bool:
         raise NotImplementedError
 
-    def create_version(self, index_version: str) -> None:
+    def cleanup_failed_version(self, index_version: str, owner_token: str) -> bool:
+        raise NotImplementedError
+
+    def create_version(self, index_version: str, owner_token: str) -> bool:
         raise NotImplementedError
 
     def write_chunks(
-        self, index_version: str, embedded_chunks: Sequence[EmbeddedChunk]
-    ) -> None:
+        self,
+        index_version: str,
+        embedded_chunks: Sequence[EmbeddedChunk],
+        owner_token: str,
+    ) -> bool:
         raise NotImplementedError
 
     def count(self, index_version: str) -> int:
@@ -59,15 +65,30 @@ class InitializableKnowledgeIndex(Protocol):
     def smoke_query(self, index_version: str, vector: tuple[float, ...]) -> None:
         raise NotImplementedError
 
-    def write_ready(self, index_version: str, manifest: IndexManifest) -> None:
+    def write_ready(
+        self, index_version: str, manifest: IndexManifest, owner_token: str
+    ) -> bool:
         raise NotImplementedError
 
-    def set_active(self, index_version: str) -> None:
+    def set_active(self, index_version: str, owner_token: str) -> bool:
         raise NotImplementedError
 
 
 class InitializationInProgressError(RuntimeError):
     pass
+
+
+class InitializationLockLostError(RuntimeError):
+    def __init__(self, index_version: str, phase: str) -> None:
+        super().__init__(f"RAG initialization lock was lost before {phase}: {index_version}")
+        self.index_version = index_version
+        self.phase = phase
+
+
+class ActiveCommitOutcomeUnknownError(RuntimeError):
+    def __init__(self, index_version: str) -> None:
+        super().__init__(f"RAG active commit outcome is unknown: {index_version}")
+        self.index_version = index_version
 
 
 def index_version(manifest: IndexManifest) -> str:
@@ -109,9 +130,13 @@ class RagInitializer:
         try:
             if self._index.has_version(version):
                 smoke_vector = self._only_vector(self._embedding.embed([SMOKE_QUERY]))
+                self._require_lock(
+                    self._index.renew_initialization_lock(version, owner_token),
+                    version,
+                    "existing-index validation",
+                )
                 self._validate_existing(version, len(chunks), smoke_vector)
-                self._index.set_active(version)
-                return version
+                return self._commit_active(version, owner_token)
 
             texts = [chunk.content for chunk in chunks]
             vectors = self._embedding.embed([*texts, SMOKE_QUERY])
@@ -128,12 +153,30 @@ class RagInitializer:
             ]
             smoke_vector = vectors[-1]
 
-            self._index.create_version(version)
-            self._index.write_chunks(version, embedded_chunks)
+            self._require_lock(
+                self._index.create_version(version, owner_token),
+                version,
+                "index creation",
+            )
+            self._require_lock(
+                self._index.write_chunks(version, embedded_chunks, owner_token),
+                version,
+                "chunk writes",
+            )
+            self._require_lock(
+                self._index.renew_initialization_lock(version, owner_token),
+                version,
+                "index validation",
+            )
             self._validate_existing(version, len(chunks), smoke_vector)
-            self._index.write_ready(version, manifest)
-            self._index.set_active(version)
-            return version
+            self._require_lock(
+                self._index.write_ready(version, manifest, owner_token),
+                version,
+                "ready publication",
+            )
+            return self._commit_active(version, owner_token)
+        except ActiveCommitOutcomeUnknownError:
+            raise
         except BaseException:
             self._index.cleanup_failed_version(version, owner_token)
             raise
@@ -172,3 +215,46 @@ class RagInitializer:
         if len(vectors) != 1:
             raise ValueError("embedding adapter returned an unexpected vector count")
         return vectors[0]
+
+    def _commit_active(self, index_version: str, owner_token: str) -> str:
+        try:
+            owned_commit = self._index.set_active(index_version, owner_token)
+        except Exception as activation_error:
+            return self._reconcile_active_commit(
+                index_version,
+                owner_token,
+                activation_error,
+            )
+        self._require_lock(owned_commit, index_version, "active commit")
+        return index_version
+
+    def _reconcile_active_commit(
+        self,
+        index_version: str,
+        owner_token: str,
+        activation_error: Exception,
+    ) -> str:
+        try:
+            active_version = self._index.active_version()
+            if active_version == index_version:
+                if self._index.has_version(index_version):
+                    return index_version
+                raise ActiveCommitOutcomeUnknownError(index_version)
+            still_owned = self._index.renew_initialization_lock(
+                index_version, owner_token
+            )
+        except ActiveCommitOutcomeUnknownError:
+            raise
+        except Exception as reconciliation_error:
+            raise ActiveCommitOutcomeUnknownError(index_version) from reconciliation_error
+
+        if not still_owned:
+            raise InitializationLockLostError(
+                index_version, "active-commit reconciliation"
+            ) from activation_error
+        raise activation_error
+
+    @staticmethod
+    def _require_lock(owned: bool, index_version: str, phase: str) -> None:
+        if not owned:
+            raise InitializationLockLostError(index_version, phase)

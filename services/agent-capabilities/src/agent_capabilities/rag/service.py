@@ -25,7 +25,13 @@ class IndexVersionNotFoundError(ValueError):
 @dataclass(frozen=True, slots=True)
 class IndexHit:
     chunk: KnowledgeChunk
-    score: float
+    distance: float
+
+    @property
+    def score(self) -> float:
+        if not math.isfinite(self.distance):
+            raise ValueError("index distance must be finite")
+        return max(0.0, min(1.0, 1.0 - self.distance))
 
 
 class KnowledgeIndexPort(Protocol):
@@ -66,7 +72,7 @@ class RagService:
             raise ValueError("embedding vector dimension does not match the adapter")
 
         candidates = self._index.search(request.index_version, query_vector, request.top_k)
-        ranked = sorted(candidates, key=lambda hit: (-hit.score, hit.chunk.chunk_id))
+        ranked = sorted(candidates, key=lambda hit: (hit.distance, hit.chunk.chunk_id))
         hits = [
             RagHit(
                 chunk_id=hit.chunk.chunk_id,

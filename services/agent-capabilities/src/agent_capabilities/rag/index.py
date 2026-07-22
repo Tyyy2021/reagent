@@ -5,8 +5,6 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
 from typing import Protocol, cast
 
-from redis.exceptions import ResponseError
-
 from agent_capabilities.rag.domain import EmbeddedChunk, KnowledgeChunk
 from agent_capabilities.rag.embedding import MINILM_DIMENSIONS
 from agent_capabilities.rag.initializer import IndexManifest
@@ -14,11 +12,87 @@ from agent_capabilities.rag.service import IndexHit, KnowledgeIndexPort
 
 _ACTIVE_KEY = "rag:incident:active"
 _LOCK_TTL_MILLISECONDS = 120_000
+_RENEW_LOCK_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+""".strip()
 _RELEASE_LOCK_SCRIPT = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
+""".strip()
+_CREATE_VERSION_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call(
+  'FT.CREATE', ARGV[3],
+  'ON', 'HASH',
+  'PREFIX', '1', ARGV[4],
+  'SCHEMA',
+  'chunk_id', 'TAG',
+  'document_id', 'TAG',
+  'title', 'TEXT', 'NOSTEM',
+  'section', 'TEXT', 'NOSTEM',
+  'source', 'TAG',
+  'content', 'TEXT',
+  'checksum', 'TAG',
+  'embedding_model', 'TAG',
+  'index_version', 'TAG',
+  'vector', 'VECTOR', 'HNSW', '6',
+  'TYPE', 'FLOAT32',
+  'DIM', ARGV[5],
+  'DISTANCE_METRIC', 'COSINE'
+)
+return 1
+""".strip()
+_WRITE_CHUNK_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('HSET', KEYS[2], unpack(ARGV, 3))
+return 1
+""".strip()
+_WRITE_READY_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3])
+return 1
+""".strip()
+_SET_ACTIVE_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3])
+return 1
+""".strip()
+_CLEANUP_VERSION_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+if redis.call('GET', KEYS[3]) == ARGV[4] then
+  return -1
+end
+local dropped = redis.pcall('FT.DROPINDEX', ARGV[2], 'DD')
+if type(dropped) == 'table' and dropped.err then
+  if not string.find(dropped.err, 'Unknown Index name', 1, true) then
+    return redis.error_reply(dropped.err)
+  end
+end
+local chunk_keys = redis.call('KEYS', ARGV[3])
+if #chunk_keys > 0 then
+  redis.call('DEL', unpack(chunk_keys))
+end
+redis.call('DEL', KEYS[2])
+return 1
 """.strip()
 
 
@@ -45,7 +119,9 @@ class RedisClient(Protocol):
     def get(self, name: str) -> bytes | None:
         raise NotImplementedError
 
-    def eval(self, script: str, numkeys: int, *keys_and_args: str) -> object:
+    def eval(
+        self, script: str, numkeys: int, *keys_and_args: str | bytes
+    ) -> object:
         raise NotImplementedError
 
     def scan_iter(self, *, match: str) -> Iterator[bytes]:
@@ -75,71 +151,61 @@ class RedisKnowledgeIndex(KnowledgeIndexPort):
     def lock_key(index_version: str) -> str:
         return f"rag:incident:init:{index_version}"
 
-    def create_version(self, index_version: str) -> None:
-        self._redis.execute_command(
-            "FT.CREATE",
+    def create_version(self, index_version: str, owner_token: str) -> bool:
+        result = self._redis.eval(
+            _CREATE_VERSION_SCRIPT,
+            1,
+            self.lock_key(index_version),
+            owner_token,
+            str(_LOCK_TTL_MILLISECONDS),
             self.index_name(index_version),
-            "ON",
-            "HASH",
-            "PREFIX",
-            "1",
             self.chunk_prefix(index_version),
-            "SCHEMA",
-            "chunk_id",
-            "TAG",
-            "document_id",
-            "TAG",
-            "title",
-            "TEXT",
-            "NOSTEM",
-            "section",
-            "TEXT",
-            "NOSTEM",
-            "source",
-            "TAG",
-            "content",
-            "TEXT",
-            "checksum",
-            "TAG",
-            "embedding_model",
-            "TAG",
-            "index_version",
-            "TAG",
-            "vector",
-            "VECTOR",
-            "HNSW",
-            "6",
-            "TYPE",
-            "FLOAT32",
-            "DIM",
             str(MINILM_DIMENSIONS),
-            "DISTANCE_METRIC",
-            "COSINE",
         )
+        return _integer(result) == 1
 
     def write_chunks(
-        self, index_version: str, embedded_chunks: Sequence[EmbeddedChunk]
-    ) -> None:
+        self,
+        index_version: str,
+        embedded_chunks: Sequence[EmbeddedChunk],
+        owner_token: str,
+    ) -> bool:
         for embedded in embedded_chunks:
             if embedded.index_version != index_version:
                 raise ValueError("embedded chunk index version does not match the target")
             vector = _vector_bytes(embedded.vector)
             chunk = embedded.chunk
-            self._redis.hset(
+            result = self._redis.eval(
+                _WRITE_CHUNK_SCRIPT,
+                2,
+                self.lock_key(index_version),
                 f"{self.chunk_prefix(index_version)}{chunk.chunk_id}",
-                mapping={
-                    "chunk_id": chunk.chunk_id,
-                    "document_id": chunk.document_id,
-                    "title": chunk.title,
-                    "section": chunk.section,
-                    "source": chunk.source,
-                    "content": chunk.content,
-                    "checksum": chunk.checksum,
-                    "embedding_model": embedded.embedding_model,
-                    "index_version": embedded.index_version,
-                    "vector": vector,
-                },
+                owner_token,
+                str(_LOCK_TTL_MILLISECONDS),
+                "chunk_id",
+                chunk.chunk_id,
+                "document_id",
+                chunk.document_id,
+                "title",
+                chunk.title,
+                "section",
+                chunk.section,
+                "source",
+                chunk.source,
+                "content",
+                chunk.content,
+                "checksum",
+                chunk.checksum,
+                "embedding_model",
+                embedded.embedding_model,
+                "index_version",
+                embedded.index_version,
+                "vector",
+                vector,
             )
+            if _integer(result) != 1:
+                return False
+        return True
 
     def count(self, index_version: str) -> int:
         info: object = self._redis.execute_command("FT.INFO", self.index_name(index_version))
@@ -192,19 +258,39 @@ class RedisKnowledgeIndex(KnowledgeIndexPort):
             "2",
         )
         hits = _search_hits(response)
-        return sorted(hits, key=lambda hit: (-hit.score, hit.chunk.chunk_id))[:top_k]
+        return sorted(hits, key=lambda hit: (hit.distance, hit.chunk.chunk_id))[:top_k]
 
     def has_version(self, index_version: str) -> bool:
         return bool(self._redis.exists(self.ready_key(index_version)))
 
-    def write_ready(self, index_version: str, manifest: IndexManifest) -> None:
+    def write_ready(
+        self, index_version: str, manifest: IndexManifest, owner_token: str
+    ) -> bool:
         encoded = json.dumps(
             asdict(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True
         )
-        self._redis.set(self.ready_key(index_version), encoded)
+        result = self._redis.eval(
+            _WRITE_READY_SCRIPT,
+            2,
+            self.lock_key(index_version),
+            self.ready_key(index_version),
+            owner_token,
+            str(_LOCK_TTL_MILLISECONDS),
+            encoded,
+        )
+        return _integer(result) == 1
 
-    def set_active(self, index_version: str) -> None:
-        self._redis.set(_ACTIVE_KEY, index_version)
+    def set_active(self, index_version: str, owner_token: str) -> bool:
+        result = self._redis.eval(
+            _SET_ACTIVE_SCRIPT,
+            2,
+            self.lock_key(index_version),
+            _ACTIVE_KEY,
+            owner_token,
+            str(_LOCK_TTL_MILLISECONDS),
+            index_version,
+        )
+        return _integer(result) == 1
 
     def active_version(self) -> str | None:
         value = self._redis.get(_ACTIVE_KEY)
@@ -223,6 +309,16 @@ class RedisKnowledgeIndex(KnowledgeIndexPort):
         observed = self._redis.get(self.lock_key(index_version))
         return _optional_text(observed) == owner_token
 
+    def renew_initialization_lock(self, index_version: str, owner_token: str) -> bool:
+        result = self._redis.eval(
+            _RENEW_LOCK_SCRIPT,
+            1,
+            self.lock_key(index_version),
+            owner_token,
+            str(_LOCK_TTL_MILLISECONDS),
+        )
+        return _integer(result) == 1
+
     def release_initialization_lock(self, index_version: str, owner_token: str) -> None:
         self._redis.eval(
             _RELEASE_LOCK_SCRIPT,
@@ -231,20 +327,19 @@ class RedisKnowledgeIndex(KnowledgeIndexPort):
             owner_token,
         )
 
-    def cleanup_failed_version(self, index_version: str, owner_token: str) -> None:
-        if not self.owns_initialization_lock(index_version, owner_token):
-            return
-        try:
-            self._redis.execute_command("FT.DROPINDEX", self.index_name(index_version), "DD")
-        except ResponseError as error:
-            if "Unknown Index name" not in str(error):
-                raise
-        keys: list[bytes] = list(
-            self._redis.scan_iter(match=f"{self.chunk_prefix(index_version)}*")
+    def cleanup_failed_version(self, index_version: str, owner_token: str) -> bool:
+        result = self._redis.eval(
+            _CLEANUP_VERSION_SCRIPT,
+            3,
+            self.lock_key(index_version),
+            self.ready_key(index_version),
+            _ACTIVE_KEY,
+            owner_token,
+            self.index_name(index_version),
+            f"{self.chunk_prefix(index_version)}*",
+            index_version,
         )
-        if keys:
-            self._redis.delete(*keys)
-        self._redis.delete(self.ready_key(index_version))
+        return _integer(result) == 1
 
 
 def _vector_bytes(vector: Sequence[float]) -> bytes:
@@ -266,7 +361,6 @@ def _search_hits(response: object) -> list[IndexHit]:
         distance = float(_required_text(fields, "distance"))
         if not math.isfinite(distance):
             raise ValueError("Redis cosine distance must be finite")
-        score = max(0.0, min(1.0, 1.0 - distance))
         chunk = KnowledgeChunk(
             chunk_id=_required_text(fields, "chunk_id"),
             document_id=_required_text(fields, "document_id"),
@@ -276,7 +370,7 @@ def _search_hits(response: object) -> list[IndexHit]:
             content=_required_text(fields, "content"),
             checksum=_required_text(fields, "checksum"),
         )
-        hits.append(IndexHit(chunk=chunk, score=score))
+        hits.append(IndexHit(chunk=chunk, distance=distance))
     return hits
 
 

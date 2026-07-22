@@ -75,11 +75,11 @@ class InMemoryKnowledgeIndex:
         hits = [
             IndexHit(
                 chunk=embedded.chunk,
-                score=max(
-                    0.0,
-                    min(1.0, sum(left * right for left, right in zip(query, embedded.vector))),
+                distance=1.0
+                - sum(
+                    left * right for left, right in zip(query, embedded.vector)
                 ),
             )
             for embedded in self._chunks
         ]
-        return sorted(hits, key=lambda hit: (-hit.score, hit.chunk.chunk_id))[:top_k]
+        return sorted(hits, key=lambda hit: (hit.distance, hit.chunk.chunk_id))[:top_k]
