@@ -78,6 +78,31 @@ def test_search_logs_includes_entries_at_both_window_boundaries() -> None:
     ]
 
 
+def test_search_logs_excludes_fixture_before_sub_microsecond_start() -> None:
+    result = search_logs(
+        "checkout",
+        "2026-07-19T10:03:12.1200001Z",
+        "2026-07-19T10:03:13Z",
+        "SQLTransientConnectionException",
+        50,
+    )
+
+    assert result["entries"] == []
+
+
+def test_search_logs_canonicalizes_fractional_window_without_precision_loss() -> None:
+    result = search_logs(
+        "checkout",
+        "2026-07-19T18:03:12.12000010+08:00",
+        "2026-07-19T05:05:47.4430000-05:00",
+        "SQLTransientConnectionException",
+        50,
+    )
+
+    assert result["start"] == "2026-07-19T10:03:12.1200001Z"
+    assert result["end"] == "2026-07-19T10:05:47.443Z"
+
+
 @pytest.mark.parametrize("limit", [0, 51])
 def test_search_logs_rejects_limit_outside_one_to_fifty(limit: int) -> None:
     with pytest.raises(ValueError, match="limit"):

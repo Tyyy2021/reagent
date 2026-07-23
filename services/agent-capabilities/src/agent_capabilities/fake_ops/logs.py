@@ -1,14 +1,11 @@
-from datetime import datetime, timedelta
-
 from agent_capabilities.fake_ops.metrics import (
-    DEMO_END,
-    DEMO_END_TEXT,
-    DEMO_START,
-    DEMO_START_TEXT,
-    parse_instant,
+    DEMO_END_EXACT,
+    DEMO_START_EXACT,
+    canonical_instant,
+    parse_exact_instant,
 )
 
-_MAX_WINDOW = timedelta(minutes=15)
+_MAX_WINDOW_SECONDS = 15 * 60
 _QUERY_FIELDS = {"message", "exception", "pool"}
 _REGEX_META = frozenset("*+?[]{}()|^$\\/")
 _LOGS = (
@@ -51,26 +48,28 @@ def search_logs(
     if type(limit) is not int or not 1 <= limit <= 50:
         raise ValueError("limit must be between 1 and 50")
 
-    parsed_start = parse_instant(start)
-    parsed_end = parse_instant(end)
-    if parsed_end <= parsed_start:
+    exact_start = parse_exact_instant(start)
+    exact_end = parse_exact_instant(end)
+    if exact_end <= exact_start:
         raise ValueError("log window must be ordered")
-    if parsed_end - parsed_start > _MAX_WINDOW:
+    if exact_end - exact_start > _MAX_WINDOW_SECONDS:
         raise ValueError("log window exceeds 15 minutes")
-    if parsed_start < DEMO_START or parsed_end > DEMO_END:
+    if exact_start < DEMO_START_EXACT or exact_end > DEMO_END_EXACT:
         raise ValueError("log window is outside the checkout fixture")
 
     terms = _query_terms(query)
     entries = [
         dict(entry)
         for entry in _LOGS
-        if parsed_start <= parse_instant(str(entry["timestamp"])) <= parsed_end
+        if exact_start
+        <= parse_exact_instant(str(entry["timestamp"]))
+        <= exact_end
         and all(term in str(entry["line"]).lower() for term in terms)
     ][:limit]
     return {
         "service": "checkout",
-        "start": _canonical_window_endpoint(parsed_start),
-        "end": _canonical_window_endpoint(parsed_end),
+        "start": canonical_instant(exact_start),
+        "end": canonical_instant(exact_end),
         "query": query,
         "entries": entries,
     }
@@ -92,11 +91,3 @@ def _query_terms(query: str) -> tuple[str, ...]:
         else:
             terms.append(token.lower())
     return tuple(terms)
-
-
-def _canonical_window_endpoint(value: datetime) -> str:
-    if value == DEMO_START:
-        return DEMO_START_TEXT
-    if value == DEMO_END:
-        return DEMO_END_TEXT
-    return value.isoformat(timespec="seconds").replace("+00:00", "Z")

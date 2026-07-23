@@ -69,6 +69,47 @@ def test_query_metrics_accepts_fractional_seconds_and_numeric_offsets() -> None:
     assert result["end"] == END
 
 
+def test_query_metrics_accepts_long_zero_fraction_at_exact_boundary() -> None:
+    result = query_metrics(
+        "checkout",
+        "2026-07-19T10:00:00.0000000Z",
+        "2026-07-19T10:15:00.0000000Z",
+    )
+
+    assert result["start"] == START
+    assert result["end"] == END
+
+
+def test_query_metrics_compares_seventh_digit_exactly_with_offset_equivalence() -> None:
+    seventh_digit_accepted = False
+    try:
+        query_metrics(
+            "checkout",
+            "2026-07-19T10:00:00.0000001Z",
+            END,
+        )
+    except ValueError:
+        pass
+    else:
+        seventh_digit_accepted = True
+
+    exact_zero_offset = query_metrics(
+        "checkout",
+        "2026-07-19T18:00:00.0000000+08:00",
+        "2026-07-19T05:15:00.0000000-05:00",
+    )
+
+    assert {
+        "seventhDigitAccepted": seventh_digit_accepted,
+        "start": exact_zero_offset["start"],
+        "end": exact_zero_offset["end"],
+    } == {
+        "seventhDigitAccepted": False,
+        "start": START,
+        "end": END,
+    }
+
+
 @pytest.mark.parametrize(
     ("service", "start", "end"),
     [
