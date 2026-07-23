@@ -22,6 +22,10 @@ class DisabledTicketFaultGate:
         return "disabled"
 
 
+class GateConflict(RuntimeError):
+    """A different key cannot replace an active fault-gate latch."""
+
+
 class LatchTicketFaultGate:
     def __init__(self) -> None:
         self._lock = anyio.Lock()
@@ -33,6 +37,10 @@ class LatchTicketFaultGate:
 
     async def arm(self, idempotency_key: str) -> None:
         async with self._lock:
+            if self._armed_key == idempotency_key:
+                return
+            if self._armed_key is not None:
+                raise GateConflict("fault gate is already armed for another key")
             self._armed_key = idempotency_key
             self._blocked = False
             self._blocked_event = anyio.Event()
@@ -73,6 +81,10 @@ class LatchTicketFaultGate:
             if release_event is None:
                 return False
             release_event.set()
+            self._armed_key = None
+            self._blocked = False
+            self._blocked_event = None
+            self._release_event = None
             self._acceptance_state = "released"
             return True
 
@@ -107,7 +119,10 @@ def chaos_routes(
         key = values.get("idempotencyKey")
         if not isinstance(key, str) or not 1 <= len(key) <= 255:
             return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400)
-        await gate.arm(key)
+        try:
+            await gate.arm(key)
+        except GateConflict:
+            return JSONResponse({"code": "GATE_CONFLICT"}, status_code=409)
         return JSONResponse(await gate.state())
 
     async def status(_: Request) -> JSONResponse:

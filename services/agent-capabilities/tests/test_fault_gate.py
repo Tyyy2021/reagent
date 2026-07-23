@@ -5,6 +5,7 @@ from functools import partial
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
 from anyio.to_thread import run_sync as run_sync_in_worker
 from sqlalchemy import create_engine, text
@@ -63,6 +64,118 @@ def test_enabled_chaos_routes_arm_report_and_release_without_echoing_key() -> No
     assert status.json() == {"armed": True, "blocked": False}
     assert released.json() == {"released": True}
     assert "sensitive-tool-call" not in (armed.text + status.text + released.text)
+
+
+def test_same_key_rearm_while_blocked_preserves_original_waiter() -> None:
+    async def exercise() -> None:
+        gate = LatchTicketFaultGate()
+        completed = anyio.Event()
+        await gate.arm("same-key")
+
+        async def wait_after_commit() -> None:
+            await gate.after_commit("same-key")
+            completed.set()
+
+        with anyio.fail_after(1):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(wait_after_commit)
+                await gate.wait_until_blocked()
+                await gate.arm("same-key")
+                assert await gate.release() is True
+                await completed.wait()
+
+        assert await gate.state() == {"armed": False, "blocked": False}
+        assert await gate.acceptance_state() == "released"
+
+    anyio.run(exercise)
+
+
+def test_different_key_rearm_returns_conflict_and_preserves_waiter() -> None:
+    async def exercise() -> None:
+        first_key = "first-sensitive-key"
+        second_key = "second-sensitive-key"
+        gate = LatchTicketFaultGate()
+        app = Starlette(routes=chaos_routes(gate, enabled=True))
+        completed = anyio.Event()
+
+        async def wait_after_commit() -> None:
+            await gate.after_commit(first_key)
+            completed.set()
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            conflict: httpx.Response | None = None
+            status: httpx.Response | None = None
+            released: httpx.Response | None = None
+            armed = await client.post(
+                "/internal/chaos/ticket-after-commit/arm",
+                json={"idempotencyKey": first_key},
+            )
+            assert armed.status_code == 200
+            with anyio.fail_after(1):
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(wait_after_commit)
+                    await gate.wait_until_blocked()
+                    conflict = await client.post(
+                        "/internal/chaos/ticket-after-commit/arm",
+                        json={"idempotencyKey": second_key},
+                    )
+                    status = await client.get(
+                        "/internal/chaos/ticket-after-commit/status"
+                    )
+                    released = await client.post(
+                        "/internal/chaos/ticket-after-commit/release"
+                    )
+                    await completed.wait()
+
+        assert conflict is not None
+        assert status is not None
+        assert released is not None
+        assert conflict.status_code == 409
+        assert conflict.json() == {"code": "GATE_CONFLICT"}
+        assert status.json() == {"armed": True, "blocked": True}
+        assert released.json() == {"released": True}
+        all_responses = armed.text + conflict.text + status.text + released.text
+        assert first_key not in all_responses
+        assert second_key not in all_responses
+
+    anyio.run(exercise)
+
+
+def test_release_before_arrival_disarms_without_later_blocked_state() -> None:
+    async def exercise() -> None:
+        gate = LatchTicketFaultGate()
+        await gate.arm("released-before-arrival")
+
+        released = await gate.release()
+        state_after_release = await gate.state()
+        acceptance_after_release = await gate.acceptance_state()
+        with anyio.fail_after(1):
+            await gate.after_commit("released-before-arrival")
+        final_state = await gate.state()
+        final_acceptance = await gate.acceptance_state()
+        second_release = await gate.release()
+
+        assert {
+            "released": released,
+            "stateAfterRelease": state_after_release,
+            "acceptanceAfterRelease": acceptance_after_release,
+            "finalState": final_state,
+            "finalAcceptance": final_acceptance,
+            "secondRelease": second_release,
+        } == {
+            "released": True,
+            "stateAfterRelease": {"armed": False, "blocked": False},
+            "acceptanceAfterRelease": "released",
+            "finalState": {"armed": False, "blocked": False},
+            "finalAcceptance": "released",
+            "secondRelease": False,
+        }
+
+    anyio.run(exercise)
 
 
 @pytest.mark.parametrize("idempotency_key", ["", "k" * 256, 42])

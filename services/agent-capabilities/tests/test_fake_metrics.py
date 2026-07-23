@@ -35,6 +35,40 @@ def test_query_metrics_accepts_equivalent_timezone_aware_instants() -> None:
     assert result["end"] == END
 
 
+def test_query_metrics_rejects_non_rfc3339_timestamp_grammar() -> None:
+    invalid_starts = [
+        "2026-07-19T10:00:00",
+        "2026-07-19 10:00:00+00:00",
+        "20260719T100000Z",
+        "2026-07-19T10:00:00+0000",
+        "2026-07-19T10:00:00+00",
+        "2026-07-19T10:00:00Ztrailing",
+        "2026-02-30T10:00:00Z",
+        "2026-07-19T10:00:00+24:00",
+    ]
+    accepted: list[str] = []
+
+    for start in invalid_starts:
+        try:
+            query_metrics("checkout", start, END)
+        except ValueError:
+            continue
+        accepted.append(start)
+
+    assert accepted == []
+
+
+def test_query_metrics_accepts_fractional_seconds_and_numeric_offsets() -> None:
+    result = query_metrics(
+        "checkout",
+        "2026-07-19T18:00:00.000000+08:00",
+        "2026-07-19T05:15:00.0-05:00",
+    )
+
+    assert result["start"] == START
+    assert result["end"] == END
+
+
 @pytest.mark.parametrize(
     ("service", "start", "end"),
     [

@@ -64,7 +64,8 @@ def search_logs(
     entries = [
         dict(entry)
         for entry in _LOGS
-        if all(term in str(entry["line"]).lower() for term in terms)
+        if parsed_start <= parse_instant(str(entry["timestamp"])) <= parsed_end
+        and all(term in str(entry["line"]).lower() for term in terms)
     ][:limit]
     return {
         "service": "checkout",

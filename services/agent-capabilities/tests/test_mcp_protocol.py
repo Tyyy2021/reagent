@@ -17,6 +17,7 @@ from testcontainers.mysql import MySqlContainer  # pyright: ignore[reportMissing
 
 from agent_capabilities.app import create_app
 from agent_capabilities.config import Settings
+from agent_capabilities.fake_ops.acceptance import AcceptanceTracker
 from agent_capabilities.fake_ops.tickets import TicketService
 
 pytestmark = pytest.mark.integration
@@ -125,6 +126,104 @@ def test_streamable_http_initialize_list_and_call_exact_tools(mysql_url: str) ->
             assert all(isinstance(value, bool) for value in deduplicated)
             assert sorted(cast(list[int], attempt_counts)) == [1, 2]
             assert sorted(cast(list[bool], deduplicated)) == [False, True]
+
+    anyio.run(exercise)
+
+
+def test_unknown_arguments_are_rejected_without_side_effects(mysql_url: str) -> None:
+    async def exercise() -> None:
+        configured = Settings.model_validate(
+            {
+                "env": "test",
+                "mysql_url": mysql_url,
+                "acceptance_enabled": False,
+                "chaos_enabled": False,
+                "knowledge_root": Path("/unused"),
+            }
+        )
+        tracker = AcceptanceTracker()
+        ticket_service = TicketService.from_url(mysql_url)
+        app = create_app(
+            configured,
+            ticket_service_factory=lambda: ticket_service,
+            acceptance_tracker=tracker,
+        )
+
+        async with _serve(app) as server_url:
+            async with streamable_http_client(server_url) as streams:
+                read_stream, write_stream, _ = streams
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    schemas = {
+                        tool.name: tool.inputSchema for tool in listed.tools
+                    }
+                    metrics = await session.call_tool(
+                        "query_metrics",
+                        {
+                            "service": "checkout",
+                            "start": START,
+                            "end": END,
+                            "unexpected": "must-fail",
+                        },
+                    )
+                    logs = await session.call_tool(
+                        "search_logs",
+                        {
+                            "service": "checkout",
+                            "start": START,
+                            "end": END,
+                            "query": "SQLTransientConnectionException",
+                            "limit": 1,
+                            "unexpected": "must-fail",
+                        },
+                    )
+                    ticket = await session.call_tool(
+                        "create_ticket",
+                        {
+                            "idempotency_key": "unknown-extra-tool-call",
+                            "title": "Must not be created",
+                            "severity": "critical",
+                            "evidence": "unknown argument must reject this call",
+                            "unexpected": "must-fail",
+                        },
+                    )
+
+            tracker_attempts = await tracker.snapshot()
+            ticket_snapshot = ticket_service.acceptance_snapshot(
+                "unknown-extra-tool-call"
+            )
+
+        assert {
+            "additionalProperties": {
+                name: schema.get("additionalProperties")
+                for name, schema in schemas.items()
+            },
+            "isError": {
+                "query_metrics": metrics.isError,
+                "search_logs": logs.isError,
+                "create_ticket": ticket.isError,
+            },
+            "trackerAttempts": tracker_attempts,
+            "ticketAttempts": ticket_snapshot.attempt_count,
+            "uniqueTickets": ticket_snapshot.unique_count,
+            "ticketIds": ticket_snapshot.ticket_ids,
+        } == {
+            "additionalProperties": {
+                "query_metrics": False,
+                "search_logs": False,
+                "create_ticket": False,
+            },
+            "isError": {
+                "query_metrics": True,
+                "search_logs": True,
+                "create_ticket": True,
+            },
+            "trackerAttempts": {"query_metrics": 0, "search_logs": 0},
+            "ticketAttempts": 0,
+            "uniqueTickets": 0,
+            "ticketIds": (),
+        }
 
     anyio.run(exercise)
 

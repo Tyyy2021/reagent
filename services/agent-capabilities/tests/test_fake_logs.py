@@ -47,6 +47,37 @@ def test_search_logs_applies_limit_without_returning_unbounded_data() -> None:
     assert len(result["entries"]) == 1  # type: ignore[arg-type]
 
 
+def test_search_logs_filters_entries_to_requested_sub_window() -> None:
+    result = search_logs(
+        "checkout",
+        "2026-07-19T10:05:00Z",
+        "2026-07-19T10:06:00Z",
+        "SQLTransientConnectionException",
+        50,
+    )
+
+    entries = cast(list[dict[str, object]], result["entries"])
+    assert [entry["timestamp"] for entry in entries] == [
+        "2026-07-19T10:05:47.443Z"
+    ]
+
+
+def test_search_logs_includes_entries_at_both_window_boundaries() -> None:
+    result = search_logs(
+        "checkout",
+        "2026-07-19T10:03:12.120Z",
+        "2026-07-19T10:05:47.443Z",
+        "SQLTransientConnectionException",
+        50,
+    )
+
+    entries = cast(list[dict[str, object]], result["entries"])
+    assert [entry["timestamp"] for entry in entries] == [
+        "2026-07-19T10:03:12.120Z",
+        "2026-07-19T10:05:47.443Z",
+    ]
+
+
 @pytest.mark.parametrize("limit", [0, 51])
 def test_search_logs_rejects_limit_outside_one_to_fifty(limit: int) -> None:
     with pytest.raises(ValueError, match="limit"):
