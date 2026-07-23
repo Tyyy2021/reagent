@@ -1,0 +1,85 @@
+from typing import cast
+
+import pytest
+
+from agent_capabilities.fake_ops.logs import search_logs
+
+START = "2026-07-19T10:00:00Z"
+END = "2026-07-19T10:15:00Z"
+
+
+def test_search_logs_returns_timestamped_bounded_connection_timeout_lines() -> None:
+    result = search_logs(
+        "checkout",
+        START,
+        END,
+        "exception:SQLTransientConnectionException pool:HikariPool-checkout",
+        3,
+    )
+
+    assert result["service"] == "checkout"
+    assert result["start"] == START
+    assert result["end"] == END
+    assert result["query"] == (
+        "exception:SQLTransientConnectionException pool:HikariPool-checkout"
+    )
+    entries = cast(list[dict[str, object]], result["entries"])
+    assert 1 <= len(entries) <= 3
+    for entry in entries:
+        assert set(entry) == {"timestamp", "line"}
+        assert str(entry["timestamp"]).endswith("Z")
+        line = str(entry["line"])
+        assert len(line) <= 500
+        assert "SQLTransientConnectionException" in line
+        assert "Connection is not available, request timed out after 30000ms" in line
+        assert "HikariPool-checkout" in line
+
+
+def test_search_logs_applies_limit_without_returning_unbounded_data() -> None:
+    result = search_logs(
+        "checkout",
+        START,
+        END,
+        "SQLTransientConnectionException",
+        1,
+    )
+
+    assert len(result["entries"]) == 1  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [0, 51])
+def test_search_logs_rejects_limit_outside_one_to_fifty(limit: int) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        search_logs("checkout", START, END, "timeout", limit)
+
+
+@pytest.mark.parametrize(
+    ("service", "start", "end"),
+    [
+        ("payments", START, END),
+        ("checkout", END, START),
+        ("checkout", START, "2026-07-19T10:16:00Z"),
+        ("checkout", "2026-07-19T10:00:00", END),
+    ],
+)
+def test_search_logs_rejects_unknown_service_reversed_or_oversized_window(
+    service: str, start: str, end: str
+) -> None:
+    with pytest.raises(ValueError):
+        search_logs(service, start, end, "timeout", 10)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "message:timeout.*",
+        "/SQLTransient.*/",
+        "host:checkout-1",
+        "unknown:value",
+        "x" * 129,
+    ],
+)
+def test_search_logs_rejects_unbounded_syntax_and_unknown_fields(query: str) -> None:
+    with pytest.raises(ValueError, match="query"):
+        search_logs("checkout", START, END, query, 10)

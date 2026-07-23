@@ -8,9 +8,18 @@ from anyio.to_thread import run_sync as run_sync_in_worker
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 from agent_capabilities.config import Settings
+from agent_capabilities.database import run_migrations
+from agent_capabilities.fake_ops.acceptance import AcceptanceTracker, acceptance_routes
+from agent_capabilities.fake_ops.faults import (
+    DisabledTicketFaultGate,
+    LatchTicketFaultGate,
+    chaos_routes,
+)
+from agent_capabilities.fake_ops.mcp_server import FakeOpsRuntimeState, create_mcp
+from agent_capabilities.fake_ops.tickets import TicketService
 from agent_capabilities.rag.api import RagRuntime, RagRuntimeState, rag_routes
 from agent_capabilities.rag.embedding import MINILM_MODEL_ID, MiniLmEmbedding
 from agent_capabilities.rag.index import RedisClient, RedisKnowledgeIndex
@@ -33,6 +42,9 @@ def create_app(
     settings: Settings | None = None,
     *,
     runtime_factory: Callable[[], RagRuntime] | None = None,
+    ticket_service_factory: Callable[[], TicketService] | None = None,
+    migration_runner: Callable[[str], None] = run_migrations,
+    acceptance_tracker: AcceptanceTracker | None = None,
 ) -> Starlette:
     resolved = settings or Settings()
     readiness_state = [CapabilityReadiness.initial()]
@@ -40,11 +52,31 @@ def create_app(
     selected_factory = runtime_factory
     if selected_factory is None and resolved.env != "test":
         selected_factory = partial(_production_runtime, resolved)
+    selected_ticket_factory = ticket_service_factory
+    if selected_ticket_factory is None and resolved.env != "test":
+        selected_ticket_factory = partial(TicketService.from_url, resolved.mysql_url)
+
+    latch_gate = LatchTicketFaultGate()
+    fault_gate = (
+        latch_gate if resolved.chaos_enabled else DisabledTicketFaultGate()
+    )
+    fake_ops_state = FakeOpsRuntimeState()
+    tracker = acceptance_tracker or AcceptanceTracker()
+    mcp = create_mcp(fake_ops_state, fault_gate, tracker)
+    mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncGenerator[None, None]:
         runtime: RagRuntime | None = None
+        ticket_service: TicketService | None = None
         try:
+            ticket_factory = selected_ticket_factory
+            if ticket_factory is not None:
+                await run_sync_in_worker(migration_runner, resolved.mysql_url)
+                ticket_service = await run_sync_in_worker(ticket_factory)
+                fake_ops_state.ticket_service = ticket_service
+                readiness_state[0] = readiness_state[0].with_fake_ops_ready()
+
             factory = selected_factory
             if factory is not None:
                 runtime = await run_sync_in_worker(factory)
@@ -54,9 +86,13 @@ def create_app(
                     raise RuntimeError("initialized RAG version is not active")
                 rag_state.runtime = runtime
                 readiness_state[0] = readiness_state[0].with_rag_ready()
-            yield
+            async with mcp.session_manager.run():
+                yield
         finally:
+            fake_ops_state.ticket_service = None
             rag_state.runtime = None
+            if ticket_service is not None:
+                await run_sync_in_worker(ticket_service.close)
             if runtime is not None:
                 await run_sync_in_worker(runtime.close)
 
@@ -66,7 +102,15 @@ def create_app(
     return Starlette(
         routes=[
             Route("/internal/readiness", readiness, methods=["GET"]),
+            *acceptance_routes(
+                fake_ops_state.require_ticket_service,
+                tracker,
+                fault_gate,
+                enabled=resolved.acceptance_enabled,
+            ),
             *rag_routes(rag_state, max_bytes=resolved.rag_request_max_bytes),
+            *chaos_routes(latch_gate, enabled=resolved.chaos_enabled),
+            Mount("/mcp", app=mcp_app),
         ],
         lifespan=lifespan,
     )

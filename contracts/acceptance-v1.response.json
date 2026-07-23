@@ -1,0 +1,15 @@
+{
+  "contractVersion": 1,
+  "scope": "idempotency-key",
+  "toolAttempts": {
+    "query_metrics": 0,
+    "search_logs": 0,
+    "create_ticket": 2
+  },
+  "createTicketAttempts": 2,
+  "uniqueTicketCount": 1,
+  "ticketIds": [
+    "OPS-0123456789AB"
+  ],
+  "faultGateState": "released"
+}
