@@ -80,6 +80,21 @@ def test_query_metrics_accepts_long_zero_fraction_at_exact_boundary() -> None:
     assert result["end"] == END
 
 
+def test_query_metrics_accepts_five_thousand_zero_fraction_at_exact_boundary() -> (
+    None
+):
+    zeros = "0" * 5000
+
+    result = query_metrics(
+        "checkout",
+        f"2026-07-19T10:00:00.{zeros}Z",
+        f"2026-07-19T10:15:00.{zeros}Z",
+    )
+
+    assert result["start"] == START
+    assert result["end"] == END
+
+
 def test_query_metrics_compares_seventh_digit_exactly_with_offset_equivalence() -> None:
     seventh_digit_accepted = False
     try:

@@ -1,19 +1,59 @@
 import calendar
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from fractions import Fraction
+from functools import total_ordering
 
 DEMO_START = datetime(2026, 7, 19, 10, 0, tzinfo=UTC)
 DEMO_END = datetime(2026, 7, 19, 10, 15, tzinfo=UTC)
 DEMO_START_TEXT = "2026-07-19T10:00:00Z"
 DEMO_END_TEXT = "2026-07-19T10:15:00Z"
-DEMO_START_EXACT = Fraction(calendar.timegm(DEMO_START.utctimetuple()))
-DEMO_END_EXACT = Fraction(calendar.timegm(DEMO_END.utctimetuple()))
 _RFC3339_INSTANT = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
     re.ASCII,
 )
+
+
+@total_ordering
+@dataclass(frozen=True, slots=True)
+class ExactInstant:
+    whole_seconds: int
+    fractional_digits: str
+
+    def __post_init__(self) -> None:
+        if self.fractional_digits.endswith("0") or any(
+            digit not in "0123456789" for digit in self.fractional_digits
+        ):
+            raise ValueError("fractional digits must be normalized ASCII decimal")
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, ExactInstant):
+            return NotImplemented
+        if self.whole_seconds != other.whole_seconds:
+            return self.whole_seconds < other.whole_seconds
+
+        digit_count = max(
+            len(self.fractional_digits), len(other.fractional_digits)
+        )
+        for index in range(digit_count):
+            left_digit = (
+                self.fractional_digits[index]
+                if index < len(self.fractional_digits)
+                else "0"
+            )
+            right_digit = (
+                other.fractional_digits[index]
+                if index < len(other.fractional_digits)
+                else "0"
+            )
+            if left_digit != right_digit:
+                return left_digit < right_digit
+        return False
+
+
+DEMO_START_EXACT = ExactInstant(calendar.timegm(DEMO_START.utctimetuple()), "")
+DEMO_END_EXACT = ExactInstant(calendar.timegm(DEMO_END.utctimetuple()), "")
 
 
 def query_metrics(service: str, start: str, end: str) -> dict[str, object]:
@@ -54,39 +94,24 @@ def parse_instant(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def parse_exact_instant(value: str) -> Fraction:
+def parse_exact_instant(value: str) -> ExactInstant:
     parsed = parse_instant(value)
     whole_seconds = calendar.timegm(parsed.replace(microsecond=0).utctimetuple())
     if value[19] != ".":
-        return Fraction(whole_seconds)
+        return ExactInstant(whole_seconds, "")
     fraction_end = len(value) - (1 if value.endswith("Z") else 6)
-    digits = value[20:fraction_end]
-    return Fraction(whole_seconds) + Fraction(int(digits), 10 ** len(digits))
+    digits = value[20:fraction_end].rstrip("0")
+    return ExactInstant(whole_seconds, digits)
 
 
-def canonical_instant(value: Fraction) -> str:
-    whole_seconds = value.numerator // value.denominator
-    fraction = value - whole_seconds
-    utc = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=whole_seconds)
+def canonical_instant(value: ExactInstant) -> str:
+    utc = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+        seconds=value.whole_seconds
+    )
     base = (
         f"{utc.year:04d}-{utc.month:02d}-{utc.day:02d}"
         f"T{utc.hour:02d}:{utc.minute:02d}:{utc.second:02d}"
     )
-    if fraction == 0:
+    if not value.fractional_digits:
         return f"{base}Z"
-
-    denominator = fraction.denominator
-    terminating_denominator = denominator
-    while terminating_denominator % 2 == 0:
-        terminating_denominator //= 2
-    while terminating_denominator % 5 == 0:
-        terminating_denominator //= 5
-    if terminating_denominator != 1:
-        raise ValueError("instant fraction is not a terminating decimal")
-
-    remainder = fraction.numerator
-    digits: list[str] = []
-    while remainder:
-        digit, remainder = divmod(remainder * 10, denominator)
-        digits.append(str(digit))
-    return f"{base}.{''.join(digits)}Z"
+    return f"{base}.{value.fractional_digits}Z"

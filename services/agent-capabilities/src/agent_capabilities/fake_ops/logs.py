@@ -1,6 +1,7 @@
 from agent_capabilities.fake_ops.metrics import (
     DEMO_END_EXACT,
     DEMO_START_EXACT,
+    ExactInstant,
     canonical_instant,
     parse_exact_instant,
 )
@@ -52,7 +53,7 @@ def search_logs(
     exact_end = parse_exact_instant(end)
     if exact_end <= exact_start:
         raise ValueError("log window must be ordered")
-    if exact_end - exact_start > _MAX_WINDOW_SECONDS:
+    if _window_exceeds_limit(exact_start, exact_end):
         raise ValueError("log window exceeds 15 minutes")
     if exact_start < DEMO_START_EXACT or exact_end > DEMO_END_EXACT:
         raise ValueError("log window is outside the checkout fixture")
@@ -73,6 +74,14 @@ def search_logs(
         "query": query,
         "entries": entries,
     }
+
+
+def _window_exceeds_limit(start: ExactInstant, end: ExactInstant) -> bool:
+    exact_limit = ExactInstant(
+        start.whole_seconds + _MAX_WINDOW_SECONDS,
+        start.fractional_digits,
+    )
+    return end > exact_limit
 
 
 def _query_terms(query: str) -> tuple[str, ...]:

@@ -90,6 +90,22 @@ def test_search_logs_excludes_fixture_before_sub_microsecond_start() -> None:
     assert result["entries"] == []
 
 
+def test_search_logs_preserves_arbitrary_nonzero_fraction_exactly() -> None:
+    fractional_digits = "120" + ("0" * 4996) + "1"
+    start = f"2026-07-19T10:03:12.{fractional_digits}Z"
+
+    result = search_logs(
+        "checkout",
+        start,
+        "2026-07-19T10:03:13Z",
+        "SQLTransientConnectionException",
+        50,
+    )
+
+    assert result["entries"] == []
+    assert result["start"] == start
+
+
 def test_search_logs_canonicalizes_fractional_window_without_precision_loss() -> None:
     result = search_logs(
         "checkout",
