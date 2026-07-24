@@ -11,7 +11,10 @@
 ## Global Constraints
 
 - Work only in `/root/reagent/.worktrees/reagent-rag-mcp` on `feature/reagent-rag-mcp-interview`.
-- Start implementation from exact clean commit `68e41dded1a8c80b8a2d5cb38d7fa38cd16865cb`.
+- The exact product/test baseline is
+  `68e41dded1a8c80b8a2d5cb38d7fa38cd16865cb`; the controller must freeze and
+  name the later clean plan-only dispatch HEAD, and the intervening diff may
+  contain only this plan and its approved design document.
 - Do not amend, reset, rebase, clean, push, merge, or start Task 10.
 - `ToolCall.id` must match `^[A-Za-z0-9_-]{1,255}$`; `ToolCall.name` must match `^[A-Za-z0-9_-]{1,64}$`.
 - Invalid identity must fail before assistant persistence, ledger creation, `markInProgress`, or tool execution, and the thrown message must not echo the rejected value.
@@ -68,18 +71,20 @@ Run:
 
 ```bash
 git status --short --branch
-git rev-parse HEAD
-git log -3 --oneline
+git merge-base --is-ancestor \
+  68e41dded1a8c80b8a2d5cb38d7fa38cd16865cb HEAD
+git diff --name-only \
+  68e41dded1a8c80b8a2d5cb38d7fa38cd16865cb..HEAD
+git log -4 --oneline
 ```
 
 Expected:
 
 ```text
 ## feature/reagent-rag-mcp-interview
-68e41dded1a8c80b8a2d5cb38d7fa38cd16865cb
-68e41dd docs: specify Task 9 final review fixes
-00d9705 fix: close Task 9 review gaps
-e0a0c95 feat: add official Java MCP gateway and adapters
+merge-base command exits 0
+the name-only diff contains exactly the approved design and this plan
+recent history contains both plan/design subjects followed by 00d9705
 ```
 
 Read completely before editing:
@@ -796,7 +801,7 @@ Run:
 
 ```bash
 ./mvnw -B dependency:tree -Dincludes=io.modelcontextprotocol.sdk
-git diff --check 68e41dded1a8c80b8a2d5cb38d7fa38cd16865cb..HEAD
+git diff --check
 git status --short
 docker ps
 ```
@@ -855,8 +860,8 @@ git diff --check \
   19c7ae4c8907f8ac16d0e7b1e23f45c6655f01cd..HEAD
 ```
 
-Expected: a new implementation commit after `68e41dd`, empty index, clean
-worktree, and clean full Task 9 range.
+Expected: a new implementation commit after the controller-frozen plan-only
+dispatch HEAD, empty index, clean worktree, and clean full Task 9 range.
 
 - [ ] **Step 17: Freeze and hand off the final full-range review**
 
