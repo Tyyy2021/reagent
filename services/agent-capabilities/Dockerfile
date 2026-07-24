@@ -7,6 +7,8 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PATH="/app/.venv/bin:$PATH"
 RUN groupadd --system app && useradd --system --gid app --home-dir /app app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY src ./src
 RUN uv sync --locked --no-dev && chown -R app:app /app
 USER app
