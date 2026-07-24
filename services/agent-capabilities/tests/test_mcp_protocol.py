@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 
 import anyio
+import httpx
 import pytest
 import uvicorn
 from anyio.abc import TaskGroup
@@ -24,6 +25,58 @@ pytestmark = pytest.mark.integration
 
 START = "2026-07-19T10:00:00Z"
 END = "2026-07-19T10:15:00Z"
+
+
+def test_exact_mcp_initialize_does_not_redirect() -> None:
+    async def exercise() -> None:
+        configured = Settings.model_validate(
+            {
+                "env": "test",
+                "acceptance_enabled": False,
+                "chaos_enabled": False,
+                "knowledge_root": Path("/unused"),
+            }
+        )
+        app = create_app(configured)
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "route-regression", "version": "1.0.0"},
+            },
+        }
+
+        async with _serve(app) as server_url:
+            async with httpx.AsyncClient(follow_redirects=False) as client:
+                response = await client.post(
+                    server_url,
+                    headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": "2025-06-18",
+                    },
+                    json=payload,
+                )
+                nested_response = await client.post(
+                    f"{server_url}/mcp",
+                    headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": "2025-06-18",
+                    },
+                    json=payload,
+                )
+
+        assert response.status_code < 300
+        assert response.headers.get("location") is None
+        assert response.content
+        assert response.json()["result"]["protocolVersion"] == "2025-06-18"
+        assert nested_response.status_code >= 400
+
+    anyio.run(exercise)
 
 
 @pytest.fixture(scope="module")

@@ -110,7 +110,7 @@ def create_app(
             ),
             *rag_routes(rag_state, max_bytes=resolved.rag_request_max_bytes),
             *chaos_routes(latch_gate, enabled=resolved.chaos_enabled),
-            Mount("/mcp", app=mcp_app),
+            Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,
     )
