@@ -4,26 +4,33 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.ToolCallStatus;
+import com.reagent.llm.LlmClient;
+import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.profile.AgentProfileDefinition;
 import com.reagent.profile.SchemaHasher;
 import com.reagent.profile.TaskProfileSnapshot;
 import com.reagent.profile.TaskToolCatalog;
 import com.reagent.profile.ToolCatalogResolver;
 import com.reagent.sandbox.RunJournal;
+import com.reagent.sandbox.WorkspaceStore;
 import com.reagent.stream.StreamTransport;
 import com.reagent.stream.TaskEvent;
 import com.reagent.tool.IdempotencyClass;
 import com.reagent.tool.Tool;
 import com.reagent.tool.ToolContext;
 import com.reagent.tool.ToolExecutor;
+import com.reagent.tool.ToolExecutionOutcome;
 import com.reagent.tool.ToolProperties;
 import com.reagent.tool.ToolRegistry;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.InOrder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -54,7 +62,7 @@ class ToolBatchCoordinatorTest {
         Fixture fixture = fixture(workspace);
         when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.PENDING);
         when(fixture.executor.executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext)))
-                .thenReturn(Map.of(call.id(), "pending-result"));
+                .thenReturn(Map.of(call.id(), ToolExecutionOutcome.definitive("pending-result")));
 
         BatchDisposition disposition = fixture.coordinator.process(
                 TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
@@ -63,7 +71,7 @@ class ToolBatchCoordinatorTest {
         InOrder durableOrder = inOrder(fixture.stateStore, fixture.transport, fixture.executor);
         durableOrder.verify(fixture.stateStore).markInProgress(TOKEN, call);
         durableOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
-                "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                "id", call.id(), "name", call.name()));
         durableOrder.verify(fixture.executor)
                 .executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext));
         durableOrder.verify(fixture.stateStore).recordToolResult(TOKEN, call, "pending-result");
@@ -84,7 +92,9 @@ class ToolBatchCoordinatorTest {
         when(fixture.stateStore.statusOf(TOKEN, readCall.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
         when(fixture.stateStore.statusOf(TOKEN, writeCall.id())).thenReturn(ToolCallStatus.IN_PROGRESS);
         when(fixture.executor.executeConcurrently(same(catalog), eq(calls), same(fixture.toolContext)))
-                .thenReturn(Map.of(readCall.id(), "read-result", writeCall.id(), "write-result"));
+                .thenReturn(Map.of(
+                        readCall.id(), ToolExecutionOutcome.definitive("read-result"),
+                        writeCall.id(), ToolExecutionOutcome.definitive("write-result")));
 
         fixture.coordinator.process(TOKEN, fixture.toolContext, fixture.context, catalog, calls);
 
@@ -95,9 +105,9 @@ class ToolBatchCoordinatorTest {
         verify(fixture.stateStore).recordToolResult(TOKEN, writeCall, "write-result");
         InOrder eventOrder = inOrder(fixture.transport);
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
-                "id", readCall.id(), "name", readCall.name(), "arguments", readCall.arguments()));
+                "id", readCall.id(), "name", readCall.name()));
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
-                "id", writeCall.id(), "name", writeCall.name(), "arguments", writeCall.arguments()));
+                "id", writeCall.id(), "name", writeCall.name()));
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
                 "id", readCall.id(), "name", readCall.name(), "result", "read-result"));
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
@@ -119,7 +129,7 @@ class ToolBatchCoordinatorTest {
         verify(fixture.stateStore).markInDoubt(eq(TOKEN), eq(call), any(String.class));
         InOrder eventOrder = inOrder(fixture.transport);
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
-                "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                "id", call.id(), "name", call.name()));
         eventOrder.verify(fixture.transport).publish(eq(TOKEN), eq(TaskEvent.Type.TOOL_RESULT), any());
         Map<String, Object> toolMessage = fixture.context.messages().getLast();
         assertEquals(call.id(), toolMessage.get("tool_call_id"));
@@ -143,7 +153,7 @@ class ToolBatchCoordinatorTest {
         verify(fixture.stateStore).recordToolResult(eq(TOKEN), eq(call), any(String.class));
         InOrder eventOrder = inOrder(fixture.transport);
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
-                "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                "id", call.id(), "name", call.name()));
         eventOrder.verify(fixture.transport).publish(eq(TOKEN), eq(TaskEvent.Type.TOOL_RESULT), any());
         String result = String.valueOf(fixture.context.messages().getLast().get("content"));
         assertTrue(result.contains("退出码 17"));
@@ -161,9 +171,11 @@ class ToolBatchCoordinatorTest {
         Fixture fixture = fixture(workspace);
         when(fixture.stateStore.statusOf(TOKEN, firstCall.id())).thenReturn(ToolCallStatus.PENDING);
         when(fixture.stateStore.statusOf(TOKEN, secondCall.id())).thenReturn(ToolCallStatus.PENDING);
-        Map<String, String> reverseResultOrder = new LinkedHashMap<>();
-        reverseResultOrder.put(secondCall.id(), "second-result");
-        reverseResultOrder.put(firstCall.id(), "first-result");
+        Map<String, ToolExecutionOutcome> reverseResultOrder = new LinkedHashMap<>();
+        reverseResultOrder.put(
+                secondCall.id(), ToolExecutionOutcome.definitive("second-result"));
+        reverseResultOrder.put(
+                firstCall.id(), ToolExecutionOutcome.definitive("first-result"));
         when(fixture.executor.executeConcurrently(same(catalog), eq(calls), same(fixture.toolContext)))
                 .thenReturn(reverseResultOrder);
 
@@ -175,6 +187,60 @@ class ToolBatchCoordinatorTest {
         assertToolMessages(fixture.context,
                 List.of(firstCall.id(), secondCall.id()),
                 List.of("first-result", "second-result"));
+    }
+
+    @Test
+    void unknownIdempotentOutcomeStaysInProgressWhileDefinitiveSiblingsPersistInOrder(
+            @TempDir Path workspace) {
+        ClassifiedTool first = new ClassifiedTool("first", IdempotencyClass.READ_ONLY);
+        ClassifiedTool ticket = new ClassifiedTool("ticket", IdempotencyClass.IDEMPOTENT);
+        ClassifiedTool last = new ClassifiedTool("last", IdempotencyClass.READ_ONLY);
+        TaskToolCatalog catalog = catalog(first, ticket, last);
+        ToolCall firstCall = new ToolCall("call-first", first.name(), "{}");
+        ToolCall ticketCall = new ToolCall("call-ticket", ticket.name(), "{}");
+        ToolCall lastCall = new ToolCall("call-last", last.name(), "{}");
+        List<ToolCall> calls = List.of(firstCall, ticketCall, lastCall);
+        Fixture fixture = fixture(workspace);
+        calls.forEach(call ->
+                when(fixture.stateStore.statusOf(TOKEN, call.id()))
+                        .thenReturn(ToolCallStatus.PENDING));
+        Map<String, ToolExecutionOutcome> reverse = new LinkedHashMap<>();
+        reverse.put(lastCall.id(), ToolExecutionOutcome.definitive("last-result"));
+        reverse.put(
+                ticketCall.id(),
+                ToolExecutionOutcome.remoteOutcomeUnknown("bounded unknown"));
+        reverse.put(firstCall.id(), ToolExecutionOutcome.definitive("first-result"));
+        when(fixture.executor.executeConcurrently(
+                        same(catalog), eq(calls), same(fixture.toolContext)))
+                .thenReturn(reverse);
+
+        BatchDisposition disposition = fixture.coordinator.process(
+                TOKEN, fixture.toolContext, fixture.context, catalog, calls);
+
+        assertEquals(BatchDisposition.RECOVERY_REQUIRED, disposition);
+        InOrder ledgerOrder = inOrder(fixture.stateStore);
+        ledgerOrder.verify(fixture.stateStore).markInProgress(TOKEN, firstCall);
+        ledgerOrder.verify(fixture.stateStore).markInProgress(TOKEN, ticketCall);
+        ledgerOrder.verify(fixture.stateStore).markInProgress(TOKEN, lastCall);
+        ledgerOrder.verify(fixture.stateStore)
+                .recordToolResult(TOKEN, firstCall, "first-result");
+        ledgerOrder.verify(fixture.stateStore)
+                .recordToolResult(TOKEN, lastCall, "last-result");
+        verify(fixture.stateStore, never())
+                .recordToolResult(eq(TOKEN), eq(ticketCall), any());
+        verify(fixture.stateStore, never()).markInDoubt(eq(TOKEN), eq(ticketCall), any());
+        assertToolMessages(
+                fixture.context,
+                List.of(firstCall.id(), lastCall.id()),
+                List.of("first-result", "last-result"));
+        verify(fixture.transport).publish(
+                TOKEN,
+                TaskEvent.Type.TOOL_RESULT,
+                Map.of(
+                        "id", ticketCall.id(),
+                        "name", ticketCall.name(),
+                        "outcome", "REMOTE_OUTCOME_UNKNOWN",
+                        "recoveryRequired", true));
     }
 
     @Test
@@ -223,7 +289,7 @@ class ToolBatchCoordinatorTest {
         when(fixture.executor.executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext)))
                 .thenAnswer(invocation -> {
                     executed.set(true);
-                    return Map.of(call.id(), "result");
+                    return Map.of(call.id(), ToolExecutionOutcome.definitive("result"));
                 });
 
         fixture.coordinator.process(TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
@@ -258,7 +324,7 @@ class ToolBatchCoordinatorTest {
             return null;
         }).when(fixture.stateStore).markInProgress(TOKEN, call);
         when(fixture.executor.executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext)))
-                .thenReturn(Map.of(call.id(), "result"));
+                .thenReturn(Map.of(call.id(), ToolExecutionOutcome.definitive("result")));
         doAnswer(invocation -> {
             durableStatus.set(ToolCallStatus.DONE);
             return null;
@@ -271,6 +337,75 @@ class ToolBatchCoordinatorTest {
                         java.util.Optional.of(call.id()), java.util.Optional.empty()),
                 observed.get());
         assertToolMessages(fixture.context, List.of(call.id()), List.of("result"));
+    }
+
+    @Test
+    void agentRunnerCommitsThenStopsOnRecoveryRequiredForPendingBatch(
+            @TempDir Path workspace) {
+        Context context = new Context("system");
+        ToolCall call = new ToolCall("call-pending-runner", "ticket", "{}");
+        context.addAssistant(assistantWithCall(call));
+        RunnerFixture fixture = runnerFixture(workspace, context);
+        when(fixture.coordinator.process(
+                        eq(TOKEN),
+                        any(ToolContext.class),
+                        same(context),
+                        same(fixture.catalog),
+                        eq(List.of(call))))
+                .thenReturn(
+                        BatchDisposition.RECOVERY_REQUIRED,
+                        BatchDisposition.WAITING_APPROVAL);
+
+        String result = invokeDriveLoop(fixture.runner, TOKEN, fixture.catalog);
+
+        assertEquals("任务需要恢复对账。", result);
+        InOrder order = inOrder(fixture.coordinator, fixture.workspaceStore);
+        order.verify(fixture.coordinator).process(
+                eq(TOKEN),
+                any(ToolContext.class),
+                same(context),
+                same(fixture.catalog),
+                eq(List.of(call)));
+        order.verify(fixture.workspaceStore).commit(TASK_ID);
+        verifyNoInteractions(fixture.llm);
+        verify(fixture.stateStore, never()).completeTask(any(), any());
+        verify(fixture.stateStore, never()).failTask(any(TaskRunToken.class), anyString());
+    }
+
+    @Test
+    void agentRunnerCommitsThenStopsOnRecoveryRequiredForNewDecision(
+            @TempDir Path workspace) {
+        Context context = new Context("system");
+        ToolCall call = new ToolCall("call-new-runner", "ticket", "{}");
+        RunnerFixture fixture = runnerFixture(workspace, context);
+        Decision decision = Decision.tools(assistantWithCall(call), List.of(call));
+        when(fixture.llm.chatStream(same(context), any(), any())).thenReturn(decision);
+        when(fixture.stateStore.appendAssistant(TOKEN, decision.getAssistantMessage()))
+                .thenReturn(2);
+        when(fixture.coordinator.process(
+                        eq(TOKEN),
+                        any(ToolContext.class),
+                        same(context),
+                        same(fixture.catalog),
+                        eq(List.of(call))))
+                .thenReturn(
+                        BatchDisposition.RECOVERY_REQUIRED,
+                        BatchDisposition.WAITING_APPROVAL);
+
+        String result = invokeDriveLoop(fixture.runner, TOKEN, fixture.catalog);
+
+        assertEquals("任务需要恢复对账。", result);
+        InOrder order = inOrder(fixture.coordinator, fixture.workspaceStore);
+        order.verify(fixture.coordinator).process(
+                eq(TOKEN),
+                any(ToolContext.class),
+                same(context),
+                same(fixture.catalog),
+                eq(List.of(call)));
+        order.verify(fixture.workspaceStore).commit(TASK_ID);
+        verify(fixture.llm).chatStream(same(context), any(), any());
+        verify(fixture.stateStore, never()).completeTask(any(), any());
+        verify(fixture.stateStore, never()).failTask(any(TaskRunToken.class), anyString());
     }
 
     private static final String TASK_ID = "task-batch";
@@ -289,6 +424,68 @@ class ToolBatchCoordinatorTest {
         ToolBatchCoordinator coordinator = new DefaultToolBatchCoordinator(
                 stateStore, executor, transport, new TaskControl(), faultInjector);
         return new Fixture(stateStore, executor, transport, toolContext, context, coordinator);
+    }
+
+    private static RunnerFixture runnerFixture(Path workspace, Context context) {
+        LlmClient llm = mock(LlmClient.class);
+        ToolBatchCoordinator coordinator = mock(ToolBatchCoordinator.class);
+        StateStore stateStore = mock(StateStore.class);
+        WorkspaceStore workspaceStore = mock(WorkspaceStore.class);
+        StreamTransport transport = mock(StreamTransport.class);
+        TaskToolCatalog catalog =
+                catalog(new ClassifiedTool("ticket", IdempotencyClass.IDEMPOTENT));
+        when(stateStore.loadContext(TASK_ID)).thenReturn(context);
+        when(stateStore.readControlSignal(TASK_ID)).thenReturn(null);
+        when(workspaceStore.checkout(TASK_ID)).thenReturn(workspace);
+        AgentRunner runner = new AgentRunner(
+                llm,
+                mock(AgentProfileRegistry.class),
+                mock(ToolCatalogResolver.class),
+                coordinator,
+                FaultInjector.none(),
+                stateStore,
+                new ShutdownState(),
+                workspaceStore,
+                new InFlightTasks(),
+                transport,
+                new TaskControl(),
+                OpenTelemetrySdk.builder().build().getTracer("runner-test"),
+                new WorkerIdentity("runner-test", "0"),
+                3);
+        return new RunnerFixture(
+                runner, llm, coordinator, stateStore, workspaceStore, catalog);
+    }
+
+    private static String invokeDriveLoop(
+            AgentRunner runner, TaskRunToken token, TaskToolCatalog catalog) {
+        try {
+            Method method = AgentRunner.class.getDeclaredMethod(
+                    "driveLoop", TaskRunToken.class, TaskToolCatalog.class);
+            method.setAccessible(true);
+            return (String) method.invoke(runner, token, catalog);
+        } catch (InvocationTargetException ex) {
+            if (ex.getCause() instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (ex.getCause() instanceof Error error) {
+                throw error;
+            }
+            throw new AssertionError(ex.getCause());
+        } catch (ReflectiveOperationException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    private static Map<String, Object> assistantWithCall(ToolCall call) {
+        return Map.of(
+                "role", "assistant",
+                "content", "",
+                "tool_calls", List.of(Map.of(
+                        "id", call.id(),
+                        "type", "function",
+                        "function", Map.of(
+                                "name", call.name(),
+                                "arguments", call.arguments()))));
     }
 
     private static TaskToolCatalog catalog(ClassifiedTool... tools) {
@@ -323,6 +520,15 @@ class ToolBatchCoordinatorTest {
             ToolBatchCoordinator coordinator
     ) {
     }
+
+    private record RunnerFixture(
+            AgentRunner runner,
+            LlmClient llm,
+            ToolBatchCoordinator coordinator,
+            StateStore stateStore,
+            WorkspaceStore workspaceStore,
+            TaskToolCatalog catalog
+    ) {}
 
     private record ClassifiedTool(String name, IdempotencyClass idempotency) implements Tool {
         @Override

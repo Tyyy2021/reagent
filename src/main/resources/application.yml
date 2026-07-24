@@ -65,6 +65,25 @@ reagent:
     maximum-response-bytes: 65536
     retries: 1
     retry-backoff: 100ms
+  # ====== Task 9:trusted official MCP Streamable HTTP boundary ======
+  mcp:
+    servers:
+      fake-ops:
+        base-url: ${REAGENT_MCP_FAKE_OPS_BASE_URL:http://localhost:8090}
+        endpoint: /mcp
+        connect-timeout: 500ms
+        request-timeout: 3s
+        maximum-response-bytes: 65536
+        tools:
+          query_metrics:
+            idempotency-class: READ_ONLY
+            approval-policy: NONE
+          search_logs:
+            idempotency-class: READ_ONLY
+            approval-policy: NONE
+          create_ticket:
+            idempotency-class: IDEMPOTENT
+            approval-policy: REQUIRE_APPROVAL
   incidents:
     trusted-sources:
       - fake-alertmanager

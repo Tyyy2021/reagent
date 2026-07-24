@@ -265,6 +265,9 @@ public class AgentRunner {
                             return "任务正在等待审批。";
                         }
                         workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
+                        if (disposition == BatchDisposition.RECOVERY_REQUIRED) {
+                            return "任务需要恢复对账。";
+                        }
                         continue;
                     }
 
@@ -301,6 +304,9 @@ public class AgentRunner {
                         return "任务正在等待审批。";
                     }
                     workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
+                    if (disposition == BatchDisposition.RECOVERY_REQUIRED) {
+                        return "任务需要恢复对账。";
+                    }
                 } finally {
                     stepSpan.end();
                 }

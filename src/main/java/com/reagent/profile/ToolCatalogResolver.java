@@ -1,9 +1,13 @@
 package com.reagent.profile;
 
+import com.reagent.mcp.McpProperties;
+import com.reagent.mcp.McpContractException;
+import com.reagent.mcp.McpToolAdapter;
 import com.reagent.tool.Tool;
 import com.reagent.tool.ToolProperties;
 import com.reagent.tool.ToolRegistry;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -23,14 +27,26 @@ public class ToolCatalogResolver {
     private final ToolRegistry registry;
     private final SchemaHasher schemaHasher;
     private final ToolProperties toolProperties;
+    private final McpProperties mcpProperties;
 
     public ToolCatalogResolver(ToolRegistry registry, SchemaHasher schemaHasher, ToolProperties toolProperties) {
+        this(registry, schemaHasher, toolProperties, null);
+    }
+
+    @Autowired
+    public ToolCatalogResolver(
+            ToolRegistry registry,
+            SchemaHasher schemaHasher,
+            ToolProperties toolProperties,
+            McpProperties mcpProperties) {
         this.registry = registry;
         this.schemaHasher = schemaHasher;
         this.toolProperties = toolProperties;
+        this.mcpProperties = mcpProperties;
     }
 
     public TaskProfileSnapshot snapshot(AgentProfileDefinition definition) {
+        validateProfileServers(definition.mcpServerIds());
         List<ToolSnapshot> tools = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (String name : definition.toolNames()) {
@@ -41,16 +57,27 @@ public class ToolCatalogResolver {
             if (tool == null) {
                 throw new IllegalArgumentException("Profile " + definition.profileId() + " references unknown tool: " + name);
             }
+            Map<String, Object> parameterSchema = tool.parameterSchema();
+            long timeoutMs = toolProperties.getTimeoutMs();
+            String provider = "local";
+            if (tool instanceof McpToolAdapter mcpTool) {
+                if (!definition.mcpServerIds().contains(mcpTool.serverId())) {
+                    throw new McpContractException(
+                            "Profile does not allow MCP server: " + mcpTool.serverId());
+                }
+                timeoutMs = mcpTool.requestTimeoutMs();
+                provider = "mcp:" + mcpTool.serverId();
+            }
             tools.add(new ToolSnapshot(
                     tool.name(),
                     tool.name(),
                     tool.description(),
-                    tool.parameterSchema(),
-                    schemaHasher.hash(tool.parameterSchema()),
+                    parameterSchema,
+                    schemaHasher.hash(parameterSchema),
                     tool.idempotency(),
                     tool.approvalPolicy(),
-                    toolProperties.getTimeoutMs(),
-                    "local"));
+                    timeoutMs,
+                    provider));
         }
         return new TaskProfileSnapshot(
                 definition.profileId(),
@@ -90,6 +117,18 @@ public class ToolCatalogResolver {
             runtimeTools.put(frozen.name(), runtime);
         }
         return new TaskToolCatalog(persistedSnapshot, runtimeTools);
+    }
+
+    private void validateProfileServers(List<String> serverIds) {
+        Set<String> seen = new HashSet<>();
+        for (String serverId : serverIds) {
+            if (!seen.add(serverId)) {
+                throw new McpContractException("Duplicate MCP server in profile: " + serverId);
+            }
+            if (mcpProperties != null) {
+                mcpProperties.requireServer(serverId);
+            }
+        }
     }
 
     private static String sha256(String value) {

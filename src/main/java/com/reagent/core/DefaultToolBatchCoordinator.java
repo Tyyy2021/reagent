@@ -10,6 +10,7 @@ import com.reagent.stream.TaskEvent;
 import com.reagent.tool.IdempotencyClass;
 import com.reagent.tool.ToolContext;
 import com.reagent.tool.ToolExecutor;
+import com.reagent.tool.ToolExecutionOutcome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -94,7 +95,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             }
         }
 
-        Map<String, String> results = new HashMap<>();
+        Map<String, ToolExecutionOutcome> results = new HashMap<>();
         if (!toRun.isEmpty()) {
             for (ToolCall call : toRun) {
                 stateStore.markInProgress(token, call);
@@ -104,14 +105,14 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             }
             for (ToolCall call : actionable) {
                 bus.publish(token, TaskEvent.Type.TOOL_CALL, Map.of(
-                        "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                        "id", call.id(), "name", call.name()));
             }
             log.info("并发执行本轮 {} 个工具调用", toRun.size());
             results.putAll(executor.executeConcurrently(catalog, toRun, toolContext));
         } else {
             for (ToolCall call : actionable) {
                 bus.publish(token, TaskEvent.Type.TOOL_CALL, Map.of(
-                        "id", call.id(), "name", call.name(), "arguments", call.arguments()));
+                        "id", call.id(), "name", call.name()));
             }
         }
 
@@ -125,6 +126,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
         for (ToolCall call : toRun) {
             ran.add(call.id());
         }
+        boolean recoveryRequired = false;
         for (ToolCall call : calls) {
             if (ran.contains(call.id())) {
                 if (forced && !canSafelyReplay(catalog, call)) {
@@ -134,7 +136,22 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                             "id", call.id(), "name", call.name(),
                             "result", "(被 force 取消中途打断,副作用是否生效未知=in-doubt)", "inDoubt", true));
                 } else {
-                    String result = results.get(call.id());
+                    ToolExecutionOutcome outcome = results.get(call.id());
+                    if (outcome == null) {
+                        throw new IllegalStateException(
+                                "Tool execution produced no outcome for " + call.id());
+                    }
+                    if (outcome.kind()
+                            == ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN) {
+                        recoveryRequired = true;
+                        bus.publish(token, TaskEvent.Type.TOOL_RESULT, Map.of(
+                                "id", call.id(),
+                                "name", call.name(),
+                                "outcome", "REMOTE_OUTCOME_UNKNOWN",
+                                "recoveryRequired", true));
+                        continue;
+                    }
+                    String result = outcome.content();
                     stateStore.recordToolResult(token, call, result);
                     faultInjector.hit(
                             FaultPoint.AFTER_TOOL_RESULT_PERSISTED_BEFORE_FINAL_ANSWER,
@@ -163,7 +180,9 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         Map.of("id", call.id(), "name", call.name(), "result", message, "inDoubt", true));
             }
         }
-        return BatchDisposition.EXECUTED;
+        return recoveryRequired
+                ? BatchDisposition.RECOVERY_REQUIRED
+                : BatchDisposition.EXECUTED;
     }
 
     private static FaultContext faultContext(TaskRunToken token, ToolCall call) {

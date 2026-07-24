@@ -51,6 +51,12 @@ public final class Trace {
     public static final AttributeKey<String> TOOL_NAME = AttributeKey.stringKey("gen_ai.tool.name");
     public static final AttributeKey<String> TOOL_CALL_ID = AttributeKey.stringKey("reagent.tool.call_id");
     public static final AttributeKey<String> IDEMPOTENCY = AttributeKey.stringKey("reagent.tool.idempotency_class");
+    public static final AttributeKey<String> TOOL_PROVIDER =
+            AttributeKey.stringKey("reagent.tool.provider");
+    public static final AttributeKey<String> MCP_SERVER =
+            AttributeKey.stringKey("reagent.mcp.server");
+    public static final AttributeKey<String> TOOL_OUTCOME =
+            AttributeKey.stringKey("reagent.tool.outcome");
     public static final AttributeKey<String> SANDBOX_TYPE = AttributeKey.stringKey("reagent.sandbox.type");
     public static final AttributeKey<Long> EXIT_CODE = AttributeKey.longKey("reagent.sandbox.exit_code");
     public static final AttributeKey<Boolean> KILLED = AttributeKey.booleanKey("reagent.sandbox.killed");
