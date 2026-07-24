@@ -4,7 +4,7 @@ Date: 2026-07-25
 
 ## Status
 
-Approved design, awaiting written-spec review before implementation.
+Approved for implementation.
 
 ## Context
 
