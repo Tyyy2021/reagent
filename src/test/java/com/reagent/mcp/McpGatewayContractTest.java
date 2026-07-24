@@ -20,6 +20,7 @@ import io.opentelemetry.context.Scope;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import java.time.Duration;
+import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.io.IOException;
@@ -148,6 +149,158 @@ class McpGatewayContractTest {
     }
 
     @Test
+    void discoveryRejectsPropertyValueThatIsNotSchemaObject() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of("name", "not-a-schema")))));
+    }
+
+    @Test
+    void discoveryRejectsDuplicateRequiredNamesAtSameObjectLevel() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of("name", Map.of("type", "string")),
+                        "required", List.of("name", "name")))));
+    }
+
+    @Test
+    void discoveryRejectsInvalidAdditionalPropertiesValue() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(),
+                        "additionalProperties", "sometimes"))));
+    }
+
+    @Test
+    void discoveryRecursivelyRejectsMalformedNestedPropertySchema() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "child", Map.of(
+                                        "type", "object",
+                                        "properties", Map.of("leaf", "not-a-schema")))))));
+    }
+
+    @Test
+    void discoveryRecursivelyRejectsNestedDuplicateRequiredNames() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "child", Map.of(
+                                        "type", "object",
+                                        "properties", Map.of(
+                                                "leaf", Map.of("type", "string")),
+                                        "required", List.of("leaf", "leaf")))))));
+    }
+
+    @Test
+    void discoveryRecursivelyRejectsNestedInvalidAdditionalProperties() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "child", Map.of(
+                                        "type", "object",
+                                        "properties", Map.of(),
+                                        "additionalProperties", 1))))));
+    }
+
+    @Test
+    void discoveryRecursivelyRejectsUnknownNestedTypeName() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "child", Map.of("type", "mystery"))))));
+    }
+
+    @Test
+    void discoveryRecursivelyRejectsNonStringNestedTypeValue() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "child", Map.of("type", 7))))));
+    }
+
+    @Test
+    void discoveryRecursivelyRejectsDuplicateNestedTypeArrayEntries() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "child", Map.of(
+                                        "type", List.of("string", "string")))))));
+    }
+
+    @Test
+    void discoveryRejectsMalformedCompositionSchemaPosition() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(),
+                        "allOf", List.of("not-a-schema")))));
+    }
+
+    @Test
+    void discoveryRejectsMalformedItemSchemaPosition() {
+        assertDiscoveryRejected(List.of(tool(
+                "query_metrics",
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(),
+                        "items", "not-a-schema"))));
+    }
+
+    @Test
+    void discoveryAcceptsValidNestedSchemasAnnotationsAndCompositionPositions() {
+        Map<String, Object> schema = Map.of(
+                "title", "query metrics input",
+                "type", "object",
+                "properties", Map.of(
+                        "child", Map.of(
+                                "title", "child input",
+                                "type", "object",
+                                "properties", Map.of(
+                                        "leaf", Map.of(
+                                                "title", "leaf value",
+                                                "type", "string"),
+                                        "optional", Map.of(
+                                                "type", List.of("string", "null"))),
+                                "required", List.of("leaf"),
+                                "additionalProperties", false)),
+                "required", List.of("child"),
+                "additionalProperties", Map.of("type", "string"),
+                "allOf", List.of(Map.of("title", "composition annotation")),
+                "items", Map.of("type", "string"),
+                "prefixItems", List.of(Map.of("type", "number")),
+                "$defs", Map.of("label", Map.of("type", "string")));
+        ScriptedFactory factory = new ScriptedFactory();
+        factory.addSession().discovery.add(List.of(tool("query_metrics", schema)));
+
+        assertEquals(
+                List.of("query_metrics"),
+                gateway(factory).discover("fake-ops").stream()
+                        .map(McpRemoteTool::name)
+                        .toList());
+    }
+
+    @Test
     void callAcceptsExactlyOneBoundedTextAndPreservesRemoteErrorFlag() {
         ScriptedFactory factory = new ScriptedFactory();
         ScriptedSession session = factory.addSession();
@@ -184,11 +337,88 @@ class McpGatewayContractTest {
     }
 
     @Test
+    void fixedByteCeilingAccepts65536AndRejects65537ForEveryBoundedPayload()
+            throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, Object> acceptedSchema = schemaWithSerializedBytes(mapper, 65_536);
+        Map<String, Object> rejectedSchema = schemaWithSerializedBytes(mapper, 65_537);
+        assertEquals(65_536, mapper.writeValueAsBytes(acceptedSchema).length);
+        assertEquals(65_537, mapper.writeValueAsBytes(rejectedSchema).length);
+
+        ScriptedFactory acceptedSchemaFactory = new ScriptedFactory();
+        acceptedSchemaFactory.addSession().discovery.add(
+                List.of(tool("query_metrics", acceptedSchema)));
+        assertEquals(
+                List.of("query_metrics"),
+                gateway(acceptedSchemaFactory).discover("fake-ops").stream()
+                        .map(McpRemoteTool::name)
+                        .toList());
+        assertDiscoveryRejected(List.of(tool("query_metrics", rejectedSchema)));
+
+        Map<String, Object> acceptedArguments =
+                argumentsWithSerializedBytes(mapper, 65_536);
+        Map<String, Object> rejectedArguments =
+                argumentsWithSerializedBytes(mapper, 65_537);
+        assertEquals(65_536, mapper.writeValueAsBytes(acceptedArguments).length);
+        assertEquals(65_537, mapper.writeValueAsBytes(rejectedArguments).length);
+        ScriptedFactory argumentFactory = new ScriptedFactory();
+        ScriptedSession argumentSession = argumentFactory.addSession();
+        argumentSession.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        argumentSession.results.add(new OfficialMcpGateway.RawCallResult(
+                List.of(new OfficialMcpGateway.RawContent(true, "ok")), false));
+        OfficialMcpGateway argumentGateway = gateway(argumentFactory);
+        argumentGateway.discover("fake-ops");
+        assertEquals(
+                new McpCallResult("ok", false),
+                argumentGateway.call(
+                        "fake-ops", "query_metrics", acceptedArguments));
+        assertThrows(
+                McpContractException.class,
+                () -> argumentGateway.call(
+                        "fake-ops", "query_metrics", rejectedArguments));
+        assertEquals(1, argumentSession.calls.get(),
+                "65,537-byte arguments must fail before the session call");
+
+        String acceptedResult = "x".repeat(65_536);
+        String rejectedResult = "x".repeat(65_537);
+        assertEquals(
+                65_536, acceptedResult.getBytes(StandardCharsets.UTF_8).length);
+        assertEquals(
+                65_537, rejectedResult.getBytes(StandardCharsets.UTF_8).length);
+        ScriptedFactory resultFactory = new ScriptedFactory();
+        ScriptedSession resultSession = resultFactory.addSession();
+        resultSession.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        resultSession.results.add(new OfficialMcpGateway.RawCallResult(
+                List.of(new OfficialMcpGateway.RawContent(true, acceptedResult)), false));
+        resultSession.results.add(new OfficialMcpGateway.RawCallResult(
+                List.of(new OfficialMcpGateway.RawContent(true, rejectedResult)), false));
+        OfficialMcpGateway resultGateway = gateway(resultFactory);
+        resultGateway.discover("fake-ops");
+        assertEquals(
+                acceptedResult,
+                resultGateway.call("fake-ops", "query_metrics", Map.of()).text());
+        assertThrows(
+                McpContractException.class,
+                () -> resultGateway.call("fake-ops", "query_metrics", Map.of()));
+
+        McpProperties acceptedConfiguration = validProperties();
+        acceptedConfiguration.getServers().get("fake-ops")
+                .setMaximumResponseBytes(65_536);
+        acceptedConfiguration.validate();
+        McpProperties rejectedConfiguration = validProperties();
+        rejectedConfiguration.getServers().get("fake-ops")
+                .setMaximumResponseBytes(65_537);
+        assertThrows(McpContractException.class, rejectedConfiguration::validate);
+        assertEquals(65_536, McpProperties.MAX_RESPONSE_BYTES);
+    }
+
+    @Test
     void transportBreakReconnectsOnceAndRequiresUnchangedSchema() {
         ScriptedFactory factory = new ScriptedFactory();
         ScriptedSession first = factory.addSession();
         first.discovery.add(List.of(tool("query_metrics", objectSchema())));
-        first.failCall = new McpTransportException("connection reset");
+        first.failCall = new McpTransportException(
+                "connection reset", new ConnectException("connection reset"));
         ScriptedSession second = factory.addSession();
         second.discovery.add(List.of(tool("query_metrics", objectSchema())));
         second.results.add(new OfficialMcpGateway.RawCallResult(
@@ -206,7 +436,8 @@ class McpGatewayContractTest {
         ScriptedFactory driftFactory = new ScriptedFactory();
         ScriptedSession driftFirst = driftFactory.addSession();
         driftFirst.discovery.add(List.of(tool("query_metrics", objectSchema())));
-        driftFirst.failCall = new McpTransportException("connection reset");
+        driftFirst.failCall = new McpTransportException(
+                "connection reset", new ConnectException("connection reset"));
         ScriptedSession driftSecond = driftFactory.addSession();
         driftSecond.discovery.add(List.of(tool(
                 "query_metrics",
@@ -218,6 +449,52 @@ class McpGatewayContractTest {
                 McpContractException.class,
                 () -> driftGateway.call("fake-ops", "query_metrics", Map.of()));
         assertEquals(0, driftSecond.calls.get());
+    }
+
+    @Test
+    void sdkWrappedJsonFailureIsDefinitive() {
+        ScriptedFactory jsonFactory = new ScriptedFactory();
+        ScriptedSession jsonFirst = jsonFactory.addSession();
+        jsonFirst.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        jsonFirst.failCall = new McpTransportException(
+                "decode failed",
+                new com.fasterxml.jackson.core.JsonParseException(
+                        (com.fasterxml.jackson.core.JsonParser) null,
+                        "malformed response JSON"));
+        ScriptedSession jsonSecond = jsonFactory.addSession();
+        jsonSecond.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        jsonSecond.results.add(new OfficialMcpGateway.RawCallResult(
+                List.of(new OfficialMcpGateway.RawContent(true, "must not retry")), false));
+        OfficialMcpGateway jsonGateway = gateway(jsonFactory);
+        jsonGateway.discover("fake-ops");
+
+        assertThrows(
+                McpContractException.class,
+                () -> jsonGateway.call("fake-ops", "query_metrics", Map.of()));
+        assertEquals(1, jsonFactory.opens.get());
+        assertEquals(0, jsonFirst.closes.get());
+        assertEquals(0, jsonSecond.calls.get());
+    }
+
+    @Test
+    void plainTransportExceptionIsDefinitive() {
+        ScriptedFactory plainFactory = new ScriptedFactory();
+        ScriptedSession plainFirst = plainFactory.addSession();
+        plainFirst.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        plainFirst.failCall = new McpTransportException("HTTP/protocol failure");
+        ScriptedSession plainSecond = plainFactory.addSession();
+        plainSecond.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        plainSecond.results.add(new OfficialMcpGateway.RawCallResult(
+                List.of(new OfficialMcpGateway.RawContent(true, "must not retry")), false));
+        OfficialMcpGateway plainGateway = gateway(plainFactory);
+        plainGateway.discover("fake-ops");
+
+        assertThrows(
+                McpContractException.class,
+                () -> plainGateway.call("fake-ops", "query_metrics", Map.of()));
+        assertEquals(1, plainFactory.opens.get());
+        assertEquals(0, plainFirst.closes.get());
+        assertEquals(0, plainSecond.calls.get());
     }
 
     @Test
@@ -305,6 +582,33 @@ class McpGatewayContractTest {
     }
 
     @Test
+    void officialHttpMalformedJsonIsDefinitiveWithoutReconnectOrRetry() throws Exception {
+        try (McpHttpFixture fixture = new McpHttpFixture()) {
+            fixture.malformedToolCallResponses = true;
+            OfficialMcpGateway gateway = new OfficialMcpGateway(
+                    propertiesFor(fixture.baseUrl(), Duration.ofSeconds(1)),
+                    fixture.mapper,
+                    new McpReadiness());
+            try {
+                assertThrows(
+                        McpContractException.class,
+                        () -> {
+                            gateway.discover("fake-ops");
+                            gateway.call(
+                                    "fake-ops", "query_metrics", Map.of("name", "cpu"));
+                        });
+            } finally {
+                gateway.close();
+            }
+
+            assertEquals(1, fixture.initializeRequests.get());
+            assertEquals(1, fixture.listRequests.get());
+            assertEquals(1, fixture.callRequests.get());
+            fixture.assertNoUnexpectedFailures();
+        }
+    }
+
+    @Test
     void officialHttpRequestTimeoutReconnectsOnceThenMarksNotReady() throws Exception {
         try (McpHttpFixture fixture = new McpHttpFixture()) {
             fixture.blockToolLists = true;
@@ -366,6 +670,26 @@ class McpGatewayContractTest {
                 "properties", Map.of()));
     }
 
+    private static Map<String, Object> schemaWithSerializedBytes(
+            ObjectMapper mapper, int targetBytes) throws Exception {
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("properties", Map.of());
+        schema.put("title", "");
+        schema.put("type", "object");
+        int fixedBytes = mapper.writeValueAsBytes(schema).length;
+        schema.put("title", "x".repeat(targetBytes - fixedBytes));
+        return schema;
+    }
+
+    private static Map<String, Object> argumentsWithSerializedBytes(
+            ObjectMapper mapper, int targetBytes) throws Exception {
+        Map<String, Object> arguments = new LinkedHashMap<>();
+        arguments.put("payload", "");
+        int fixedBytes = mapper.writeValueAsBytes(arguments).length;
+        arguments.put("payload", "x".repeat(targetBytes - fixedBytes));
+        return arguments;
+    }
+
     private static McpProperties validProperties() {
         return propertiesFor("http://localhost:8090", Duration.ofSeconds(3));
     }
@@ -401,6 +725,7 @@ class McpGatewayContractTest {
         private final Queue<Throwable> unexpectedFailures = new ConcurrentLinkedQueue<>();
         private final CountDownLatch releaseToolLists = new CountDownLatch(1);
         private volatile boolean breakFirstToolCall;
+        private volatile boolean malformedToolCallResponses;
         private volatile boolean blockToolLists;
 
         private McpHttpFixture() throws Exception {
@@ -467,6 +792,19 @@ class McpGatewayContractTest {
                     case "tools/call" -> {
                         int requestNumber = callRequests.incrementAndGet();
                         if (breakFirstToolCall && requestNumber == 1) {
+                            return;
+                        }
+                        if (malformedToolCallResponses) {
+                            byte[] malformed = (
+                                    "event: message\n"
+                                            + "data: {malformed-json\n\n")
+                                    .getBytes(StandardCharsets.UTF_8);
+                            exchange.getResponseHeaders().set(
+                                    "Content-Type", "text/event-stream");
+                            exchange.getResponseHeaders().set(
+                                    "Mcp-Session-Id", "fixture-session");
+                            exchange.sendResponseHeaders(200, malformed.length);
+                            exchange.getResponseBody().write(malformed);
                             return;
                         }
                         ObjectNode result = response.putObject("result");

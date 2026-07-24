@@ -1,8 +1,14 @@
 package com.reagent.core;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.spi.ThrowableProxyUtil;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.persist.StateStore;
+import com.reagent.persist.TaskEntity;
+import com.reagent.persist.TaskStatus;
 import com.reagent.persist.ToolCallStatus;
 import com.reagent.llm.LlmClient;
 import com.reagent.profile.AgentProfileRegistry;
@@ -23,9 +29,14 @@ import com.reagent.tool.ToolExecutionOutcome;
 import com.reagent.tool.ToolProperties;
 import com.reagent.tool.ToolRegistry;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.InOrder;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,15 +46,19 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -56,13 +71,14 @@ class ToolBatchCoordinatorTest {
 
     @Test
     void pendingCallMarksInProgressExecutesOnceAndRecordsDoneWithToolMessage(@TempDir Path workspace) {
+        String sentinel = "TOOL_RESULT_SECRET_SENTINEL";
         ClassifiedTool read = new ClassifiedTool("read", IdempotencyClass.READ_ONLY);
         TaskToolCatalog catalog = catalog(read);
         ToolCall call = new ToolCall("call-pending", read.name(), "{}");
         Fixture fixture = fixture(workspace);
         when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.PENDING);
         when(fixture.executor.executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext)))
-                .thenReturn(Map.of(call.id(), ToolExecutionOutcome.definitive("pending-result")));
+                .thenReturn(Map.of(call.id(), ToolExecutionOutcome.definitive(sentinel)));
 
         BatchDisposition disposition = fixture.coordinator.process(
                 TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
@@ -74,10 +90,10 @@ class ToolBatchCoordinatorTest {
                 "id", call.id(), "name", call.name()));
         durableOrder.verify(fixture.executor)
                 .executeConcurrently(same(catalog), eq(List.of(call)), same(fixture.toolContext));
-        durableOrder.verify(fixture.stateStore).recordToolResult(TOKEN, call, "pending-result");
+        durableOrder.verify(fixture.stateStore).recordToolResult(TOKEN, call, sentinel);
         durableOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
-                "id", call.id(), "name", call.name(), "result", "pending-result"));
-        assertToolMessages(fixture.context, List.of(call.id()), List.of("pending-result"));
+                "id", call.id(), "name", call.name(), "outcome", "DEFINITIVE"));
+        assertToolMessages(fixture.context, List.of(call.id()), List.of(sentinel));
     }
 
     @Test
@@ -109,9 +125,9 @@ class ToolBatchCoordinatorTest {
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
                 "id", writeCall.id(), "name", writeCall.name()));
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
-                "id", readCall.id(), "name", readCall.name(), "result", "read-result"));
+                "id", readCall.id(), "name", readCall.name(), "outcome", "DEFINITIVE"));
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
-                "id", writeCall.id(), "name", writeCall.name(), "result", "write-result"));
+                "id", writeCall.id(), "name", writeCall.name(), "outcome", "DEFINITIVE"));
     }
 
     @Test
@@ -130,7 +146,9 @@ class ToolBatchCoordinatorTest {
         InOrder eventOrder = inOrder(fixture.transport);
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
                 "id", call.id(), "name", call.name()));
-        eventOrder.verify(fixture.transport).publish(eq(TOKEN), eq(TaskEvent.Type.TOOL_RESULT), any());
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
+                "id", call.id(), "name", call.name(),
+                "outcome", "IN_DOUBT", "inDoubt", true));
         Map<String, Object> toolMessage = fixture.context.messages().getLast();
         assertEquals(call.id(), toolMessage.get("tool_call_id"));
         assertTrue(String.valueOf(toolMessage.get("content")).contains("副作用是否已生效【未知】"));
@@ -154,10 +172,126 @@ class ToolBatchCoordinatorTest {
         InOrder eventOrder = inOrder(fixture.transport);
         eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_CALL, Map.of(
                 "id", call.id(), "name", call.name()));
-        eventOrder.verify(fixture.transport).publish(eq(TOKEN), eq(TaskEvent.Type.TOOL_RESULT), any());
+        eventOrder.verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
+                "id", call.id(), "name", call.name(),
+                "outcome", "DEFINITIVE", "reconciled", true));
         String result = String.valueOf(fixture.context.messages().getLast().get("content"));
         assertTrue(result.contains("退出码 17"));
         assertTrue(result.contains("未重复执行"));
+    }
+
+    @Test
+    void forceCancelledSideEffectPublishesOnlyMetadataAndRemainsUncommitted(
+            @TempDir Path workspace) {
+        ClassifiedTool sideEffect =
+                new ClassifiedTool("force_side_effect", IdempotencyClass.SIDE_EFFECTFUL);
+        TaskToolCatalog catalog = catalog(sideEffect);
+        ToolCall call = new ToolCall("call-force-cancel", sideEffect.name(), "{}");
+        Fixture fixture = fixture(workspace);
+        when(fixture.stateStore.statusOf(TOKEN, call.id())).thenReturn(ToolCallStatus.PENDING);
+        when(fixture.executor.executeConcurrently(
+                        same(catalog), eq(List.of(call)), same(fixture.toolContext)))
+                .thenReturn(Map.of(
+                        call.id(),
+                        ToolExecutionOutcome.definitive("FORCE_CANCEL_RESULT_SENTINEL")));
+        fixture.taskControl.begin(TOKEN);
+        try {
+            assertTrue(fixture.taskControl.requestCancel(TASK_ID, true));
+
+            fixture.coordinator.process(
+                    TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
+        } finally {
+            Thread.interrupted();
+            fixture.taskControl.end(TASK_ID);
+        }
+
+        verify(fixture.stateStore, never()).recordToolResult(any(), any(), any());
+        assertEquals(1, fixture.context.size());
+        verify(fixture.transport).publish(TOKEN, TaskEvent.Type.TOOL_RESULT, Map.of(
+                "id", call.id(), "name", call.name(),
+                "outcome", "IN_DOUBT", "inDoubt", true));
+    }
+
+    @Test
+    void agentTaskSpanAndLogsExcludeGoalAndRawExceptionCause(@TempDir Path workspace) {
+        String goalSentinel = "GOAL_SECRET_SENTINEL";
+        String logSentinel = "AGENT_LOG_EXCEPTION_SENTINEL";
+        String spanSentinel = "AGENT_SPAN_EXCEPTION_SENTINEL";
+        String causeSentinel = "AGENT_CAUSE_EXCEPTION_SENTINEL";
+        Context context = new Context("system");
+        LlmClient llm = mock(LlmClient.class);
+        AgentProfileRegistry profileRegistry = mock(AgentProfileRegistry.class);
+        ToolCatalogResolver catalogResolver = mock(ToolCatalogResolver.class);
+        ToolBatchCoordinator coordinator = mock(ToolBatchCoordinator.class);
+        StateStore stateStore = mock(StateStore.class);
+        WorkspaceStore workspaceStore = mock(WorkspaceStore.class);
+        StreamTransport transport = mock(StreamTransport.class);
+        TaskToolCatalog catalog =
+                catalog(new ClassifiedTool("ticket", IdempotencyClass.IDEMPOTENT));
+        TaskProfileSnapshot snapshot = new TaskProfileSnapshot(
+                "test", "v1", "system", "system-hash",
+                null, null, List.of(), List.of());
+        TaskEntity task = mock(TaskEntity.class);
+        when(task.getId()).thenReturn(TASK_ID);
+        when(task.getGoal()).thenReturn(goalSentinel);
+        when(task.getRecoveryCount()).thenReturn(0);
+        when(task.getStatus()).thenReturn(TaskStatus.RUNNING);
+        when(profileRegistry.snapshot("coding")).thenReturn(snapshot);
+        when(catalogResolver.resolve(snapshot)).thenReturn(catalog);
+        when(stateStore.createTask(goalSentinel, snapshot)).thenReturn(task);
+        when(stateStore.claim(TASK_ID)).thenReturn(Optional.of(TOKEN));
+        when(stateStore.loadContext(TASK_ID)).thenReturn(context);
+        when(stateStore.readControlSignal(TASK_ID)).thenReturn(null);
+        when(stateStore.getTask(TASK_ID)).thenReturn(task);
+        when(workspaceStore.checkout(TASK_ID)).thenReturn(workspace);
+        when(llm.chatStream(same(context), any(), any()))
+                .thenThrow(new IllegalStateException(logSentinel));
+        doThrow(new IllegalArgumentException(
+                        spanSentinel, new java.io.IOException(causeSentinel)))
+                .when(stateStore).failTask(eq(TOKEN), anyString());
+        InMemorySpanExporter exporter = InMemorySpanExporter.create();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(exporter))
+                .build();
+        AgentRunner runner = new AgentRunner(
+                llm,
+                profileRegistry,
+                catalogResolver,
+                coordinator,
+                FaultInjector.none(),
+                stateStore,
+                new ShutdownState(),
+                workspaceStore,
+                new InFlightTasks(),
+                transport,
+                new TaskControl(),
+                OpenTelemetrySdk.builder()
+                        .setTracerProvider(provider)
+                        .build()
+                        .getTracer("runner-test"),
+                new WorkerIdentity("runner-test", "0"),
+                3);
+        ListAppender<ILoggingEvent> logs = captureLogs(AgentRunner.class);
+        try {
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> runner.run(goalSentinel));
+
+            SpanData taskSpan = exporter.getFinishedSpanItems().stream()
+                    .filter(span -> span.getName().equals("agent.task"))
+                    .findFirst()
+                    .orElseThrow();
+            String exported = taskSpan.getAttributes() + " " + taskSpan.getEvents();
+            assertFalse(exported.contains(goalSentinel));
+            assertFalse(exported.contains(spanSentinel));
+            assertFalse(exported.contains(causeSentinel));
+            String captured = capturedLogText(logs);
+            assertFalse(captured.contains(goalSentinel));
+            assertFalse(captured.contains(logSentinel));
+        } finally {
+            detachLogs(AgentRunner.class, logs);
+            provider.close();
+        }
     }
 
     @Test
@@ -419,11 +553,14 @@ class ToolBatchCoordinatorTest {
         StateStore stateStore = mock(StateStore.class);
         ToolExecutor executor = mock(ToolExecutor.class);
         StreamTransport transport = mock(StreamTransport.class);
+        TaskControl taskControl = new TaskControl();
         ToolContext toolContext = new ToolContext(TOKEN, workspace);
         Context context = new Context("system");
         ToolBatchCoordinator coordinator = new DefaultToolBatchCoordinator(
-                stateStore, executor, transport, new TaskControl(), faultInjector);
-        return new Fixture(stateStore, executor, transport, toolContext, context, coordinator);
+                stateStore, executor, transport, taskControl, faultInjector);
+        return new Fixture(
+                stateStore, executor, transport, taskControl,
+                toolContext, context, coordinator);
     }
 
     private static RunnerFixture runnerFixture(Path workspace, Context context) {
@@ -511,10 +648,35 @@ class ToolBatchCoordinatorTest {
                 .toList());
     }
 
+    private static ListAppender<ILoggingEvent> captureLogs(Class<?> type) {
+        Logger logger = (Logger) LoggerFactory.getLogger(type);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void detachLogs(Class<?> type, ListAppender<ILoggingEvent> appender) {
+        ((Logger) LoggerFactory.getLogger(type)).detachAppender(appender);
+        appender.stop();
+    }
+
+    private static String capturedLogText(ListAppender<ILoggingEvent> appender) {
+        StringBuilder captured = new StringBuilder();
+        for (ILoggingEvent event : appender.list) {
+            captured.append(event.getFormattedMessage());
+            if (event.getThrowableProxy() != null) {
+                captured.append(ThrowableProxyUtil.asString(event.getThrowableProxy()));
+            }
+        }
+        return captured.toString();
+    }
+
     private record Fixture(
             StateStore stateStore,
             ToolExecutor executor,
             StreamTransport transport,
+            TaskControl taskControl,
             ToolContext toolContext,
             Context context,
             ToolBatchCoordinator coordinator

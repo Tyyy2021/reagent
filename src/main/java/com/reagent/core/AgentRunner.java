@@ -93,7 +93,7 @@ public class AgentRunner {
     }
 
     public RunResult run(String goal, String profileId) {
-        log.info("====== 新任务:{} ======", goal);
+        log.info("====== 新任务 ======");
         TaskProfileSnapshot snapshot = profileRegistry.snapshot(profileId);
         TaskToolCatalog catalog = catalogResolver.resolve(snapshot);
         TaskEntity task = stateStore.createTask(goal, snapshot);
@@ -110,7 +110,7 @@ public class AgentRunner {
     }
 
     public String submit(String goal, String profileId) {
-        log.info("====== 新任务(异步):{} ======", goal);
+        log.info("====== 新任务(异步) ======");
         TaskProfileSnapshot snapshot = profileRegistry.snapshot(profileId);
         TaskToolCatalog catalog = catalogResolver.resolve(snapshot);
         TaskEntity task = stateStore.createTask(goal, snapshot);
@@ -120,7 +120,7 @@ public class AgentRunner {
                 drive(task, false, catalog);
             } catch (RuntimeException ex) {
                 // drive 内部已分流(shutdown 保 RUNNING / 真错判 FAILED);此处兜底,防虚拟线程静默吞异常
-                log.error("异步任务 {} 驱动异常", taskId, ex);
+                log.error("异步任务 {} 驱动异常", taskId);
             }
         });
         return taskId;
@@ -153,7 +153,7 @@ public class AgentRunner {
             try {
                 resume(taskId);
             } catch (RuntimeException ex) {
-                log.error("异步恢复任务 {} 异常", taskId, ex);
+                log.error("异步恢复任务 {} 异常", taskId);
             }
         });
     }
@@ -200,7 +200,7 @@ public class AgentRunner {
                     log.info("自动恢复 / 接管任务 {}(第 {}/{} 次)", taskId, attempt, maxAttempts);
                 }
             } catch (FencedExecutionException ex) {
-                log.warn("任务 {} 的恢复前置步骤已被 fence,停止旧驱动且不写 FAILED: {}", taskId, ex.getMessage());
+                log.warn("任务 {} 的恢复前置步骤已被 fence,停止旧驱动且不写 FAILED", taskId);
                 return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
             }
             taskControl.begin(token);   // 登记驱动线程 + 打断信号槽 + 本次运行 token(M4 / M7 Stage3)
@@ -210,15 +210,13 @@ public class AgentRunner {
                     .setParent(Trace.logicalRootContext(taskId))
                     .setSpanKind(SpanKind.INTERNAL)
                     .setAttribute(Trace.TASK_ID, taskId)
-                    .setAttribute(Trace.GOAL, preview(task.getGoal()))
                     .setAttribute(Trace.RECOVERY_COUNT, (long) task.getRecoveryCount())
                     .setAttribute(Trace.WORKER_ID, workerIdentity.id())   // M7:标出本次由哪个 worker 驱动(失败转移后可见接管)
                     .startSpan();
             try (Scope ignored = taskSpan.makeCurrent()) {
                 return driveLoop(token, catalog);
             } catch (RuntimeException ex) {
-                taskSpan.recordException(ex);
-                taskSpan.setStatus(StatusCode.ERROR);
+                taskSpan.setStatus(StatusCode.ERROR, "agent task failed");
                 throw ex;
             } finally {
                 try {
@@ -323,7 +321,7 @@ public class AgentRunner {
                     taskId, ex.point());
             throw ex;
         } catch (FencedExecutionException ex) {
-            log.warn("任务 {} 的运行 token 已被 fence,停止旧驱动且不写 FAILED: {}", taskId, ex.getMessage());
+            log.warn("任务 {} 的运行 token 已被 fence,停止旧驱动且不写 FAILED", taskId);
             return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
         } catch (RuntimeException ex) {
             // 关键区分:这个异常是"进程要关了"造成的,还是任务本身真出错了?
@@ -335,13 +333,13 @@ public class AgentRunner {
                 log.warn("进程正在关闭,任务 {} 保持 RUNNING,重启后将自动恢复。", taskId);
                 return "进程关闭,任务将于重启后恢复。";
             }
-            log.error("任务 {} 执行异常,标记 FAILED", taskId, ex);
+            log.error("任务 {} 执行异常,标记 FAILED", taskId);
             try {
                 stateStore.failTask(token, "执行异常: " + ex.getMessage());
                 bus.publish(token, TaskEvent.Type.FAILED, Map.of("error", String.valueOf(ex.getMessage())));
             } catch (FencedExecutionException fenced) {
-                log.warn("任务 {} 写 FAILED 前已被接管,旧 worker 停止且不发布 FAILED: {}",
-                        taskId, fenced.getMessage());
+                log.warn("任务 {} 写 FAILED 前已被接管,旧 worker 停止且不发布 FAILED",
+                        taskId);
                 return "本任务已被其它 worker 接管(fence),本 worker 停止驱动。";
             }
             return "任务执行失败:" + ex.getMessage();
@@ -390,15 +388,6 @@ public class AgentRunner {
         }
         return null;
     }
-
-    /** goal 等放进 span 属性前截断,避免超大属性。 */
-    private static String preview(String s) {
-        if (s == null) {
-            return "";
-        }
-        return s.length() > 200 ? s.substring(0, 200) + "…" : s;
-    }
-
     /** 提交任务的返回:任务 id(可据此查状态 / 手动恢复)+ 最终结果 */
     public record RunResult(String taskId, String result) {
     }

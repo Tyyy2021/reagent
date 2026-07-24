@@ -60,6 +60,15 @@ def test_exact_mcp_initialize_does_not_redirect() -> None:
                     },
                     json=payload,
                 )
+                trailing_slash_response = await client.post(
+                    f"{server_url}/",
+                    headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                        "MCP-Protocol-Version": "2025-06-18",
+                    },
+                    json=payload,
+                )
                 nested_response = await client.post(
                     f"{server_url}/mcp",
                     headers={
@@ -74,7 +83,12 @@ def test_exact_mcp_initialize_does_not_redirect() -> None:
         assert response.headers.get("location") is None
         assert response.content
         assert response.json()["result"]["protocolVersion"] == "2025-06-18"
+        assert trailing_slash_response.status_code >= 400
+        assert trailing_slash_response.status_code < 500
+        assert trailing_slash_response.headers.get("location") is None
         assert nested_response.status_code >= 400
+        assert nested_response.status_code < 500
+        assert nested_response.headers.get("location") is None
 
     anyio.run(exercise)
 

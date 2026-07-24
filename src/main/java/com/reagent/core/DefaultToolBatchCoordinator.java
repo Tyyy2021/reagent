@@ -134,7 +134,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                             call.name());
                     bus.publish(token, TaskEvent.Type.TOOL_RESULT, Map.of(
                             "id", call.id(), "name", call.name(),
-                            "result", "(被 force 取消中途打断,副作用是否生效未知=in-doubt)", "inDoubt", true));
+                            "outcome", "IN_DOUBT", "inDoubt", true));
                 } else {
                     ToolExecutionOutcome outcome = results.get(call.id());
                     if (outcome == null) {
@@ -158,7 +158,9 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                             faultContext(token, call));
                     context.addToolResult(call.id(), result);
                     bus.publish(token, TaskEvent.Type.TOOL_RESULT,
-                            Map.of("id", call.id(), "name", call.name(), "result", String.valueOf(result)));
+                            Map.of(
+                                    "id", call.id(), "name", call.name(),
+                                    "outcome", "DEFINITIVE"));
                 }
             } else if (reconciled.containsKey(call.id())) {
                 String message = reconciled.get(call.id());
@@ -168,7 +170,9 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         faultContext(token, call));
                 context.addToolResult(call.id(), message);
                 bus.publish(token, TaskEvent.Type.TOOL_RESULT,
-                        Map.of("id", call.id(), "name", call.name(), "result", message, "reconciled", true));
+                        Map.of(
+                                "id", call.id(), "name", call.name(),
+                                "outcome", "DEFINITIVE", "reconciled", true));
             } else if (inDoubt.containsKey(call.id())) {
                 String message = inDoubt.get(call.id());
                 stateStore.markInDoubt(token, call, message);
@@ -177,7 +181,9 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         faultContext(token, call));
                 context.addToolResult(call.id(), message);
                 bus.publish(token, TaskEvent.Type.TOOL_RESULT,
-                        Map.of("id", call.id(), "name", call.name(), "result", message, "inDoubt", true));
+                        Map.of(
+                                "id", call.id(), "name", call.name(),
+                                "outcome", "IN_DOUBT", "inDoubt", true));
             }
         }
         return recoveryRequired

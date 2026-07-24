@@ -1,5 +1,9 @@
 package com.reagent.tool;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.spi.ThrowableProxyUtil;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.ToolCall;
@@ -30,8 +34,10 @@ import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -40,6 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -166,6 +173,9 @@ class ToolExecutorTracingTest {
 
     @Test
     void remoteUnknownIsDistinctFromDefinitiveToolFailure() {
+        String resultSentinel = "MCP_RESULT_BODY_SECRET_SENTINEL";
+        String remoteCauseSentinel = "MCP_REMOTE_CAUSE_SECRET_SENTINEL";
+        String localCauseSentinel = "LOCAL_REMOTE_CAUSE_SECRET_SENTINEL";
         Tool localLookalike = new Tool() {
             @Override public String name() { return "local_lookalike"; }
             @Override public String description() { return "local"; }
@@ -177,7 +187,7 @@ class ToolExecutorTracingTest {
             }
             @Override public String execute(JsonNode args, ToolContext ctx) {
                 throw new RemoteOutcomeUnknownException(
-                        name(), new java.io.IOException("local lookalike"));
+                        name(), new java.io.IOException(localCauseSentinel));
             }
         };
         McpGateway unknownGateway = new McpGateway() {
@@ -198,8 +208,11 @@ class ToolExecutorTracingTest {
             @Override
             public McpCallResult call(
                     String serverId, String toolName, Map<String, Object> arguments) {
+                if ("return-result".equals(arguments.get("title"))) {
+                    return new McpCallResult(resultSentinel, false);
+                }
                 throw new RemoteOutcomeUnknownException(
-                        toolName, new java.io.IOException("remote connection lost"));
+                        toolName, new java.io.IOException(remoteCauseSentinel));
             }
 
             @Override
@@ -235,40 +248,65 @@ class ToolExecutorTracingTest {
                         .build()
                         .getTracer("test"));
         ToolContext context = new ToolContext("task-1", Path.of("."));
+        ListAppender<ILoggingEvent> logs = captureLogs(ToolExecutor.class);
+        try {
+            assertEquals(
+                    ToolExecutionOutcome.definitive(resultSentinel),
+                    executor.execute(
+                            catalog,
+                            new ToolCall(
+                                    "call-result",
+                                    remote.name(),
+                                    "{\"title\":\"return-result\"}"),
+                            context));
+            assertEquals(
+                    ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
+                    executor.execute(
+                                    catalog,
+                                    new ToolCall(
+                                            "call-unknown",
+                                            remote.name(),
+                                            "{\"title\":\"incident\"}"),
+                                    context)
+                            .kind());
+            assertEquals(
+                    ToolExecutionOutcome.Kind.DEFINITIVE,
+                    executor.execute(
+                                    catalog,
+                                    new ToolCall(
+                                            "call-local", localLookalike.name(), "{}"),
+                                    context)
+                            .kind());
 
-        assertEquals(
-                ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
-                executor.execute(
-                                catalog,
-                                new ToolCall(
-                                        "call-unknown",
-                                        remote.name(),
-                                        "{\"title\":\"incident\"}"),
-                                context)
-                        .kind());
-        assertEquals(
-                ToolExecutionOutcome.Kind.DEFINITIVE,
-                executor.execute(
-                                catalog,
-                                new ToolCall(
-                                        "call-local", localLookalike.name(), "{}"),
-                                context)
-                        .kind());
-
-        SpanData remoteSpan = exporter.getFinishedSpanItems().stream()
-                .filter(span -> span.getName().equals("execute_tool create_ticket"))
-                .findFirst()
-                .orElseThrow();
-        assertEquals("mcp:fake-ops", remoteSpan.getAttributes().get(Trace.TOOL_PROVIDER));
-        assertEquals("fake-ops", remoteSpan.getAttributes().get(Trace.MCP_SERVER));
-        assertEquals(
-                "REMOTE_OUTCOME_UNKNOWN",
-                remoteSpan.getAttributes().get(Trace.TOOL_OUTCOME));
-        assertTrue(remoteSpan.getAttributes().asMap().keySet().stream()
-                .noneMatch(key -> key.getKey().contains("argument")
-                        || key.getKey().contains("url")
-                        || key.getKey().contains("result")));
-        provider.close();
+            SpanData remoteSpan = exporter.getFinishedSpanItems().stream()
+                    .filter(span -> span.getName().equals("execute_tool create_ticket"))
+                    .filter(span -> "REMOTE_OUTCOME_UNKNOWN".equals(
+                            span.getAttributes().get(Trace.TOOL_OUTCOME)))
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals("mcp:fake-ops", remoteSpan.getAttributes().get(Trace.TOOL_PROVIDER));
+            assertEquals("fake-ops", remoteSpan.getAttributes().get(Trace.MCP_SERVER));
+            assertEquals(
+                    "REMOTE_OUTCOME_UNKNOWN",
+                    remoteSpan.getAttributes().get(Trace.TOOL_OUTCOME));
+            assertTrue(remoteSpan.getAttributes().asMap().keySet().stream()
+                    .noneMatch(key -> key.getKey().contains("argument")
+                            || key.getKey().contains("url")
+                            || key.getKey().contains("result")));
+            String exported = exporter.getFinishedSpanItems().stream()
+                    .map(span -> span.getAttributes() + " " + span.getEvents())
+                    .reduce("", (left, right) -> left + right);
+            assertFalse(exported.contains(resultSentinel));
+            assertFalse(exported.contains(remoteCauseSentinel));
+            assertFalse(exported.contains(localCauseSentinel));
+            String captured = capturedLogText(logs);
+            assertFalse(captured.contains(resultSentinel));
+            assertFalse(captured.contains(remoteCauseSentinel));
+            assertFalse(captured.contains(localCauseSentinel));
+        } finally {
+            detachLogs(ToolExecutor.class, logs);
+            provider.close();
+        }
     }
 
     @Test
@@ -344,61 +382,183 @@ class ToolExecutorTracingTest {
     }
 
     @Test
-    void outerTimeoutOfIdempotentMcpProviderIsUnknownWhileLocalSiblingIsDefinitive() {
+    void singleIdempotentMcpUsesFrozenDeadlineAndTimesOutAsUnknown() {
         ObjectMapper mapper = new ObjectMapper();
         ToolProperties toolProperties = new ToolProperties();
-        toolProperties.setTimeoutMs(50);
+        toolProperties.setTimeoutMs(5_000);
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicBoolean cancelled = new AtomicBoolean();
+        McpProperties properties = mcpProperties(
+                Duration.ofMillis(35),
+                Map.of("create_ticket", IdempotencyClass.IDEMPOTENT));
+        McpToolAdapter ticket = new McpToolAdapter(
+                blockingGateway(
+                        List.of(remoteTool("fake-ops", "create_ticket")),
+                        started,
+                        cancelled,
+                        250),
+                properties,
+                mapper,
+                "fake-ops",
+                "create_ticket");
+        TaskToolCatalog catalog = catalog(
+                mapper,
+                toolProperties,
+                properties,
+                List.of(ticket),
+                List.of("fake-ops"),
+                List.of(ticket.name()));
+        toolProperties.setTimeoutMs(10_000);
+        ToolExecutor executor = new ToolExecutor(
+                mapper,
+                toolProperties,
+                OpenTelemetrySdk.builder().build().getTracer("test"));
+
+        Map<String, ToolExecutionOutcome> outcomes = executor.executeConcurrently(
+                catalog,
+                List.of(new ToolCall(
+                        "call-ticket", "create_ticket", "{\"title\":\"incident\"}")),
+                new ToolContext("task-1", Path.of(".")));
+
+        assertTrue(awaitLatch(started));
+        assertEquals(35, catalog.snapshot("create_ticket").timeoutMs());
+        assertEquals(
+                ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
+                outcomes.get("call-ticket").kind());
+        assertTrue(cancelled.get());
+    }
+
+    @Test
+    void singleReadOnlyMcpUsesFrozenDeadlineAndTimesOutDefinitively() {
+        ObjectMapper mapper = new ObjectMapper();
+        ToolProperties toolProperties = new ToolProperties();
+        toolProperties.setTimeoutMs(5_000);
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicBoolean cancelled = new AtomicBoolean();
+        McpProperties properties = mcpProperties(
+                Duration.ofMillis(35),
+                Map.of("query_metrics", IdempotencyClass.READ_ONLY));
+        McpToolAdapter metrics = new McpToolAdapter(
+                blockingGateway(
+                        List.of(remoteTool("fake-ops", "query_metrics")),
+                        started,
+                        cancelled,
+                        250),
+                properties,
+                mapper,
+                "fake-ops",
+                "query_metrics");
+        TaskToolCatalog catalog = catalog(
+                mapper,
+                toolProperties,
+                properties,
+                List.of(metrics),
+                List.of("fake-ops"),
+                List.of(metrics.name()));
+        toolProperties.setTimeoutMs(10_000);
+        ToolExecutor executor = new ToolExecutor(
+                mapper,
+                toolProperties,
+                OpenTelemetrySdk.builder().build().getTracer("test"));
+
+        Map<String, ToolExecutionOutcome> outcomes = executor.executeConcurrently(
+                catalog,
+                List.of(new ToolCall("call-metrics", "query_metrics", "{}")),
+                new ToolContext("task-1", Path.of(".")));
+
+        assertTrue(awaitLatch(started));
+        assertEquals(35, catalog.snapshot("query_metrics").timeoutMs());
+        assertEquals(
+                ToolExecutionOutcome.Kind.DEFINITIVE,
+                outcomes.get("call-metrics").kind());
+        assertTrue(outcomes.get("call-metrics").content().contains(">35ms"));
+        assertTrue(cancelled.get());
+    }
+
+    @Test
+    void singleLocalToolUsesFrozenLocalDeadlineAfterGlobalConfigurationChanges() {
+        ObjectMapper mapper = new ObjectMapper();
+        ToolProperties toolProperties = new ToolProperties();
+        toolProperties.setTimeoutMs(35);
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicBoolean cancelled = new AtomicBoolean();
+        Tool local = throwingTool("local_slow", () -> {
+            started.countDown();
+            try {
+                new CountDownLatch(1).await(250, TimeUnit.MILLISECONDS);
+                return "unexpected";
+            } catch (InterruptedException ex) {
+                cancelled.set(true);
+                Thread.currentThread().interrupt();
+                return "cancelled";
+            }
+        });
+        TaskToolCatalog catalog = catalog(
+                mapper,
+                toolProperties,
+                null,
+                List.of(local),
+                List.of(),
+                List.of(local.name()));
+        toolProperties.setTimeoutMs(10_000);
+        ToolExecutor executor = new ToolExecutor(
+                mapper,
+                toolProperties,
+                OpenTelemetrySdk.builder().build().getTracer("test"));
+
+        Map<String, ToolExecutionOutcome> outcomes = executor.executeConcurrently(
+                catalog,
+                List.of(new ToolCall("call-local", local.name(), "{}")),
+                new ToolContext("task-1", Path.of(".")));
+
+        assertTrue(awaitLatch(started));
+        assertEquals(35, catalog.snapshot(local.name()).timeoutMs());
+        assertEquals(
+                ToolExecutionOutcome.Kind.DEFINITIVE,
+                outcomes.get("call-local").kind());
+        assertTrue(outcomes.get("call-local").content().contains(">35ms"));
+        assertTrue(cancelled.get());
+    }
+
+    @Test
+    void concurrentCallsUseIndependentFrozenDeadlinesMeasuredFromSubmission() {
+        ObjectMapper mapper = new ObjectMapper();
+        ToolProperties toolProperties = new ToolProperties();
+        toolProperties.setTimeoutMs(200);
+        CountDownLatch localStarted = new CountDownLatch(1);
         CountDownLatch remoteStarted = new CountDownLatch(1);
         AtomicBoolean remoteCancelled = new AtomicBoolean();
-        McpGateway gateway = new McpGateway() {
-            @Override
-            public List<McpRemoteTool> discover(String serverId) {
-                return List.of(new McpRemoteTool(
-                        serverId,
-                        "create_ticket",
-                        "ticket",
-                        Map.of(
-                                "type", "object",
-                                "properties", Map.of(
-                                        "title", Map.of("type", "string"),
-                                        "idempotency_key", Map.of("type", "string")),
-                                "required", List.of("title", "idempotency_key"))));
+        McpProperties properties = mcpProperties(
+                Duration.ofMillis(30),
+                Map.of("create_ticket", IdempotencyClass.IDEMPOTENT));
+        McpToolAdapter ticket = new McpToolAdapter(
+                blockingGateway(
+                        List.of(remoteTool("fake-ops", "create_ticket")),
+                        remoteStarted,
+                        remoteCancelled,
+                        300),
+                properties,
+                mapper,
+                "fake-ops",
+                "create_ticket");
+        Tool local = throwingTool("local_leader", () -> {
+            localStarted.countDown();
+            if (!remoteStarted.await(1, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("remote tool did not start");
             }
-
-            @Override
-            public McpCallResult call(
-                    String serverId, String toolName, Map<String, Object> arguments) {
-                remoteStarted.countDown();
-                try {
-                    new CountDownLatch(1).await(2, TimeUnit.SECONDS);
-                    return new McpCallResult("unexpected", false);
-                } catch (InterruptedException ex) {
-                    remoteCancelled.set(true);
-                    Thread.currentThread().interrupt();
-                    throw new RemoteOutcomeUnknownException(toolName, ex);
-                }
-            }
-
-            @Override
-            public void close() {}
-        };
-        McpProperties properties = mcpProperties();
-        McpToolAdapter ticket =
-                new McpToolAdapter(gateway, properties, mapper, "fake-ops", "create_ticket");
-        Tool local = new FakeTool("local");
-        ToolCatalogResolver resolver = new ToolCatalogResolver(
-                new ToolRegistry(List.of(ticket, local)),
-                new SchemaHasher(mapper),
+            new CountDownLatch(1).await(100, TimeUnit.MILLISECONDS);
+            return "local-ok";
+        });
+        TaskToolCatalog catalog = catalog(
+                mapper,
                 toolProperties,
-                properties);
-        TaskToolCatalog catalog = resolver.resolve(resolver.snapshot(new AgentProfileDefinition(
-                "mcp-timeout",
-                "v1",
-                "system",
-                null,
-                null,
+                properties,
+                List.of(local, ticket),
                 List.of("fake-ops"),
-                List.of(ticket.name(), local.name()))));
+                List.of(local.name(), ticket.name()));
+        assertEquals(200, catalog.snapshot(local.name()).timeoutMs());
+        assertEquals(30, catalog.snapshot(ticket.name()).timeoutMs());
+        toolProperties.setTimeoutMs(5_000);
         ToolExecutor executor = new ToolExecutor(
                 mapper,
                 toolProperties,
@@ -407,17 +567,21 @@ class ToolExecutorTracingTest {
         Map<String, ToolExecutionOutcome> outcomes = executor.executeConcurrently(
                 catalog,
                 List.of(
-                        new ToolCall("call-ticket", "create_ticket", "{\"title\":\"incident\"}"),
-                        new ToolCall("call-local", "local", "{}")),
+                        new ToolCall("call-local", local.name(), "{}"),
+                        new ToolCall(
+                                "call-ticket",
+                                "create_ticket",
+                                "{\"title\":\"incident\"}")),
                 new ToolContext("task-1", Path.of(".")));
 
+        assertTrue(awaitLatch(localStarted));
         assertTrue(awaitLatch(remoteStarted));
+        assertEquals(
+                ToolExecutionOutcome.definitive("local-ok"),
+                outcomes.get("call-local"));
         assertEquals(
                 ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
                 outcomes.get("call-ticket").kind());
-        assertEquals(
-                ToolExecutionOutcome.definitive("ok:local"),
-                outcomes.get("call-local"));
         assertTrue(remoteCancelled.get());
     }
 
@@ -434,17 +598,96 @@ class ToolExecutorTracingTest {
         };
     }
 
+    private static TaskToolCatalog catalog(
+            ObjectMapper mapper,
+            ToolProperties toolProperties,
+            McpProperties mcpProperties,
+            List<Tool> tools,
+            List<String> serverIds,
+            List<String> toolNames) {
+        ToolCatalogResolver resolver = new ToolCatalogResolver(
+                new ToolRegistry(tools),
+                new SchemaHasher(mapper),
+                toolProperties,
+                mcpProperties);
+        return resolver.resolve(resolver.snapshot(new AgentProfileDefinition(
+                "timeout-test",
+                "v1",
+                "system",
+                null,
+                null,
+                serverIds,
+                toolNames)));
+    }
+
+    private static McpGateway blockingGateway(
+            List<McpRemoteTool> remoteTools,
+            CountDownLatch started,
+            AtomicBoolean cancelled,
+            long fallbackMs) {
+        return new McpGateway() {
+            @Override
+            public List<McpRemoteTool> discover(String serverId) {
+                return remoteTools;
+            }
+
+            @Override
+            public McpCallResult call(
+                    String serverId, String toolName, Map<String, Object> arguments) {
+                started.countDown();
+                try {
+                    new CountDownLatch(1).await(fallbackMs, TimeUnit.MILLISECONDS);
+                    return new McpCallResult("unexpected", false);
+                } catch (InterruptedException ex) {
+                    cancelled.set(true);
+                    Thread.currentThread().interrupt();
+                    throw new RemoteOutcomeUnknownException(toolName, ex);
+                }
+            }
+
+            @Override
+            public void close() {}
+        };
+    }
+
+    private static McpRemoteTool remoteTool(String serverId, String toolName) {
+        return new McpRemoteTool(
+                serverId,
+                toolName,
+                toolName,
+                Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "title", Map.of("type", "string"),
+                                "idempotency_key", Map.of("type", "string")),
+                        "required", List.of("title", "idempotency_key")));
+    }
+
     private static McpProperties mcpProperties() {
-        McpProperties.ToolPolicy ticketPolicy = new McpProperties.ToolPolicy();
-        ticketPolicy.setIdempotencyClass(IdempotencyClass.IDEMPOTENT);
-        ticketPolicy.setApprovalPolicy(ApprovalPolicy.REQUIRE_APPROVAL);
+        return mcpProperties(
+                Duration.ofSeconds(3),
+                Map.of("create_ticket", IdempotencyClass.IDEMPOTENT));
+    }
+
+    private static McpProperties mcpProperties(
+            Duration requestTimeout, Map<String, IdempotencyClass> toolClasses) {
         McpProperties.Server server = new McpProperties.Server();
         server.setBaseUrl("http://localhost:8090");
         server.setEndpoint("/mcp");
-        server.setConnectTimeout(java.time.Duration.ofMillis(500));
-        server.setRequestTimeout(java.time.Duration.ofSeconds(3));
+        server.setConnectTimeout(Duration.ofMillis(500));
+        server.setRequestTimeout(requestTimeout);
         server.setMaximumResponseBytes(65_536);
-        server.setTools(Map.of("create_ticket", ticketPolicy));
+        Map<String, McpProperties.ToolPolicy> policies = new java.util.LinkedHashMap<>();
+        toolClasses.forEach((name, idempotency) -> {
+            McpProperties.ToolPolicy policy = new McpProperties.ToolPolicy();
+            policy.setIdempotencyClass(idempotency);
+            policy.setApprovalPolicy(
+                    idempotency == IdempotencyClass.IDEMPOTENT
+                            ? ApprovalPolicy.REQUIRE_APPROVAL
+                            : ApprovalPolicy.NONE);
+            policies.put(name, policy);
+        });
+        server.setTools(policies);
         McpProperties properties = new McpProperties();
         properties.setServers(Map.of("fake-ops", server));
         properties.validate();
@@ -458,6 +701,30 @@ class ToolExecutorTracingTest {
             Thread.currentThread().interrupt();
             return false;
         }
+    }
+
+    private static ListAppender<ILoggingEvent> captureLogs(Class<?> type) {
+        Logger logger = (Logger) LoggerFactory.getLogger(type);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void detachLogs(Class<?> type, ListAppender<ILoggingEvent> appender) {
+        ((Logger) LoggerFactory.getLogger(type)).detachAppender(appender);
+        appender.stop();
+    }
+
+    private static String capturedLogText(ListAppender<ILoggingEvent> appender) {
+        StringBuilder captured = new StringBuilder();
+        for (ILoggingEvent event : appender.list) {
+            captured.append(event.getFormattedMessage());
+            if (event.getThrowableProxy() != null) {
+                captured.append(ThrowableProxyUtil.asString(event.getThrowableProxy()));
+            }
+        }
+        return captured.toString();
     }
 
     @FunctionalInterface

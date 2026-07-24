@@ -15,7 +15,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "reagent.mcp")
 public class McpProperties implements InitializingBean {
 
-    static final int MAX_RESPONSE_BYTES = 1_048_576;
+    static final int MAX_RESPONSE_BYTES = 65_536;
     static final Duration MAX_TIMEOUT = Duration.ofSeconds(60);
     static final Pattern LEGAL_ID = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
     private Map<String, Server> servers = new LinkedHashMap<>();

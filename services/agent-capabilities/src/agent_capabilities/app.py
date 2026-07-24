@@ -64,6 +64,7 @@ def create_app(
     tracker = acceptance_tracker or AcceptanceTracker()
     mcp = create_mcp(fake_ops_state, fault_gate, tracker)
     mcp_app = mcp.streamable_http_app()
+    mcp_app.router.redirect_slashes = False
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncGenerator[None, None]:

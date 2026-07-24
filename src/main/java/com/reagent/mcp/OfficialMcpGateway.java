@@ -48,6 +48,18 @@ public final class OfficialMcpGateway implements McpGateway {
     private static final int MAX_DESCRIPTION_CODE_POINTS = 4_096;
     private static final int MAX_SCHEMA_DEPTH = 32;
     private static final int MAX_PROPERTIES_PER_OBJECT = 128;
+    private static final Set<String> SCHEMA_MAP_POSITIONS = Set.of(
+            "$defs", "definitions", "dependentSchemas", "patternProperties");
+    private static final Set<String> SCHEMA_LIST_POSITIONS = Set.of(
+            "allOf", "anyOf", "oneOf", "prefixItems");
+    private static final Set<String> SCHEMA_OBJECT_POSITIONS = Set.of(
+            "contains", "contentSchema", "else", "if", "items", "not",
+            "propertyNames", "then");
+    private static final Set<String> BOOLEAN_OR_SCHEMA_POSITIONS = Set.of(
+            "additionalItems", "additionalProperties",
+            "unevaluatedItems", "unevaluatedProperties");
+    private static final Set<String> JSON_SCHEMA_TYPES = Set.of(
+            "array", "boolean", "integer", "null", "number", "object", "string");
 
     private final McpProperties properties;
     private final ObjectMapper mapper;
@@ -328,26 +340,130 @@ public final class OfficialMcpGateway implements McpGateway {
         if (!"object".equals(schema.get("type"))) {
             throw new McpContractException("MCP tool Schema root type must be object");
         }
-        Object propertiesValue = schema.get("properties");
-        if (propertiesValue != null && !(propertiesValue instanceof Map<?, ?>)) {
-            throw new McpContractException("MCP Schema properties must be an object");
+        validateSchemaObject(schema);
+    }
+
+    private void validateSchemaObject(Map<?, ?> schema) {
+        if (schema.containsKey("type")) {
+            validateSchemaType(schema.get("type"));
         }
-        if (schema.get("required") instanceof List<?> required) {
-            Set<String> propertyNames = propertiesValue instanceof Map<?, ?> propertyMap
-                    ? new HashSet<>(propertyMap.keySet().stream()
-                            .filter(String.class::isInstance)
-                            .map(String.class::cast)
-                            .toList())
-                    : Set.of();
+
+        Map<?, ?> properties = Map.of();
+        if (schema.containsKey("properties")) {
+            Object propertiesValue = schema.get("properties");
+            if (!(propertiesValue instanceof Map<?, ?> propertyMap)) {
+                throw new McpContractException("MCP Schema properties must be an object");
+            }
+            properties = propertyMap;
+            propertyMap.forEach((name, child) -> {
+                if (!(child instanceof Map<?, ?> childSchema)) {
+                    throw new McpContractException(
+                            "MCP Schema property value must be a Schema object");
+                }
+                validateSchemaObject(childSchema);
+            });
+        }
+
+        if (schema.containsKey("required")) {
+            Object requiredValue = schema.get("required");
+            if (!(requiredValue instanceof List<?> required)) {
+                throw new McpContractException("MCP Schema required must be an array");
+            }
+            Set<String> seen = new HashSet<>();
             for (Object name : required) {
-                if (!(name instanceof String text) || !propertyNames.contains(text)) {
+                if (!(name instanceof String text)
+                        || !seen.add(text)
+                        || !properties.containsKey(text)) {
                     throw new McpContractException(
                             "MCP Schema required property is malformed");
                 }
             }
-        } else if (schema.containsKey("required")) {
-            throw new McpContractException("MCP Schema required must be an array");
         }
+
+        for (String position : BOOLEAN_OR_SCHEMA_POSITIONS) {
+            if (!schema.containsKey(position)) {
+                continue;
+            }
+            Object value = schema.get(position);
+            if (value instanceof Boolean) {
+                continue;
+            }
+            if (!(value instanceof Map<?, ?> childSchema)) {
+                throw new McpContractException(
+                        "MCP Schema " + position + " must be boolean or a Schema object");
+            }
+            validateSchemaObject(childSchema);
+        }
+
+        for (String position : SCHEMA_OBJECT_POSITIONS) {
+            if (!schema.containsKey(position)) {
+                continue;
+            }
+            Object value = schema.get(position);
+            if (!(value instanceof Map<?, ?> childSchema)) {
+                throw new McpContractException(
+                        "MCP Schema " + position + " must be a Schema object");
+            }
+            validateSchemaObject(childSchema);
+        }
+
+        for (String position : SCHEMA_LIST_POSITIONS) {
+            if (!schema.containsKey(position)) {
+                continue;
+            }
+            Object value = schema.get(position);
+            if (!(value instanceof List<?> children)) {
+                throw new McpContractException(
+                        "MCP Schema " + position + " must be an array");
+            }
+            for (Object child : children) {
+                if (!(child instanceof Map<?, ?> childSchema)) {
+                    throw new McpContractException(
+                            "MCP Schema " + position + " entries must be Schema objects");
+                }
+                validateSchemaObject(childSchema);
+            }
+        }
+
+        for (String position : SCHEMA_MAP_POSITIONS) {
+            if (!schema.containsKey(position)) {
+                continue;
+            }
+            Object value = schema.get(position);
+            if (!(value instanceof Map<?, ?> children)) {
+                throw new McpContractException(
+                        "MCP Schema " + position + " must be an object");
+            }
+            children.forEach((name, child) -> {
+                if (!(child instanceof Map<?, ?> childSchema)) {
+                    throw new McpContractException(
+                            "MCP Schema " + position + " values must be Schema objects");
+                }
+                validateSchemaObject(childSchema);
+            });
+        }
+    }
+
+    private static void validateSchemaType(Object value) {
+        if (value instanceof String type) {
+            if (JSON_SCHEMA_TYPES.contains(type)) {
+                return;
+            }
+            throw new McpContractException("MCP Schema type name is invalid");
+        }
+        if (value instanceof List<?> types && !types.isEmpty()) {
+            Set<String> seen = new HashSet<>();
+            for (Object type : types) {
+                if (!(type instanceof String text)
+                        || !JSON_SCHEMA_TYPES.contains(text)
+                        || !seen.add(text)) {
+                    throw new McpContractException("MCP Schema type array is malformed");
+                }
+            }
+            return;
+        }
+        throw new McpContractException(
+                "MCP Schema type must be a string or non-empty string array");
     }
 
     private void requireBoundedJson(Object value, int maximumBytes, String message) {
@@ -411,11 +527,13 @@ public final class OfficialMcpGateway implements McpGateway {
     }
 
     private static boolean isTransportFailure(Throwable failure) {
+        if (hasDefinitiveProtocolCause(failure)) {
+            return false;
+        }
         Throwable current = failure;
         Set<Throwable> seen = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         while (current != null && seen.add(current)) {
-            if (current instanceof McpTransportException
-                    || current instanceof McpTransportSessionClosedException
+            if (current instanceof McpTransportSessionClosedException
                     || current instanceof McpTransportSessionNotFoundException
                     || current instanceof HttpTimeoutException
                     || current instanceof ConnectException
@@ -429,8 +547,24 @@ public final class OfficialMcpGateway implements McpGateway {
         return false;
     }
 
+    private static boolean hasDefinitiveProtocolCause(Throwable failure) {
+        Throwable current = failure;
+        Set<Throwable> seen = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        while (current != null && seen.add(current)) {
+            if (current instanceof McpContractException
+                    || current instanceof McpError
+                    || current instanceof JsonProcessingException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
     private static String unavailableReason(RuntimeException failure) {
-        if (failure instanceof McpContractException) {
+        if (hasDefinitiveProtocolCause(failure)
+                || failure instanceof McpTransportException
+                        && failure.getCause() == null) {
             return "contract unavailable";
         }
         return "transport unavailable";

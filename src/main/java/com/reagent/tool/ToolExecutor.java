@@ -22,11 +22,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Function;
 
 /**
  * 工具执行器。负责:找到工具 -> 解析参数 -> 执行 -> 把异常兜成可读结果。
@@ -90,12 +90,11 @@ public class ToolExecutor {
                 JsonNode args = mapper.readTree(rawArgs);
                 // 绑定本次调用的 idempotencyKey(=tool_call_id),供 run_command 等把 key 下推给副作用做幂等
                 String result = tool.execute(args, ctx.forCall(call.id()));
-                log.info("工具返回: {} -> {}", call.name(), preview(result));
+                log.info("工具完成: {}", call.name());
                 return withOutcome(span, ToolExecutionOutcome.definitive(result));
             } catch (InjectedWorkerCrashException | FencedExecutionException fatal) {
                 throw fatal;
             } catch (RemoteOutcomeUnknownException unknown) {
-                span.recordException(unknown);
                 span.setStatus(StatusCode.ERROR, "remote outcome unknown");
                 if (isIdempotentMcp(snapshot)) {
                     return withOutcome(
@@ -105,9 +104,8 @@ public class ToolExecutor {
                 return withOutcome(span, ToolExecutionOutcome.definitive(
                         "工具 '" + call.name() + "' 执行失败:remote outcome unavailable"));
             } catch (Exception e) {
-                span.recordException(e);
-                span.setStatus(StatusCode.ERROR);
-                log.warn("工具 '{}' 执行失败: {}", call.name(), e.toString());
+                span.setStatus(StatusCode.ERROR, "tool execution failed");
+                log.warn("工具 '{}' 执行失败", call.name());
                 return withOutcome(span, ToolExecutionOutcome.definitive(
                         "工具 '" + call.name() + "' 执行失败:" + e.getMessage()));
             }
@@ -131,21 +129,26 @@ public class ToolExecutor {
     /** Execute a batch only through the task's frozen allowlist. */
     public Map<String, ToolExecutionOutcome> executeConcurrently(
             TaskToolCatalog catalog, List<ToolCall> calls, ToolContext ctx) {
-        return executeConcurrently(
-                calls,
-                call -> execute(catalog, call, ctx),
-                call -> isIdempotentMcp(catalog.snapshot(call.name())));
-    }
-
-    private Map<String, ToolExecutionOutcome> executeConcurrently(
-            List<ToolCall> calls,
-            Function<ToolCall, ToolExecutionOutcome> execution,
-            Function<ToolCall, Boolean> unknownOnTimeout) {
         Map<String, ToolExecutionOutcome> results = new LinkedHashMap<>();
+        Context otelContext = Context.current();
 
         if (calls.size() <= 1 || !props.isConcurrent()) {
-            for (ToolCall c : calls) {
-                results.put(c.id(), execution.apply(c));   // 串行:同线程,execute_tool span 自动挂当前 step span
+            try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+                for (ToolCall call : calls) {
+                    PendingExecution pending =
+                            submit(pool, otelContext, catalog, call, ctx);
+                    try {
+                        results.put(
+                                call.id(),
+                                await(
+                                        call,
+                                        pending,
+                                        isIdempotentMcp(catalog.snapshot(call.name()))));
+                    } catch (InjectedWorkerCrashException | FencedExecutionException fatal) {
+                        pending.future().cancel(true);
+                        throw fatal;
+                    }
+                }
             }
             return results;
         }
@@ -153,24 +156,26 @@ public class ToolExecutor {
         // M6:OTel context 是 ThreadLocal,跨不过下面 pool.submit 的虚拟线程边界 —— 提交【前】捕获当前 context
         // (此刻 = step span),在每个工具线程里 makeCurrent 恢复,execute 开的 execute_tool span 才会正确挂到
         // step span 下。这与当初 ToolContext 选「显式捕获传参而非 ThreadLocal」是同一问题、同一解法。
-        Context otelContext = Context.current();
         // JDK21:每任务一根虚拟线程;try-with-resources 关闭时等所有任务结束
         try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
-            Map<ToolCall, Future<ToolExecutionOutcome>> futures = new LinkedHashMap<>();
-            for (ToolCall c : calls) {
-                futures.put(c, pool.submit(() -> {
-                    try (Scope ignored = otelContext.makeCurrent()) {
-                        return execution.apply(c);
-                    }
-                }));
+            Map<ToolCall, PendingExecution> pendingExecutions = new LinkedHashMap<>();
+            for (ToolCall call : calls) {
+                pendingExecutions.put(
+                        call, submit(pool, otelContext, catalog, call, ctx));
             }
-            for (Map.Entry<ToolCall, Future<ToolExecutionOutcome>> e : futures.entrySet()) {
-                ToolCall c = e.getKey();
+            for (Map.Entry<ToolCall, PendingExecution> entry
+                    : pendingExecutions.entrySet()) {
+                ToolCall call = entry.getKey();
                 try {
-                    results.put(c.id(), await(
-                            c, e.getValue(), Boolean.TRUE.equals(unknownOnTimeout.apply(c))));
+                    results.put(
+                            call.id(),
+                            await(
+                                    call,
+                                    entry.getValue(),
+                                    isIdempotentMcp(catalog.snapshot(call.name()))));
                 } catch (InjectedWorkerCrashException | FencedExecutionException fatal) {
-                    futures.values().forEach(future -> future.cancel(true));
+                    pendingExecutions.values().forEach(
+                            pending -> pending.future().cancel(true));
                     throw fatal;
                 }
             }
@@ -178,19 +183,54 @@ public class ToolExecutor {
         return results;
     }
 
+    private PendingExecution submit(
+            ExecutorService pool,
+            Context otelContext,
+            TaskToolCatalog catalog,
+            ToolCall call,
+            ToolContext toolContext) {
+        ToolSnapshot snapshot = catalog.snapshot(call.name());
+        long timeoutMs = snapshot == null ? -1 : snapshot.timeoutMs();
+        long submittedAt = System.nanoTime();
+        long deadlineNanos = timeoutMs < 0
+                ? Long.MAX_VALUE
+                : deadlineNanos(submittedAt, timeoutMs);
+        Future<ToolExecutionOutcome> future = pool.submit(() -> {
+            try (Scope ignored = otelContext.makeCurrent()) {
+                return execute(catalog, call, toolContext);
+            }
+        });
+        return new PendingExecution(future, timeoutMs, deadlineNanos);
+    }
+
+    private static long deadlineNanos(long submittedAt, long timeoutMs) {
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        try {
+            return Math.addExact(submittedAt, timeoutNanos);
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
     /** 等单个工具的结果,带超时;超时/异常都兜成可读结果回给模型。 */
     private ToolExecutionOutcome await(
-            ToolCall call, Future<ToolExecutionOutcome> future, boolean unknownOnTimeout) {
+            ToolCall call, PendingExecution pending, boolean unknownOnTimeout) {
+        Future<ToolExecutionOutcome> future = pending.future();
         try {
-            return future.get(props.getTimeoutMs(), TimeUnit.MILLISECONDS);
+            if (pending.deadlineNanos() == Long.MAX_VALUE) {
+                return future.get();
+            }
+            long remainingNanos = Math.max(
+                    0, pending.deadlineNanos() - System.nanoTime());
+            return future.get(remainingNanos, TimeUnit.NANOSECONDS);
         } catch (TimeoutException te) {
             future.cancel(true);  // 中断该工具线程(真正的硬杀留给子进程/Docker 沙箱那层)
-            log.warn("工具 '{}' 执行超过 {}ms,已中断", call.name(), props.getTimeoutMs());
+            log.warn("工具 '{}' 执行超过 {}ms,已中断", call.name(), pending.timeoutMs());
             if (unknownOnTimeout) {
                 return ToolExecutionOutcome.remoteOutcomeUnknown(boundedUnknown(call));
             }
             return ToolExecutionOutcome.definitive(
-                    "错误:工具 '" + call.name() + "' 执行超时(>" + props.getTimeoutMs()
+                    "错误:工具 '" + call.name() + "' 执行超时(>" + pending.timeoutMs()
                             + "ms),已被中断。");
         } catch (ExecutionException ee) {
             Throwable cause = ee.getCause();
@@ -213,6 +253,9 @@ public class ToolExecutor {
         }
     }
 
+    private record PendingExecution(
+            Future<ToolExecutionOutcome> future, long timeoutMs, long deadlineNanos) {}
+
     private static boolean isIdempotentMcp(ToolSnapshot snapshot) {
         return snapshot != null
                 && snapshot.provider().startsWith("mcp:")
@@ -227,10 +270,5 @@ public class ToolExecutor {
             Span span, ToolExecutionOutcome outcome) {
         span.setAttribute(Trace.TOOL_OUTCOME, outcome.kind().name());
         return outcome;
-    }
-
-    private static String preview(String s) {
-        if (s == null) return "";
-        return s.length() > 200 ? s.substring(0, 200) + " ...(省略)" : s;
     }
 }
