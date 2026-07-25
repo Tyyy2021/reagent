@@ -12,8 +12,12 @@
 
 - Work only in `/root/reagent/.worktrees/reagent-rag-mcp` on branch
   `feature/reagent-rag-mcp-interview`.
-- Dispatch base must be exact clean
+- Approved design baseline is exact
   `2a302b252c5fd511c91c01b9acfe26d4f6f2a101`.
+- Before Task 1 dispatch, the controller must record the current clean,
+  docs-only HEAD in this plan's ignored ledger as
+  `Dispatch base: <40-character SHA>`. That frozen SHA is the Cycle 3
+  implementation base and governs every exact product/test scope diff.
 - Binding specification:
   `docs/superpowers/specs/2026-07-25-task-9-final-review-cycle-3-design.md`,
   257 lines, SHA-256
@@ -110,6 +114,8 @@ No other production or test path is allowed in Cycle 3.
   `.superpowers/sdd/task-9-resume-brief.md`
 - Read:
   `.superpowers/sdd/task-9-review-fix-brief.md`
+- Read:
+  `.superpowers/sdd/2026-07-25-task-9-final-review-cycle-3/progress.md`
 - Modify evidence only:
   `.superpowers/sdd/task-9-report.md`
 - Modify evidence only:
@@ -117,8 +123,8 @@ No other production or test path is allowed in Cycle 3.
 
 **Interfaces:**
 
-- Consumes: exact clean design commit
-  `2a302b252c5fd511c91c01b9acfe26d4f6f2a101`.
+- Consumes: the exact clean docs-only dispatch base frozen in this plan's
+  ignored ledger after the approved design and implementation plan.
 - Produces: verified 17-test behavioral baseline and unchanged product scope.
 
 - [ ] **Step 1: Read all binding inputs**
@@ -144,7 +150,7 @@ Expected:
 ```text
 /root/reagent/.worktrees/reagent-rag-mcp
 feature/reagent-rag-mcp-interview
-2a302b252c5fd511c91c01b9acfe26d4f6f2a101
+the exact 40-character SHA recorded by the ledger's "Dispatch base:" line
 branch header only
 no diff-check output
 ```
@@ -1147,7 +1153,9 @@ unrelated production.
 Run:
 
 ```bash
-git diff --name-only 2a302b252c5fd511c91c01b9acfe26d4f6f2a101..HEAD -- \
+dispatch_base=$(sed -n 's/^Dispatch base: //p' \
+  .superpowers/sdd/2026-07-25-task-9-final-review-cycle-3/progress.md)
+git diff --name-only "${dispatch_base}"..HEAD -- \
   services/agent-capabilities
 docker image inspect reagent-agent-capabilities:task9
 ```
@@ -1300,10 +1308,12 @@ BUILD SUCCESS
 Run:
 
 ```bash
+dispatch_base=$(sed -n 's/^Dispatch base: //p' \
+  .superpowers/sdd/2026-07-25-task-9-final-review-cycle-3/progress.md)
 git diff --check \
-  2a302b252c5fd511c91c01b9acfe26d4f6f2a101..HEAD
+  "${dispatch_base}"..HEAD
 git diff --name-status \
-  2a302b252c5fd511c91c01b9acfe26d4f6f2a101..HEAD
+  "${dispatch_base}"..HEAD
 git status --short --branch
 ```
 
@@ -1353,7 +1363,7 @@ Use the provided script:
 review_head=$(git rev-parse --short HEAD)
 review_path=".superpowers/sdd/review-task-9-19c7ae4..${review_head}.diff"
 bash /root/.codex/plugins/cache/openai-curated-remote/superpowers/6.2.0/skills/subagent-driven-development/scripts/review-package \
-  docs/superpowers/plans/2026-07-19-reagent-mcp-incident.md \
+  docs/superpowers/plans/2026-07-25-task-9-final-review-cycle-3.md \
   19c7ae4c8907f8ac16d0e7b1e23f45c6655f01cd \
   HEAD \
   "${review_path}"
