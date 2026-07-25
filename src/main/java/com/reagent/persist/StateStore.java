@@ -37,6 +37,13 @@ import java.util.Optional;
 @Service
 public class StateStore {
 
+    private static final String TOOL_CALL_ID_ALREADY_EXISTS =
+            "Tool call id already exists";
+    private static final String TOOL_CALL_OWNERSHIP_MISMATCH =
+            "Tool call id belongs to another task";
+    private static final String TOOL_CALL_IDENTITY_MISMATCH =
+            "Tool call identity does not match ledger";
+
     private final TaskRepository taskRepo;
     private final MessageRepository messageRepo;
     private final ToolCallRepository toolCallRepo;
@@ -268,20 +275,29 @@ public class StateStore {
         List<ToolCall> parsedCalls = rawToolCalls == null
                 ? List.of()
                 : ToolCall.parseAssistantToolCalls(rawToolCalls);
-        String toolCallsJson = rawToolCalls == null ? null : toJson(rawToolCalls);
-
-        Map<String, ToolCall> callsToCreate = new LinkedHashMap<>();
         for (ToolCall call : parsedCalls) {
-            // 先校验整批 call 的任务归属,再落 assistant 消息:外任务同 ID 必须在任何持久化之前 fail closed。
-            if (ownedToolCall(task.getId(), call.id()).isEmpty()) {
-                callsToCreate.put(call.id(), call);
+            if (toolCallRepo.findById(call.id()).isPresent()) {
+                throw new IllegalStateException(
+                        TOOL_CALL_ID_ALREADY_EXISTS);
             }
         }
-        int sequence = appendMessage(task.getId(), "assistant", content, toolCallsJson, null, now);
-        List<ToolCallEntity> ledgerRows = callsToCreate.values().stream()
+        String toolCallsJson = rawToolCalls == null ? null : toJson(rawToolCalls);
+
+        int sequence = appendMessage(
+                task.getId(),
+                "assistant",
+                content,
+                toolCallsJson,
+                null,
+                now);
+        List<ToolCallEntity> ledgerRows = parsedCalls.stream()
                 .map(call -> new ToolCallEntity(
-                        call.id(), task.getId(), call.name(), call.arguments(),
-                        now, sequence))
+                        call.id(),
+                        task.getId(),
+                        call.name(),
+                        call.arguments(),
+                        now,
+                        sequence))
                 .toList();
         toolCallRepo.saveAll(ledgerRows);
         return sequence;
@@ -296,7 +312,7 @@ public class StateStore {
     public void markInProgress(TaskRunToken token, ToolCall call) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
-        ToolCallEntity e = ownedToolCall(task.getId(), call.id())
+        ToolCallEntity e = matchingOwnedToolCall(task.getId(), call)
                 .orElseGet(() -> new ToolCallEntity(
                         call.id(), task.getId(), call.name(), call.arguments(), now));
         e.markInProgress(now);
@@ -311,7 +327,7 @@ public class StateStore {
     public void recordToolResult(TaskRunToken token, ToolCall call, String result) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
-        ToolCallEntity e = ownedToolCall(task.getId(), call.id())
+        ToolCallEntity e = matchingOwnedToolCall(task.getId(), call)
                 .orElseGet(() -> new ToolCallEntity(
                         call.id(), task.getId(), call.name(), call.arguments(), now));
         e.markDone(result, now);
@@ -327,7 +343,7 @@ public class StateStore {
     public void markInDoubt(TaskRunToken token, ToolCall call, String result) {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
-        ToolCallEntity e = ownedToolCall(task.getId(), call.id())
+        ToolCallEntity e = matchingOwnedToolCall(task.getId(), call)
                 .orElseGet(() -> new ToolCallEntity(
                         call.id(), task.getId(), call.name(), call.arguments(), now));
         e.markInDoubt(result, now);
@@ -383,7 +399,22 @@ public class StateStore {
         Optional<ToolCallEntity> existing = toolCallRepo.findById(toolCallId);
         if (existing.isPresent() && !taskId.equals(existing.orElseThrow().getTaskId())) {
             throw new IllegalStateException(
-                    "tool_call_id 已属于其它任务: " + toolCallId + ", 当前任务: " + taskId);
+                    TOOL_CALL_OWNERSHIP_MISMATCH);
+        }
+        return existing;
+    }
+
+    private Optional<ToolCallEntity> matchingOwnedToolCall(
+            String taskId, ToolCall call) {
+        Optional<ToolCallEntity> existing =
+                ownedToolCall(taskId, call.id());
+        if (existing.isPresent()) {
+            ToolCallEntity row = existing.orElseThrow();
+            if (!call.name().equals(row.getToolName())
+                    || !call.arguments().equals(row.getArguments())) {
+                throw new IllegalStateException(
+                        TOOL_CALL_IDENTITY_MISMATCH);
+            }
         }
         return existing;
     }

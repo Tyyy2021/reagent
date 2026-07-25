@@ -126,6 +126,157 @@ class StateStoreIT extends InfrastructureIT {
                 stateStore.loadContext(task.getId()).messages().get(2));
     }
 
+    @ParameterizedTest(name = "rejects same-task reuse with {0}")
+    @MethodSource("sameTaskReusedCalls")
+    @Transactional
+    void rejectsSameTaskCrossBatchToolCallIdReuseWithoutMutation(
+            String ignored, ToolCall original, ToolCall reused) {
+        TaskEntity task = stateStore.createTask(
+                "reject reused call id", "system prompt");
+        TaskRunToken token = stateStore.claim(task.getId()).orElseThrow();
+        stateStore.appendAssistant(token, assistantFor(original));
+        long messagesBefore = messageRepository.countByTaskId(task.getId());
+        long ledgerBefore = toolCallRepository.count();
+
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> stateStore.appendAssistant(token, assistantFor(reused)));
+
+        assertEquals("Tool call id already exists", error.getMessage());
+        assertEquals(
+                messagesBefore,
+                messageRepository.countByTaskId(task.getId()));
+        assertEquals(ledgerBefore, toolCallRepository.count());
+        ToolCallEntity row =
+                toolCallRepository.findById(original.id()).orElseThrow();
+        assertEquals(original.name(), row.getToolName());
+        assertEquals(original.arguments(), row.getArguments());
+        assertEquals(ToolCallStatus.PENDING, row.getStatus());
+    }
+
+    private static Stream<Arguments> sameTaskReusedCalls() {
+        ToolCall original =
+                new ToolCall("call-reused", "read_file", "{\"path\":\"A\"}");
+        return Stream.of(
+                Arguments.of("identical identity", original, original),
+                Arguments.of(
+                        "different name",
+                        original,
+                        new ToolCall(
+                                "call-reused",
+                                "list_dir",
+                                "{\"path\":\"A\"}")),
+                Arguments.of(
+                        "different arguments",
+                        original,
+                        new ToolCall(
+                                "call-reused",
+                                "read_file",
+                                "{\"path\":\"B\"}")));
+    }
+
+    @Test
+    @Transactional
+    void rejectsCrossTaskToolCallIdBeforeCurrentTaskMutation() {
+        ToolCall call = new ToolCall(
+                "call-cross-task", "read_file", "{}");
+        TaskEntity owner =
+                stateStore.createTask("owner", "system prompt");
+        TaskRunToken ownerToken =
+                stateStore.claim(owner.getId()).orElseThrow();
+        stateStore.appendAssistant(ownerToken, assistantFor(call));
+
+        TaskEntity other =
+                stateStore.createTask("other", "system prompt");
+        TaskRunToken otherToken =
+                stateStore.claim(other.getId()).orElseThrow();
+        long messagesBefore =
+                messageRepository.countByTaskId(other.getId());
+
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> stateStore.appendAssistant(
+                        otherToken, assistantFor(call)));
+
+        assertEquals("Tool call id already exists", error.getMessage());
+        assertEquals(
+                messagesBefore,
+                messageRepository.countByTaskId(other.getId()));
+        assertEquals(owner.getId(),
+                toolCallRepository.findById(call.id())
+                        .orElseThrow()
+                        .getTaskId());
+    }
+
+    @ParameterizedTest(name = "rejects ledger mismatch before {0}")
+    @MethodSource("ledgerIdentityMismatches")
+    @Transactional
+    void rejectsLedgerIdentityMismatchBeforeMutation(
+            LedgerMutation mutation, ToolCall supplied) {
+        ToolCall original = new ToolCall(
+                "call-ledger-identity", "read_file", "{\"path\":\"A\"}");
+        TaskEntity task = stateStore.createTask(
+                "ledger identity", "system prompt");
+        TaskRunToken token = stateStore.claim(task.getId()).orElseThrow();
+        stateStore.appendAssistant(token, assistantFor(original));
+        long messagesBefore = messageRepository.countByTaskId(task.getId());
+
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> {
+                    switch (mutation) {
+                        case MARK_IN_PROGRESS ->
+                                stateStore.markInProgress(token, supplied);
+                        case RECORD_RESULT ->
+                                stateStore.recordToolResult(
+                                        token, supplied, "result");
+                        case MARK_IN_DOUBT ->
+                                stateStore.markInDoubt(
+                                        token, supplied, "unknown");
+                    }
+                });
+
+        assertEquals(
+                "Tool call identity does not match ledger",
+                error.getMessage());
+        ToolCallEntity row =
+                toolCallRepository.findById(original.id()).orElseThrow();
+        assertEquals(ToolCallStatus.PENDING, row.getStatus());
+        assertEquals(0, row.getAttemptCount());
+        assertEquals(null, row.getResult());
+        assertEquals(
+                messagesBefore,
+                messageRepository.countByTaskId(task.getId()));
+    }
+
+    private static Stream<Arguments> ledgerIdentityMismatches() {
+        return Stream.of(
+                Arguments.of(
+                        LedgerMutation.MARK_IN_PROGRESS,
+                        new ToolCall(
+                                "call-ledger-identity",
+                                "list_dir",
+                                "{\"path\":\"A\"}")),
+                Arguments.of(
+                        LedgerMutation.RECORD_RESULT,
+                        new ToolCall(
+                                "call-ledger-identity",
+                                "read_file",
+                                "{\"path\":\"B\"}")),
+                Arguments.of(
+                        LedgerMutation.MARK_IN_DOUBT,
+                        new ToolCall(
+                                "call-ledger-identity",
+                                "list_dir",
+                                "{\"path\":\"B\"}")));
+    }
+
+    private enum LedgerMutation {
+        MARK_IN_PROGRESS,
+        RECORD_RESULT,
+        MARK_IN_DOUBT
+    }
+
     private static Stream<Arguments> malformedAssistantToolCalls() {
         return Stream.of(
                 Arguments.of("missing id", assistant(List.of(rawCall(false, null, true, "read_file", "{}")))),
@@ -174,5 +325,14 @@ class StateStoreIT extends InfrastructureIT {
         message.put("content", null);
         message.put("tool_calls", rawToolCalls);
         return message;
+    }
+
+    private static Map<String, Object> assistantFor(ToolCall call) {
+        return assistant(List.of(rawCall(
+                true,
+                call.id(),
+                true,
+                call.name(),
+                call.arguments())));
     }
 }
