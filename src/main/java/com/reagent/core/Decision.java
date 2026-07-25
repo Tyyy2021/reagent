@@ -36,8 +36,29 @@ public class Decision {
     }
 
     /** 要调工具(可能不止一个) */
-    public static Decision tools(Map<String, Object> assistantMessage, List<ToolCall> toolCalls) {
-        return new Decision(false, null, toolCalls, assistantMessage);
+    public static Decision tools(
+            Map<String, Object> assistantMessage,
+            List<ToolCall> toolCalls) {
+        if (assistantMessage == null || toolCalls == null) {
+            throw mismatchedToolCalls();
+        }
+        List<ToolCall> executable;
+        try {
+            executable = List.copyOf(toolCalls);
+        } catch (NullPointerException exception) {
+            throw mismatchedToolCalls();
+        }
+        List<ToolCall> parsed = ToolCall.parseAssistantToolCalls(
+                assistantMessage.get("tool_calls"));
+        if (!parsed.equals(executable)) {
+            throw mismatchedToolCalls();
+        }
+        return new Decision(false, null, executable, assistantMessage);
+    }
+
+    private static IllegalArgumentException mismatchedToolCalls() {
+        return new IllegalArgumentException(
+                "Assistant tool calls do not match decision");
     }
 
     public boolean isFinal() { return isFinal; }

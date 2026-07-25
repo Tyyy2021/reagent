@@ -106,26 +106,20 @@ public class Context {
         for (int i = idx + 1; i < messages.size(); i++) {
             Map<String, Object> m = messages.get(i);
             if ("tool".equals(m.get("role"))) {
-                answered.add(String.valueOf(m.get("tool_call_id")));
+                Object rawId = m.get("tool_call_id");
+                if (!(rawId instanceof String id)) {
+                    throw new IllegalArgumentException(
+                            "Invalid tool result call id");
+                }
+                answered.add(id);
             }
         }
 
-        List<ToolCall> pending = new ArrayList<>();
-        Object toolCalls = messages.get(idx).get("tool_calls");
-        if (toolCalls instanceof List<?> list) {
-            for (Object o : list) {
-                if (!(o instanceof Map<?, ?> tc)) continue;
-                String id = String.valueOf(tc.get("id"));
-                if (answered.contains(id)) continue;
-                Map<?, ?> fn = (Map<?, ?>) tc.get("function");
-                String name = String.valueOf(fn.get("name"));
-                Object argsObj = fn.get("arguments");
-                String args = argsObj instanceof String s ? s
-                        : (argsObj == null ? "{}" : argsObj.toString());
-                pending.add(new ToolCall(id, name, args));
-            }
-        }
-        return pending;
+        return ToolCall.parseAssistantToolCalls(
+                        messages.get(idx).get("tool_calls"))
+                .stream()
+                .filter(call -> !answered.contains(call.id()))
+                .toList();
     }
 
     private static Map<String, Object> message(String role, String content) {
