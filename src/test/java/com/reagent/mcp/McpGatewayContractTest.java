@@ -1,6 +1,7 @@
 package com.reagent.mcp;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -452,6 +453,97 @@ class McpGatewayContractTest {
     }
 
     @Test
+    void secondTransportFailureInvalidatesStateAndLaterCallRediscovers() {
+        ScriptedFactory factory = new ScriptedFactory();
+        ScriptedSession first = factory.addSession();
+        first.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        first.failCall = transportFailure("first");
+        ScriptedSession second = factory.addSession();
+        second.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        second.failCall = transportFailure("second");
+        ScriptedSession third = factory.addSession();
+        third.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        third.results.add(textResult("recovered"));
+        McpReadiness readiness = new McpReadiness();
+        OfficialMcpGateway gateway = new OfficialMcpGateway(
+                validProperties(), new ObjectMapper(), readiness, factory);
+
+        gateway.discover("fake-ops");
+        assertThrows(
+                OfficialMcpGateway.TransportFailureException.class,
+                () -> gateway.call("fake-ops", "query_metrics", Map.of()));
+        assertEquals(1, first.closes.get());
+        assertEquals(1, second.closes.get());
+        assertFalse(readiness.state("fake-ops").ready());
+
+        assertEquals(
+                new McpCallResult("recovered", false),
+                assertDoesNotThrow(
+                        () -> gateway.call("fake-ops", "query_metrics", Map.of())));
+        assertEquals(3, factory.opens.get());
+        assertEquals(1, third.calls.get());
+        assertTrue(readiness.state("fake-ops").ready());
+    }
+
+    @Test
+    void rejectedReplacementDiscoveryLeavesNoCallableCachedState() {
+        ScriptedFactory factory = new ScriptedFactory();
+        ScriptedSession first = factory.addSession();
+        first.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        first.failCall = transportFailure("first");
+        ScriptedSession rejected = factory.addSession();
+        rejected.discovery.add(List.of());
+        ScriptedSession fresh = factory.addSession();
+        fresh.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        fresh.results.add(textResult("fresh"));
+        McpReadiness readiness = new McpReadiness();
+        OfficialMcpGateway gateway = new OfficialMcpGateway(
+                validProperties(), new ObjectMapper(), readiness, factory);
+
+        gateway.discover("fake-ops");
+        assertThrows(
+                McpContractException.class,
+                () -> gateway.call("fake-ops", "query_metrics", Map.of()));
+        assertEquals(1, rejected.closes.get());
+        assertFalse(readiness.state("fake-ops").ready());
+
+        assertEquals(
+                new McpCallResult("fresh", false),
+                assertDoesNotThrow(
+                        () -> gateway.call("fake-ops", "query_metrics", Map.of())));
+        assertEquals(3, factory.opens.get());
+        assertEquals(1, fresh.calls.get());
+        assertTrue(readiness.state("fake-ops").ready());
+    }
+
+    @Test
+    void failedPublicDiscoveryRefreshInvalidatesPreviouslyValidState() {
+        ScriptedFactory factory = new ScriptedFactory();
+        ScriptedSession stale = factory.addSession();
+        stale.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        stale.discovery.add(List.of());
+        ScriptedSession fresh = factory.addSession();
+        fresh.discovery.add(List.of(tool("query_metrics", objectSchema())));
+        fresh.results.add(textResult("fresh"));
+        McpReadiness readiness = new McpReadiness();
+        OfficialMcpGateway gateway = new OfficialMcpGateway(
+                validProperties(), new ObjectMapper(), readiness, factory);
+
+        gateway.discover("fake-ops");
+        assertThrows(McpContractException.class, () -> gateway.discover("fake-ops"));
+        assertEquals(1, stale.closes.get());
+        assertFalse(readiness.state("fake-ops").ready());
+
+        assertEquals(
+                new McpCallResult("fresh", false),
+                assertDoesNotThrow(
+                        () -> gateway.call("fake-ops", "query_metrics", Map.of())));
+        assertEquals(2, factory.opens.get());
+        assertEquals(1, fresh.calls.get());
+        assertTrue(readiness.state("fake-ops").ready());
+    }
+
+    @Test
     void sdkWrappedJsonFailureIsDefinitive() {
         ScriptedFactory jsonFactory = new ScriptedFactory();
         ScriptedSession jsonFirst = jsonFactory.addSession();
@@ -662,6 +754,18 @@ class McpGatewayContractTest {
 
     private static OfficialMcpGateway.RawTool tool(String name, Object schema) {
         return new OfficialMcpGateway.RawTool(name, "description", schema);
+    }
+
+    private static McpTransportException transportFailure(String attempt) {
+        return new McpTransportException(
+                "connection reset " + attempt,
+                new ConnectException("connection reset"));
+    }
+
+    private static OfficialMcpGateway.RawCallResult textResult(String text) {
+        return new OfficialMcpGateway.RawCallResult(
+                List.of(new OfficialMcpGateway.RawContent(true, text)),
+                false);
     }
 
     private static Map<String, Object> objectSchema() {

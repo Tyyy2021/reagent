@@ -103,12 +103,7 @@ public final class OfficialMcpGateway implements McpGateway {
         ensureOpen();
         McpProperties.Server configured = properties.requireServer(serverId);
         ServerState state = states.computeIfAbsent(serverId, ignored -> new ServerState());
-        try {
-            return discoverWithReconnect(serverId, configured, state);
-        } catch (RuntimeException ex) {
-            readiness.recordUnavailable(serverId, unavailableReason(ex));
-            throw normalize("MCP discovery failed", ex);
-        }
+        return discoverOrInvalidate(serverId, configured, state);
     }
 
     @Override
@@ -124,8 +119,8 @@ public final class OfficialMcpGateway implements McpGateway {
                 safeArguments, configured.getMaximumResponseBytes(), "MCP arguments exceed limit");
 
         ServerState state = states.computeIfAbsent(serverId, ignored -> new ServerState());
-        if (state.discovery.isEmpty()) {
-            discoverWithReconnect(serverId, configured, state);
+        if (state.session == null || state.discovery.isEmpty()) {
+            discoverOrInvalidate(serverId, configured, state);
         }
         Map<String, Object> previousSchema = schemaFor(state.discovery, toolName);
         if (previousSchema == null) {
@@ -140,43 +135,48 @@ public final class OfficialMcpGateway implements McpGateway {
             if (!isTransportFailure(firstFailure)) {
                 throw normalize("MCP call failed", firstFailure);
             }
-            closeSession(state);
+            invalidateState(state);
+            Session replacement;
+            List<McpRemoteTool> rediscovered;
             try {
-                Session replacement = openInitialized(serverId, configured);
+                replacement = openInitialized(serverId, configured);
                 state.session = replacement;
-                List<McpRemoteTool> rediscovered = validatedDiscovery(serverId, configured, replacement);
-                Map<String, Object> currentSchema = schemaFor(rediscovered, toolName);
-                if (!previousSchema.equals(currentSchema)) {
-                    closeSession(state);
-                    state.discovery = List.of();
-                    readiness.recordUnavailable(serverId, "schema drift");
-                    throw new McpContractException(
-                            "MCP Schema drift detected for " + serverId + "/" + toolName);
-                }
-                state.discovery = rediscovered;
-                readiness.recordReady(serverId, names(rediscovered));
-                try {
-                    return validateCallResult(
-                            replacement.call(toolName, safeArguments),
-                            configured.getMaximumResponseBytes());
-                } catch (RuntimeException secondFailure) {
-                    if (isTransportFailure(secondFailure)) {
-                        closeSession(state);
-                        readiness.recordUnavailable(serverId, "transport unavailable");
-                        throw new TransportFailureException("MCP transport unavailable", secondFailure);
-                    }
-                    throw normalize("MCP call failed", secondFailure);
-                }
-            } catch (McpContractException | TransportFailureException ex) {
-                throw ex;
+                rediscovered = validatedDiscovery(serverId, configured, replacement);
             } catch (RuntimeException reconnectFailure) {
-                closeSession(state);
-                readiness.recordUnavailable(serverId, unavailableReason(reconnectFailure));
+                invalidateState(state);
+                readiness.recordUnavailable(
+                        serverId, unavailableReason(reconnectFailure));
                 if (isTransportFailure(reconnectFailure)) {
                     throw new TransportFailureException(
                             "MCP transport unavailable", reconnectFailure);
                 }
                 throw normalize("MCP reconnect failed", reconnectFailure);
+            }
+
+            Map<String, Object> currentSchema =
+                    schemaFor(rediscovered, toolName);
+            if (!previousSchema.equals(currentSchema)) {
+                invalidateState(state);
+                readiness.recordUnavailable(serverId, "schema drift");
+                throw new McpContractException(
+                        "MCP Schema drift detected for " + serverId + "/" + toolName);
+            }
+            state.discovery = rediscovered;
+            readiness.recordReady(serverId, names(rediscovered));
+
+            try {
+                return validateCallResult(
+                        replacement.call(toolName, safeArguments),
+                        configured.getMaximumResponseBytes());
+            } catch (RuntimeException secondFailure) {
+                if (isTransportFailure(secondFailure)) {
+                    invalidateState(state);
+                    readiness.recordUnavailable(
+                            serverId, "transport unavailable");
+                    throw new TransportFailureException(
+                            "MCP transport unavailable", secondFailure);
+                }
+                throw normalize("MCP call failed", secondFailure);
             }
         }
     }
@@ -188,8 +188,22 @@ public final class OfficialMcpGateway implements McpGateway {
             return;
         }
         closed = true;
-        states.values().forEach(OfficialMcpGateway::closeSession);
+        states.values().forEach(OfficialMcpGateway::invalidateState);
         states.clear();
+    }
+
+    private List<McpRemoteTool> discoverOrInvalidate(
+            String serverId,
+            McpProperties.Server configured,
+            ServerState state) {
+        try {
+            return discoverWithReconnect(serverId, configured, state);
+        } catch (RuntimeException exception) {
+            invalidateState(state);
+            readiness.recordUnavailable(
+                    serverId, unavailableReason(exception));
+            throw normalize("MCP discovery failed", exception);
+        }
     }
 
     private List<McpRemoteTool> discoverWithReconnect(
@@ -202,9 +216,10 @@ public final class OfficialMcpGateway implements McpGateway {
             return discovered;
         } catch (RuntimeException firstFailure) {
             if (!isTransportFailure(firstFailure)) {
+                invalidateState(state);
                 throw normalize("MCP discovery failed", firstFailure);
             }
-            closeSession(state);
+            invalidateState(state);
             try {
                 Session replacement = openInitialized(serverId, configured);
                 state.session = replacement;
@@ -214,7 +229,7 @@ public final class OfficialMcpGateway implements McpGateway {
                 readiness.recordReady(serverId, names(discovered));
                 return discovered;
             } catch (RuntimeException secondFailure) {
-                closeSession(state);
+                invalidateState(state);
                 if (isTransportFailure(secondFailure)) {
                     throw new TransportFailureException(
                             "MCP transport unavailable", secondFailure);
@@ -576,9 +591,10 @@ public final class OfficialMcpGateway implements McpGateway {
         }
     }
 
-    private static void closeSession(ServerState state) {
+    private static void invalidateState(ServerState state) {
         Session session = state.session;
         state.session = null;
+        state.discovery = List.of();
         if (session != null) {
             session.close();
         }
