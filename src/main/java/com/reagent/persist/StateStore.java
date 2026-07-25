@@ -264,28 +264,23 @@ public class StateStore {
         TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
         Instant now = clock.instant();
         String content = asStringOrNull(assistantMessage.get("content"));
-        Object toolCalls = assistantMessage.get("tool_calls");
-        String toolCallsJson = toolCalls == null ? null : toJson(toolCalls);
+        Object rawToolCalls = assistantMessage.get("tool_calls");
+        List<ToolCall> parsedCalls = rawToolCalls == null
+                ? List.of()
+                : ToolCall.parseAssistantToolCalls(rawToolCalls);
+        String toolCallsJson = rawToolCalls == null ? null : toJson(rawToolCalls);
 
-        Map<String, PendingToolCall> callsToCreate = new LinkedHashMap<>();
-        if (toolCalls instanceof List<?> list) {
-            for (Object o : list) {
-                if (!(o instanceof Map<?, ?> tc)) continue;
-                String id = String.valueOf(tc.get("id"));
-                Map<?, ?> fn = (Map<?, ?>) tc.get("function");
-                String name = String.valueOf(fn.get("name"));
-                String args = asArguments(fn.get("arguments"));
-                // 先校验整批 call 的任务归属,再落 assistant 消息:外任务同 ID 必须在任何持久化之前 fail closed。
-                if (!callsToCreate.containsKey(id)
-                        && ownedToolCall(task.getId(), id).isEmpty()) {
-                    callsToCreate.put(id, new PendingToolCall(name, args));
-                }
+        Map<String, ToolCall> callsToCreate = new LinkedHashMap<>();
+        for (ToolCall call : parsedCalls) {
+            // 先校验整批 call 的任务归属,再落 assistant 消息:外任务同 ID 必须在任何持久化之前 fail closed。
+            if (ownedToolCall(task.getId(), call.id()).isEmpty()) {
+                callsToCreate.put(call.id(), call);
             }
         }
         int sequence = appendMessage(task.getId(), "assistant", content, toolCallsJson, null, now);
-        List<ToolCallEntity> ledgerRows = callsToCreate.entrySet().stream()
-                .map(entry -> new ToolCallEntity(
-                        entry.getKey(), task.getId(), entry.getValue().name(), entry.getValue().arguments(),
+        List<ToolCallEntity> ledgerRows = callsToCreate.values().stream()
+                .map(call -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(),
                         now, sequence))
                 .toList();
         toolCallRepo.saveAll(ledgerRows);
@@ -405,11 +400,6 @@ public class StateStore {
         return o == null ? null : String.valueOf(o);
     }
 
-    /** arguments 在 OpenAI/DeepSeek 协议里是字符串;Ollama 可能给对象,统一转成字符串 */
-    private String asArguments(Object arguments) {
-        return arguments instanceof String s ? s : toJson(arguments);
-    }
-
     private String toJson(Object o) {
         try {
             return mapper.writeValueAsString(o);
@@ -439,9 +429,6 @@ public class StateStore {
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Cannot deserialize task profile snapshot", ex);
         }
-    }
-
-    private record PendingToolCall(String name, String arguments) {
     }
 
     @SuppressWarnings("unchecked")
