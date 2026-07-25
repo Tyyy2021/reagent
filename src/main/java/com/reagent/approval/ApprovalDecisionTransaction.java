@@ -136,6 +136,13 @@ public class ApprovalDecisionTransaction {
     public boolean cancelWaiting(String taskId) {
         TaskEntity task = taskRepository.findByIdForUpdate(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getStatus() == TaskStatus.RUNNING) {
+            if (taskRepository.requestControl(taskId, "CANCEL") != 1) {
+                throw new IllegalStateException(
+                        "Running task cancellation signal was not persisted");
+            }
+            return false;
+        }
         if (task.getStatus() != TaskStatus.WAITING_APPROVAL) {
             return false;
         }

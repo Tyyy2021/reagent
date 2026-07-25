@@ -92,11 +92,13 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                 if (taskControl.isForced(token.taskId())) {
                     Thread.interrupted();
                 }
-                approvalDecisionTransaction.cancelWaiting(token.taskId());
-                bus.publish(
-                        token,
-                        TaskEvent.Type.CANCELLED,
-                        Map.of("status", "CANCELLED"));
+                if (approvalDecisionTransaction.cancelWaiting(
+                        token.taskId())) {
+                    bus.publish(
+                            token,
+                            TaskEvent.Type.CANCELLED,
+                            Map.of("status", "CANCELLED"));
+                }
             } else {
                 bus.publish(
                         token,

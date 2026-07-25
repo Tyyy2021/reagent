@@ -904,6 +904,119 @@ class ApprovalServiceIT extends InfrastructureIT {
         assertEquals(0, ticket.callCount());
     }
 
+    @ParameterizedTest(name = "final approval races after cancel observation; local={0}")
+    @ValueSource(booleans = {true, false})
+    void finalApprovalWinningAfterCancelObservationLeavesDurableCancelWithoutFalseEvent(
+            boolean localCancel,
+            @TempDir Path workspace
+    ) throws InterruptedException {
+        RecordingTool ticket = new RecordingTool(
+                "create_ticket",
+                IdempotencyClass.IDEMPOTENT,
+                ApprovalPolicy.REQUIRE_APPROVAL,
+                "must not execute");
+        TaskToolCatalog catalog = catalog(ticket);
+        TaskEntity task =
+                stateStore.createTask("cancel while final approval commits", "system");
+        TaskRunToken token = stateStore.claim(task.getId()).orElseThrow();
+        ToolCall call = new ToolCall(
+                "call-final-approval-race-" + localCancel,
+                ticket.name(),
+                "{\"title\":\"Approval race\",\"severity\":\"sev1\","
+                        + "\"evidence\":\"cancel must remain durable\"}");
+        stateStore.appendAssistant(token, Map.of(
+                "role", "assistant",
+                "content", "",
+                "tool_calls", List.of(assistantToolCall(call))));
+
+        if (localCancel) {
+            taskControl.begin(token);
+            assertTrue(taskControl.requestCancel(task.getId(), false));
+        } else {
+            assertTrue(stateStore.requestControl(task.getId(), "CANCEL"));
+        }
+
+        CountDownLatch cancelTransactionEntered = new CountDownLatch(1);
+        CountDownLatch finalApprovalCommitted = new CountDownLatch(1);
+        ApprovalDecisionTransaction racingTransaction =
+                org.mockito.Mockito.mock(ApprovalDecisionTransaction.class);
+        org.mockito.Mockito.when(
+                        racingTransaction.cancelWaiting(task.getId()))
+                .thenAnswer(invocation -> {
+                    cancelTransactionEntered.countDown();
+                    assertTrue(
+                            finalApprovalCommitted.await(10, TimeUnit.SECONDS),
+                            "Final approval did not commit at the controlled boundary");
+                    return decisionTransaction.cancelWaiting(task.getId());
+                });
+        StreamTransport transport =
+                org.mockito.Mockito.mock(StreamTransport.class);
+        DefaultToolBatchCoordinator coordinator =
+                new DefaultToolBatchCoordinator(
+                        stateStore,
+                        toolExecutor,
+                        transport,
+                        taskControl,
+                        FaultInjector.none(),
+                        racingTransaction);
+        AtomicReference<BatchDisposition> disposition =
+                new AtomicReference<>();
+        AtomicReference<Throwable> coordinatorFailure =
+                new AtomicReference<>();
+
+        Thread coordinatorThread = Thread.ofVirtual().start(() -> {
+            try {
+                disposition.set(coordinator.process(
+                        token,
+                        new ToolContext(token, workspace),
+                        stateStore.loadContext(task.getId()),
+                        catalog,
+                        List.of(call)));
+            } catch (Throwable throwable) {
+                coordinatorFailure.set(throwable);
+            }
+        });
+        try {
+            assertTrue(
+                    cancelTransactionEntered.await(10, TimeUnit.SECONDS),
+                    "Coordinator did not observe cancellation before arbitration");
+            ApprovalDecisionTransaction.DecisionOutcome approved =
+                    decisionTransaction.decide(
+                            task.getId(),
+                            call.id(),
+                            new ApprovalDecisionRequest(
+                                    ApprovalDecision.APPROVE,
+                                    "approved concurrently"));
+            assertTrue(approved.shouldResume());
+        } finally {
+            finalApprovalCommitted.countDown();
+        }
+
+        coordinatorThread.join(TimeUnit.SECONDS.toMillis(10));
+        try {
+            assertFalse(
+                    coordinatorThread.isAlive(),
+                    "Coordinator did not finish after the controlled race");
+            assertEquals(null, coordinatorFailure.get());
+            assertEquals(BatchDisposition.WAITING_APPROVAL, disposition.get());
+            org.mockito.Mockito.verify(transport, never()).publish(
+                    token,
+                    TaskEvent.Type.CANCELLED,
+                    Map.of("status", "CANCELLED"));
+            assertEquals(
+                    "CANCEL",
+                    stateStore.readControlSignal(task.getId()),
+                    "An accepted cancellation must survive the old local handle");
+            assertEquals(TaskStatus.RUNNING,
+                    stateStore.getTask(task.getId()).getStatus());
+            assertEquals(0, ticket.callCount());
+        } finally {
+            if (localCancel) {
+                taskControl.end(task.getId());
+            }
+        }
+    }
+
     private static Map<String, Object> assistantToolCall(ToolCall call) {
         return Map.of(
                 "id", call.id(),
