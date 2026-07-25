@@ -42,8 +42,14 @@ public record TaskEvent(String taskId, String eventId, Type type, Object data, I
 
     /** 本次 run 的收尾事件:之后该 run 不再有新事件,SSE 端据此收尾。注意 PAUSED 非任务终态(可 resume),但对"本次 SSE 流"而言已结束。 */
     public boolean isTerminal() {
-        return type == Type.COMPLETED || type == Type.FAILED
-                || type == Type.CANCELLED || type == Type.PAUSED
+        return isTaskTerminal() || type == Type.PAUSED
                 || type == Type.APPROVAL_REQUIRED;
+    }
+
+    /** 不可恢复的任务终态；与只结束当前 SSE run 的 PAUSED/APPROVAL_REQUIRED 明确分开。 */
+    public boolean isTaskTerminal() {
+        return type == Type.COMPLETED
+                || type == Type.FAILED
+                || type == Type.CANCELLED;
     }
 }

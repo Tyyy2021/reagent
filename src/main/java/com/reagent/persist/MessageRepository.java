@@ -19,5 +19,10 @@ public interface MessageRepository extends JpaRepository<MessageEntity, Long> {
     @Query("select coalesce(max(m.seq), -1) + 1 from MessageEntity m where m.taskId = :taskId")
     int nextSequenceForLockedTask(@Param("taskId") String taskId);
 
+    boolean existsByTaskIdAndRoleAndToolCallId(
+            String taskId,
+            String role,
+            String toolCallId);
+
     long countByTaskId(String taskId);
 }

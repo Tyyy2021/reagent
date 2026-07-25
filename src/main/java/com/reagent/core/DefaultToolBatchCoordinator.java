@@ -1,5 +1,6 @@
 package com.reagent.core;
 
+import com.reagent.approval.ApprovalDecisionTransaction;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.ToolCallStatus;
 import com.reagent.profile.TaskToolCatalog;
@@ -13,6 +14,7 @@ import com.reagent.tool.ToolExecutor;
 import com.reagent.tool.ToolExecutionOutcome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -35,6 +37,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
     private final StreamTransport bus;
     private final TaskControl taskControl;
     private final FaultInjector faultInjector;
+    private final ApprovalDecisionTransaction approvalDecisionTransaction;
 
     public DefaultToolBatchCoordinator(
             StateStore stateStore,
@@ -43,11 +46,30 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             TaskControl taskControl,
             FaultInjector faultInjector
     ) {
+        this(
+                stateStore,
+                executor,
+                bus,
+                taskControl,
+                faultInjector,
+                null);
+    }
+
+    @Autowired
+    public DefaultToolBatchCoordinator(
+            StateStore stateStore,
+            ToolExecutor executor,
+            StreamTransport bus,
+            TaskControl taskControl,
+            FaultInjector faultInjector,
+            ApprovalDecisionTransaction approvalDecisionTransaction
+    ) {
         this.stateStore = stateStore;
         this.executor = executor;
         this.bus = bus;
         this.taskControl = taskControl;
         this.faultInjector = faultInjector;
+        this.approvalDecisionTransaction = approvalDecisionTransaction;
     }
 
     @Override
@@ -62,21 +84,42 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             throw new IllegalArgumentException("ToolContext must carry the same TaskRunToken as the batch");
         }
         if (stateStore.prepareApprovalBarrier(token, catalog, calls)) {
-            bus.publish(
-                    token,
-                    TaskEvent.Type.APPROVAL_REQUIRED,
-                    Map.of("status", "WAITING_APPROVAL"));
+            if (cancelRequested(token.taskId())) {
+                if (approvalDecisionTransaction == null) {
+                    throw new IllegalStateException(
+                            "Waiting-task cancellation is unavailable");
+                }
+                if (taskControl.isForced(token.taskId())) {
+                    Thread.interrupted();
+                }
+                approvalDecisionTransaction.cancelWaiting(token.taskId());
+                bus.publish(
+                        token,
+                        TaskEvent.Type.CANCELLED,
+                        Map.of("status", "CANCELLED"));
+            } else {
+                bus.publish(
+                        token,
+                        TaskEvent.Type.APPROVAL_REQUIRED,
+                        Map.of("status", "WAITING_APPROVAL"));
+            }
             return BatchDisposition.WAITING_APPROVAL;
         }
 
         List<ToolCall> toRun = new ArrayList<>();
         List<ToolCall> actionable = new ArrayList<>();
+        Set<String> rejected = new HashSet<>();
         Map<String, String> inDoubt = new LinkedHashMap<>();
         Map<String, String> reconciled = new LinkedHashMap<>();
         for (ToolCall call : calls) {
             ToolCallStatus status = stateStore.statusOf(token, call.id());
             switch (status) {
-                case DONE, IN_DOUBT, REJECTED ->
+                case REJECTED -> {
+                    rejected.add(call.id());
+                    log.info("账本已是终态 {},按原序物化结果: {}",
+                            status, observableToolName(catalog, call));
+                }
+                case DONE, IN_DOUBT ->
                         log.info("账本已是终态 {},跳过: {}", status, observableToolName(catalog, call));
                 case IN_PROGRESS -> {
                     actionable.add(call);
@@ -193,11 +236,31 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         Map.of(
                                 "id", call.id(), "name", observableToolName(catalog, call),
                                 "outcome", "IN_DOUBT", "inDoubt", true));
+            } else if (rejected.contains(call.id())) {
+                stateStore.materializeRejectedToolResult(token, call)
+                        .ifPresent(message -> {
+                            faultInjector.hit(
+                                    FaultPoint.AFTER_TOOL_RESULT_PERSISTED_BEFORE_FINAL_ANSWER,
+                                    faultContext(token, call));
+                            context.addToolResult(call.id(), message);
+                            bus.publish(
+                                    token,
+                                    TaskEvent.Type.TOOL_RESULT,
+                                    Map.of(
+                                            "id", call.id(),
+                                            "name", observableToolName(catalog, call),
+                                            "outcome", "REJECTED"));
+                        });
             }
         }
         return recoveryRequired
                 ? BatchDisposition.RECOVERY_REQUIRED
                 : BatchDisposition.EXECUTED;
+    }
+
+    private boolean cancelRequested(String taskId) {
+        return taskControl.signalOf(taskId) == TaskControl.Signal.CANCEL
+                || "CANCEL".equals(stateStore.readControlSignal(taskId));
     }
 
     private static FaultContext faultContext(TaskRunToken token, ToolCall call) {

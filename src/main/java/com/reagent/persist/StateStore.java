@@ -445,6 +445,43 @@ public class StateStore {
     }
 
     /**
+     * Materializes a durable REJECTED ledger result into the conversation only when its
+     * ordered coordinator pass reaches this call. The task row lock and message lookup make
+     * crash replay idempotent without letting approval-decision order reorder tool messages.
+     *
+     * @return the result when this call appended its missing message; empty when already present
+     */
+    @Transactional
+    public Optional<String> materializeRejectedToolResult(
+            TaskRunToken token,
+            ToolCall call
+    ) {
+        TaskEntity task =
+                leaseGuard.lockOwned(
+                        token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        ToolCallEntity ledger = matchingOwnedToolCall(task.getId(), call)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Rejected tool call is missing from the durable ledger"));
+        if (ledger.getStatus() != ToolCallStatus.REJECTED
+                || ledger.getResult() == null) {
+            throw new IllegalStateException(
+                    "Rejected tool call has no durable synthetic result");
+        }
+        if (messageRepo.existsByTaskIdAndRoleAndToolCallId(
+                task.getId(), "tool", call.id())) {
+            return Optional.empty();
+        }
+        appendMessage(
+                task.getId(),
+                "tool",
+                ledger.getResult(),
+                null,
+                call.id(),
+                clock.instant());
+        return Optional.of(ledger.getResult());
+    }
+
+    /**
      * 非幂等工具崩在 in-doubt 窗口、又无 journal 完成记录:判定"结果存疑",落 IN_DOUBT + 一条 tool 消息
      * (把"未知"作为观察回给模型,既满足"每个 tool_call 必有结果"的协议,又绝不替它重放副作用)。
      */

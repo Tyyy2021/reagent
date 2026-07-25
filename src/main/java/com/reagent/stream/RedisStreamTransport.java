@@ -94,7 +94,7 @@ public class RedisStreamTransport implements StreamTransport {
         RecordId rid = redis.opsForStream().add(key(taskId), fields);
         String eventId = (type == TaskEvent.Type.TOKEN) ? null : (rid != null ? rid.getValue() : durableId);
         TaskEvent event = new TaskEvent(taskId, eventId, type, data, clock.instant());
-        if (event.isTerminal()) {
+        if (event.isTaskTerminal()) {
             redis.expire(key(taskId), Duration.ofSeconds(ttlSec));   // 任务收尾:给 stream 设 TTL,跑完自动清
         }
         return event;

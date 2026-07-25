@@ -41,6 +41,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -103,6 +104,12 @@ class ApprovalServiceIT extends InfrastructureIT {
 
     @Autowired
     private ToolExecutor toolExecutor;
+
+    @Autowired
+    private DefaultToolBatchCoordinator toolBatchCoordinator;
+
+    @Autowired
+    private TaskControl taskControl;
 
     @BeforeEach
     void clearRuntimeState() {
@@ -251,7 +258,9 @@ class ApprovalServiceIT extends InfrastructureIT {
     }
 
     @Test
-    void rejectWritesOneBoundedSyntheticMessageAndNeverIncludesRawArguments() {
+    void rejectDurablyRecordsThenResumeWritesOneOrderedBoundedSyntheticMessage(
+            @TempDir Path workspace
+    ) {
         String rawSentinel = "RAW_EVIDENCE_SENTINEL";
         PendingApproval pending = pendingApproval(
                 "call-reject",
@@ -270,6 +279,39 @@ class ApprovalServiceIT extends InfrastructureIT {
         assertTrue(rejected.shouldResume());
         assertEquals(ToolCallStatus.REJECTED,
                 stateStore.statusOf(pending.task().getId(), pending.call().id()));
+        assertEquals(
+                "Approval rejected for create_ticket; no remote action occurred.",
+                jdbc.queryForObject(
+                        "SELECT result FROM tool_call WHERE id = ?",
+                        String.class,
+                        pending.call().id()));
+        assertEquals(
+                List.of(),
+                messageRepository
+                        .findByTaskIdOrderByIdAsc(pending.task().getId()).stream()
+                        .filter(message -> "tool".equals(message.getRole()))
+                        .toList(),
+                "The coordinator must materialize synthetic results in assistant order");
+
+        RecordingTool ticket = new RecordingTool(
+                "create_ticket",
+                IdempotencyClass.IDEMPOTENT,
+                ApprovalPolicy.REQUIRE_APPROVAL,
+                "must not execute");
+        TaskToolCatalog catalog = catalog(ticket);
+        TaskRunToken resumed =
+                stateStore.claim(pending.task().getId()).orElseThrow();
+        Context restored = stateStore.loadContext(pending.task().getId());
+        assertEquals(
+                BatchDisposition.EXECUTED,
+                toolBatchCoordinator.process(
+                        resumed,
+                        new ToolContext(resumed, workspace),
+                        restored,
+                        catalog,
+                        restored.pendingToolCalls()));
+        assertEquals(0, ticket.callCount());
+
         List<MessageEntity> toolMessages =
                 messageRepository.findByTaskIdOrderByIdAsc(pending.task().getId()).stream()
                         .filter(message -> "tool".equals(message.getRole()))
@@ -381,8 +423,17 @@ class ApprovalServiceIT extends InfrastructureIT {
         assertTrue(view.evidencePreview().endsWith("…[truncated]"));
     }
 
-    @Test
+    @ParameterizedTest(
+            name = "rejected call first={0}, approve decision first={1}")
+    @CsvSource({
+            "true, true",
+            "true, false",
+            "false, true",
+            "false, false"
+    })
     void approvedRejectedMixedBatchPersistsResultsInAssistantOrder(
+            boolean rejectedFirst,
+            boolean approveFirst,
             @TempDir Path workspace
     ) {
         RecordingTool ticket = new RecordingTool(
@@ -395,16 +446,18 @@ class ApprovalServiceIT extends InfrastructureIT {
         TaskRunToken initialToken =
                 stateStore.claim(task.getId()).orElseThrow();
         ToolCall rejected = new ToolCall(
-                "call-mixed-rejected",
+                "call-mixed-rejected-" + rejectedFirst,
                 ticket.name(),
                 "{\"title\":\"Reject\",\"severity\":\"sev2\","
                         + "\"evidence\":\"not enough\"}");
         ToolCall approved = new ToolCall(
-                "call-mixed-approved",
+                "call-mixed-approved-" + rejectedFirst,
                 ticket.name(),
                 "{\"title\":\"Approve\",\"severity\":\"sev1\","
                         + "\"evidence\":\"confirmed\"}");
-        List<ToolCall> calls = List.of(rejected, approved);
+        List<ToolCall> calls = rejectedFirst
+                ? List.of(rejected, approved)
+                : List.of(approved, rejected);
         stateStore.appendAssistant(initialToken, Map.of(
                 "role", "assistant",
                 "content", "",
@@ -415,17 +468,33 @@ class ApprovalServiceIT extends InfrastructureIT {
                 initialToken, catalog, calls));
 
         ApprovalDecisionTransaction.DecisionOutcome first =
-                decisionTransaction.decide(
-                        task.getId(),
-                        approved.id(),
-                        new ApprovalDecisionRequest(
-                                ApprovalDecision.APPROVE, "confirmed"));
+                approveFirst
+                        ? decisionTransaction.decide(
+                                task.getId(),
+                                approved.id(),
+                                new ApprovalDecisionRequest(
+                                        ApprovalDecision.APPROVE,
+                                        "confirmed"))
+                        : decisionTransaction.decide(
+                                task.getId(),
+                                rejected.id(),
+                                new ApprovalDecisionRequest(
+                                        ApprovalDecision.REJECT,
+                                        "not enough"));
         ApprovalDecisionTransaction.DecisionOutcome second =
-                decisionTransaction.decide(
-                        task.getId(),
-                        rejected.id(),
-                        new ApprovalDecisionRequest(
-                                ApprovalDecision.REJECT, "not enough"));
+                approveFirst
+                        ? decisionTransaction.decide(
+                                task.getId(),
+                                rejected.id(),
+                                new ApprovalDecisionRequest(
+                                        ApprovalDecision.REJECT,
+                                        "not enough"))
+                        : decisionTransaction.decide(
+                                task.getId(),
+                                approved.id(),
+                                new ApprovalDecisionRequest(
+                                        ApprovalDecision.APPROVE,
+                                        "confirmed"));
         assertFalse(first.shouldResume());
         assertTrue(second.shouldResume());
 
@@ -437,12 +506,13 @@ class ApprovalServiceIT extends InfrastructureIT {
                         org.mockito.Mockito.mock(StreamTransport.class),
                         new TaskControl(),
                         FaultInjector.none());
+        Context restored = stateStore.loadContext(task.getId());
         BatchDisposition disposition = coordinator.process(
                 resumed,
                 new ToolContext(resumed, workspace),
-                stateStore.loadContext(task.getId()),
+                restored,
                 catalog,
-                calls);
+                restored.pendingToolCalls());
 
         entityManager.clear();
         assertEquals(BatchDisposition.EXECUTED, disposition);
@@ -461,9 +531,13 @@ class ApprovalServiceIT extends InfrastructureIT {
                         .map(MessageEntity::getToolCallId)
                         .toList());
         assertEquals(
-                List.of(
-                        "Approval rejected for create_ticket; no remote action occurred.",
-                        "ticket-created"),
+                rejectedFirst
+                        ? List.of(
+                                "Approval rejected for create_ticket; no remote action occurred.",
+                                "ticket-created")
+                        : List.of(
+                                "ticket-created",
+                                "Approval rejected for create_ticket; no remote action occurred."),
                 toolMessages.stream().map(MessageEntity::getContent).toList());
     }
 
@@ -691,6 +765,143 @@ class ApprovalServiceIT extends InfrastructureIT {
                 messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
                         .filter(message -> "tool".equals(message.getRole()))
                         .count());
+    }
+
+    @Test
+    void waitingCancellationAfterPartialRejectionPersistsEveryResultInAssistantOrder() {
+        RecordingTool read = new RecordingTool(
+                "query_metrics",
+                IdempotencyClass.READ_ONLY,
+                ApprovalPolicy.NONE,
+                "must not execute");
+        RecordingTool ticket = new RecordingTool(
+                "create_ticket",
+                IdempotencyClass.IDEMPOTENT,
+                ApprovalPolicy.REQUIRE_APPROVAL,
+                "must not execute");
+        TaskToolCatalog catalog = catalog(read, ticket);
+        TaskEntity task =
+                stateStore.createTask("cancel partially decided batch", "system");
+        TaskRunToken token = stateStore.claim(task.getId()).orElseThrow();
+        ToolCall pendingFirst = new ToolCall(
+                "call-partial-pending",
+                ticket.name(),
+                "{\"title\":\"Pending\",\"severity\":\"sev1\","
+                        + "\"evidence\":\"pending evidence\"}");
+        ToolCall rejectedSecond = new ToolCall(
+                "call-partial-rejected",
+                ticket.name(),
+                "{\"title\":\"Rejected\",\"severity\":\"sev2\","
+                        + "\"evidence\":\"rejected evidence\"}");
+        ToolCall readThird = new ToolCall(
+                "call-partial-read",
+                read.name(),
+                "{\"query\":\"must not run\"}");
+        List<ToolCall> calls =
+                List.of(pendingFirst, rejectedSecond, readThird);
+        stateStore.appendAssistant(token, Map.of(
+                "role", "assistant",
+                "content", "",
+                "tool_calls", calls.stream()
+                        .map(ApprovalServiceIT::assistantToolCall)
+                        .toList()));
+        assertTrue(stateStore.prepareApprovalBarrier(token, catalog, calls));
+
+        ApprovalDecisionTransaction.DecisionOutcome rejected =
+                decisionTransaction.decide(
+                        task.getId(),
+                        rejectedSecond.id(),
+                        new ApprovalDecisionRequest(
+                                ApprovalDecision.REJECT,
+                                "insufficient evidence"));
+        assertFalse(rejected.shouldResume());
+        assertTrue(approvalService.cancelWaiting(task.getId()));
+
+        entityManager.clear();
+        assertEquals(TaskStatus.CANCELLED,
+                stateStore.getTask(task.getId()).getStatus());
+        assertEquals(
+                calls.stream().map(ToolCall::id).toList(),
+                messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
+                        .filter(message -> "tool".equals(message.getRole()))
+                        .map(MessageEntity::getToolCallId)
+                        .toList());
+        assertEquals(
+                List.of(
+                        "Task cancelled before create_ticket; no remote action occurred.",
+                        "Approval rejected for create_ticket; no remote action occurred.",
+                        "Task cancelled before query_metrics; no remote action occurred."),
+                messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
+                        .filter(message -> "tool".equals(message.getRole()))
+                        .map(MessageEntity::getContent)
+                        .toList());
+        assertEquals(0, ticket.callCount());
+        assertEquals(0, read.callCount());
+        verify(runner, never()).resumeAsync(task.getId());
+    }
+
+    @ParameterizedTest(name = "cancel signal is local={0}")
+    @ValueSource(booleans = {true, false})
+    void cancelSignalBeforeApprovalTransitionCannotStrandWaitingTask(
+            boolean localCancel,
+            @TempDir Path workspace
+    ) {
+        RecordingTool ticket = new RecordingTool(
+                "create_ticket",
+                IdempotencyClass.IDEMPOTENT,
+                ApprovalPolicy.REQUIRE_APPROVAL,
+                "must not execute");
+        TaskToolCatalog catalog = catalog(ticket);
+        TaskEntity task =
+                stateStore.createTask("cancel during approval transition", "system");
+        TaskRunToken token = stateStore.claim(task.getId()).orElseThrow();
+        ToolCall call = new ToolCall(
+                "call-transition-" + localCancel,
+                ticket.name(),
+                "{\"title\":\"Transition\",\"severity\":\"sev1\","
+                        + "\"evidence\":\"cancel race\"}");
+        stateStore.appendAssistant(token, Map.of(
+                "role", "assistant",
+                "content", "",
+                "tool_calls", List.of(assistantToolCall(call))));
+
+        if (localCancel) {
+            taskControl.begin(token);
+            assertTrue(taskControl.requestCancel(task.getId(), false));
+        } else {
+            assertTrue(stateStore.requestControl(task.getId(), "CANCEL"));
+        }
+        try {
+            assertEquals(
+                    BatchDisposition.WAITING_APPROVAL,
+                    toolBatchCoordinator.process(
+                            token,
+                            new ToolContext(token, workspace),
+                            stateStore.loadContext(task.getId()),
+                            catalog,
+                            List.of(call)));
+        } finally {
+            if (localCancel) {
+                taskControl.end(task.getId());
+            }
+        }
+
+        entityManager.clear();
+        assertEquals(TaskStatus.CANCELLED,
+                stateStore.getTask(task.getId()).getStatus());
+        ApprovalRequestEntity approval =
+                approvalRepository.findById(call.id()).orElseThrow();
+        assertEquals(ApprovalStatus.REJECTED, approval.getStatus());
+        assertEquals("task-cancelled", approval.getDecisionReason());
+        assertEquals(ToolCallStatus.REJECTED,
+                stateStore.statusOf(task.getId(), call.id()));
+        assertEquals(
+                List.of(call.id()),
+                messageRepository.findByTaskIdOrderByIdAsc(task.getId()).stream()
+                        .filter(message -> "tool".equals(message.getRole()))
+                        .map(MessageEntity::getToolCallId)
+                        .toList());
+        assertEquals(0, ticket.callCount());
     }
 
     private static Map<String, Object> assistantToolCall(ToolCall call) {

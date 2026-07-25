@@ -5,6 +5,8 @@ import com.reagent.persist.StateStore;
 import com.reagent.testsupport.InfrastructureIT;
 import com.reagent.testsupport.MutableClock;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -122,6 +124,25 @@ class RedisStreamTransportIT extends InfrastructureIT {
         Long ttlSeconds = redis.getExpire(KEY_PREFIX + taskId, TimeUnit.SECONDS);
         assertTrue(ttlSeconds != null && ttlSeconds > 0,
                 () -> "Terminal stream must have a positive TTL, actual=" + ttlSeconds);
+    }
+
+    @ParameterizedTest(name = "{0} ends one run without expiring the active task stream")
+    @EnumSource(
+            value = TaskEvent.Type.class,
+            names = {"PAUSED", "APPROVAL_REQUIRED"})
+    void runTerminalButTaskNonTerminalEventDoesNotSetStreamTtl(
+            TaskEvent.Type type
+    ) {
+        String taskId = taskId();
+
+        TaskEvent event =
+                transport.publish(taskId, type, Map.of("status", type.name()));
+
+        assertTrue(event.isTerminal(), "The current SSE run must end");
+        assertEquals(
+                -1L,
+                redis.getExpire(KEY_PREFIX + taskId, TimeUnit.SECONDS),
+                "A resumable task stream must remain live without a TTL");
     }
 
     @Test

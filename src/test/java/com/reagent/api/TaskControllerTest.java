@@ -16,6 +16,8 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -163,6 +165,46 @@ class TaskControllerTest {
         verifyNoInteractions(runner);
         verifyNoInteractions(stateStore);
         verifyNoInteractions(taskControl);
+    }
+
+    @Test
+    void localCancelRechecksWaitingStateBeforeReturningAccepted() throws Exception {
+        when(approvalService.cancelWaiting("local-transition"))
+                .thenReturn(false, true);
+        when(taskControl.requestCancel("local-transition", false))
+                .thenReturn(true);
+
+        mvc.perform(post("/api/tasks/local-transition/cancel"))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.taskId").value("local-transition"))
+                .andExpect(jsonPath("$.message")
+                        .value("已取消等待审批的任务"));
+
+        verify(approvalService, times(2))
+                .cancelWaiting("local-transition");
+        verify(taskControl).requestCancel("local-transition", false);
+        verifyNoInteractions(stateStore);
+    }
+
+    @Test
+    void crossWorkerCancelRechecksWaitingStateWhenRunningUpdateLosesTransition()
+            throws Exception {
+        when(approvalService.cancelWaiting("remote-transition"))
+                .thenReturn(false, true);
+        when(stateStore.requestControl("remote-transition", "CANCEL"))
+                .thenReturn(false);
+
+        mvc.perform(post("/api/tasks/remote-transition/cancel"))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.taskId").value("remote-transition"))
+                .andExpect(jsonPath("$.message")
+                        .value("已取消等待审批的任务"));
+
+        verify(approvalService, times(2))
+                .cancelWaiting("remote-transition");
+        verify(taskControl).requestCancel("remote-transition", false);
+        verify(stateStore).requestControl("remote-transition", "CANCEL");
+        verify(stateStore, never()).getTask("remote-transition");
     }
 
     @Test

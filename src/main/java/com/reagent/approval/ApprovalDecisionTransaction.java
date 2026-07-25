@@ -117,15 +117,6 @@ public class ApprovalDecisionTransaction {
                 throw new ApprovalConflictException(
                         "Tool call is no longer pending");
             }
-            int sequence = messageRepository.nextSequenceForLockedTask(taskId);
-            messageRepository.save(new MessageEntity(
-                    taskId,
-                    sequence,
-                    "tool",
-                    REJECTION_RESULT,
-                    null,
-                    toolCallId,
-                    now));
         }
 
         boolean shouldResume =
@@ -179,19 +170,29 @@ public class ApprovalDecisionTransaction {
         int sequence = messageRepository.nextSequenceForLockedTask(taskId);
         for (int index = 0; index < blockedBatch.size(); index++) {
             ToolCallEntity ledger = lockedCalls.get(index);
-            if (ledger.getStatus() != ToolCallStatus.PENDING) {
-                continue;
-            }
             ToolCall call = blockedBatch.get(index);
-            String result = cancellationResult(call.name());
-            if (approvalRepository.completePendingToolCall(
-                    taskId,
-                    call.id(),
-                    ToolCallStatus.REJECTED,
-                    result,
-                    now) != 1) {
-                throw new ApprovalConflictException(
-                        "Tool call is no longer pending");
+            String result;
+            if (ledger.getStatus() == ToolCallStatus.PENDING) {
+                result = cancellationResult(call.name());
+                if (approvalRepository.completePendingToolCall(
+                        taskId,
+                        call.id(),
+                        ToolCallStatus.REJECTED,
+                        result,
+                        now) != 1) {
+                    throw new ApprovalConflictException(
+                            "Tool call is no longer pending");
+                }
+            } else if (ledger.getStatus() == ToolCallStatus.REJECTED
+                    && ledger.getResult() != null) {
+                result = ledger.getResult();
+            } else {
+                throw new IllegalStateException(
+                        "Waiting approval batch contains an executed or malformed tool call");
+            }
+            if (messageRepository.existsByTaskIdAndRoleAndToolCallId(
+                    taskId, "tool", call.id())) {
+                continue;
             }
             messageRepository.save(new MessageEntity(
                     taskId,

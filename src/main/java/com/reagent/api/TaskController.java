@@ -139,11 +139,23 @@ public class TaskController {
         }
         // M7 Stage4:先试本地(任务恰在本 worker 驱动)—— 立即生效,force 还能硬杀 in-flight 工具
         if (taskControl.requestCancel(id, force)) {
+            if (approvalService.cancelWaiting(id)) {
+                return ResponseEntity.accepted().body(Map.of(
+                        "taskId", id,
+                        "message", "已取消等待审批的任务"));
+            }
             return ResponseEntity.accepted().body(Map.of("taskId", id,
                     "message", force ? "已请求取消(本地 force 硬杀)" : "已请求取消(本地优雅:当前工具跑完后停)"));
         }
         // 本地没有 → 任务在别的 worker 上:落 DB 控制信号,由其 owner 在安全点优雅消费(位置透明)
-        if (stateStore.requestControl(id, "CANCEL")) {
+        boolean remoteRequested =
+                stateStore.requestControl(id, "CANCEL");
+        if (approvalService.cancelWaiting(id)) {
+            return ResponseEntity.accepted().body(Map.of(
+                    "taskId", id,
+                    "message", "已取消等待审批的任务"));
+        }
+        if (remoteRequested) {
             return ResponseEntity.accepted().body(Map.of("taskId", id,
                     "message", "已请求取消(跨 worker:owner 将在安全点优雅停"
                             + (force ? ";force 跨 worker 退化为优雅)" : ")")));
