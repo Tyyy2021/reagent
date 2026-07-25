@@ -13,6 +13,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DecisionTest {
 
@@ -137,6 +138,128 @@ class DecisionTest {
                 UnsupportedOperationException.class,
                 () -> decision.getToolCalls().add(
                         new ToolCall("call-other", "read_file", "{}")));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void deeplyDetachesAndFreezesToolAssistantMessage() {
+        Map<String, Object> arguments = new LinkedHashMap<>();
+        arguments.put("path", "README.md");
+        Map<String, Object> function = new LinkedHashMap<>();
+        function.put("name", "read_file");
+        function.put("arguments", arguments);
+        Map<String, Object> rawCall = new LinkedHashMap<>();
+        rawCall.put("id", "call-frozen");
+        rawCall.put("type", "function");
+        rawCall.put("function", function);
+        List<Map<String, Object>> rawCalls =
+                new ArrayList<>(List.of(rawCall));
+        Map<String, Object> assistant = new LinkedHashMap<>();
+        assistant.put("role", "assistant");
+        assistant.put("content", null);
+        assistant.put("tool_calls", rawCalls);
+        ToolCall executable = new ToolCall(
+                "call-frozen", "read_file", "{\"path\":\"README.md\"}");
+
+        Decision decision = Decision.tools(
+                assistant, List.of(executable));
+        assistant.put("content", "mutated");
+        arguments.put("path", "OTHER.md");
+        function.put("name", "list_dir");
+        rawCall.put("id", "call-mutated");
+        rawCalls.clear();
+
+        Map<String, Object> snapshot = decision.getAssistantMessage();
+        assertEquals(null, snapshot.get("content"));
+        assertEquals(
+                List.of(executable),
+                ToolCall.parseAssistantToolCalls(snapshot.get("tool_calls")));
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> snapshot.put("content", "blocked"));
+        List<Map<String, Object>> snapshotCalls =
+                (List<Map<String, Object>>) snapshot.get("tool_calls");
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> snapshotCalls.clear());
+        Map<String, Object> snapshotFunction =
+                (Map<String, Object>) snapshotCalls.getFirst().get("function");
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> snapshotFunction.put("name", "blocked"));
+        Map<String, Object> snapshotArguments =
+                (Map<String, Object>) snapshotFunction.get("arguments");
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> snapshotArguments.put("path", "blocked"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void deeplyDetachesAndFreezesFinalAssistantMessage() {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("source", "model");
+        Map<String, Object> assistant = new LinkedHashMap<>();
+        assistant.put("role", "assistant");
+        assistant.put("content", "done");
+        assistant.put("metadata", metadata);
+
+        Decision decision = Decision.finalAnswer("done", assistant);
+        assistant.put("content", "mutated");
+        metadata.put("source", "mutated");
+
+        assertEquals("done", decision.getAssistantMessage().get("content"));
+        Map<String, Object> snapshotMetadata =
+                (Map<String, Object>) decision.getAssistantMessage().get("metadata");
+        assertEquals("model", snapshotMetadata.get("source"));
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> snapshotMetadata.put("source", "blocked"));
+    }
+
+    @ParameterizedTest(name = "rejects final assistant with {0}")
+    @MethodSource("invalidFinalToolCalls")
+    void rejectsInvalidOrNonEmptyFinalToolCalls(
+            String ignored, Map<String, Object> assistant) {
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class,
+                () -> Decision.finalAnswer("done", assistant));
+
+        assertEquals("Invalid final assistant message", error.getMessage());
+    }
+
+    private static Stream<Arguments> invalidFinalToolCalls() {
+        return Stream.of(
+                Arguments.of(
+                        "malformed tool_calls",
+                        assistantWithToolCalls(Map.of())),
+                Arguments.of(
+                        "non-empty tool_calls",
+                        assistant(List.of(rawCall(
+                                true,
+                                "call-final",
+                                true,
+                                "read_file",
+                                "{}")))));
+    }
+
+    @ParameterizedTest(name = "allows final assistant with {0}")
+    @MethodSource("validFinalToolCalls")
+    void allowsMissingNullOrEmptyFinalToolCalls(
+            String ignored, Map<String, Object> assistant) {
+        Decision decision = Decision.finalAnswer("done", assistant);
+
+        assertTrue(decision.isFinal());
+        assertEquals("done", decision.getAnswer());
+    }
+
+    private static Stream<Arguments> validFinalToolCalls() {
+        Map<String, Object> explicitNull = assistantWithoutToolCalls();
+        explicitNull.put("tool_calls", null);
+        return Stream.of(
+                Arguments.of("missing tool_calls", assistantWithoutToolCalls()),
+                Arguments.of("null tool_calls", explicitNull),
+                Arguments.of("empty tool_calls", assistant(List.of())));
     }
 
     private static ToolCall validCall() {
