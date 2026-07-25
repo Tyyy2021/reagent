@@ -21,5 +21,6 @@ public enum ToolCallStatus {
     PENDING,
     IN_PROGRESS,
     DONE,
-    IN_DOUBT
+    IN_DOUBT,
+    REJECTED
 }

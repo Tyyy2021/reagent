@@ -75,6 +75,24 @@ public interface TaskRepository extends JpaRepository<TaskEntity, String> {
             """)
     int renew(@Param("id") String id, @Param("me") String me, @Param("epoch") long epoch, @Param("expires") Instant expires);
 
+    @Modifying(clearAutomatically = true)
+    @Query("""
+            UPDATE TaskEntity t
+               SET t.status = com.reagent.persist.TaskStatus.WAITING_APPROVAL,
+                   t.ownerId = null,
+                   t.leaseExpiresAt = null,
+                   t.updatedAt = :now
+             WHERE t.id = :id
+               AND t.status = com.reagent.persist.TaskStatus.RUNNING
+               AND t.ownerId = :workerId
+               AND t.leaseEpoch = :epoch
+            """)
+    int waitForApproval(
+            @Param("id") String id,
+            @Param("workerId") String workerId,
+            @Param("epoch") long epoch,
+            @Param("now") Instant now);
+
     /**
      * ★ M7 Stage4:跨 worker 下达控制信号 —— 仅对仍在跑(RUNNING)的任务有意义(由其 owner 在安全点消费)。
      * @return 1 = 已记录;0 = 任务不在 RUNNING(已结束 / 暂停等),调用方据此回 409。

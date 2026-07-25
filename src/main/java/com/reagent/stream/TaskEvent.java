@@ -28,6 +28,7 @@ public record TaskEvent(String taskId, String eventId, Type type, Object data, I
         TOOL_CALL,      // 要调某工具
         TOOL_RESULT,    // 某工具返回
         KNOWLEDGE_RETRIEVED, // RAG citations retrieved; event data is metadata-only
+        APPROVAL_REQUIRED, // durable task state is WAITING_APPROVAL; this event ends the current run
         COMPLETED,      // 任务完成(终态)
         FAILED,         // 任务失败(终态)
         CANCELLED,      // 用户取消(终态)
@@ -42,6 +43,7 @@ public record TaskEvent(String taskId, String eventId, Type type, Object data, I
     /** 本次 run 的收尾事件:之后该 run 不再有新事件,SSE 端据此收尾。注意 PAUSED 非任务终态(可 resume),但对"本次 SSE 流"而言已结束。 */
     public boolean isTerminal() {
         return type == Type.COMPLETED || type == Type.FAILED
-                || type == Type.CANCELLED || type == Type.PAUSED;
+                || type == Type.CANCELLED || type == Type.PAUSED
+                || type == Type.APPROVAL_REQUIRED;
     }
 }

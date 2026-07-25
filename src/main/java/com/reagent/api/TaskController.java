@@ -1,5 +1,6 @@
 package com.reagent.api;
 
+import com.reagent.approval.ApprovalService;
 import com.reagent.core.AgentRunner;
 import com.reagent.core.TaskControl;
 import com.reagent.persist.StateStore;
@@ -38,12 +39,20 @@ public class TaskController {
     private final StateStore stateStore;
     private final StreamTransport bus;
     private final TaskControl taskControl;
+    private final ApprovalService approvalService;
 
-    public TaskController(AgentRunner runner, StateStore stateStore, StreamTransport bus, TaskControl taskControl) {
+    public TaskController(
+            AgentRunner runner,
+            StateStore stateStore,
+            StreamTransport bus,
+            TaskControl taskControl,
+            ApprovalService approvalService
+    ) {
         this.runner = runner;
         this.stateStore = stateStore;
         this.bus = bus;
         this.taskControl = taskControl;
+        this.approvalService = approvalService;
     }
 
     /**
@@ -123,6 +132,11 @@ public class TaskController {
     @PostMapping("/{id}/cancel")
     public ResponseEntity<Map<String, String>> cancel(@PathVariable String id,
                                                       @RequestParam(defaultValue = "false") boolean force) {
+        if (approvalService.cancelWaiting(id)) {
+            return ResponseEntity.accepted().body(Map.of(
+                    "taskId", id,
+                    "message", "已取消等待审批的任务"));
+        }
         // M7 Stage4:先试本地(任务恰在本 worker 驱动)—— 立即生效,force 还能硬杀 in-flight 工具
         if (taskControl.requestCancel(id, force)) {
             return ResponseEntity.accepted().body(Map.of("taskId", id,

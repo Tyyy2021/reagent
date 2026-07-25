@@ -53,25 +53,26 @@ class SchemaMigrationIT {
 
     @Test
     @Order(1)
-    void createsFreshRuntimeSchemaAtVersionThree() throws SQLException {
+    void createsFreshRuntimeSchemaAtVersionFour() throws SQLException {
         Flyway flyway = flyway(FRESH_DATABASE, false);
 
         MigrateResult result = flyway.migrate();
 
         assertTrue(result.success, "Flyway migration must succeed");
-        assertEquals(3, result.migrationsExecuted, "Fresh schema must execute V1 through V3");
+        assertEquals(4, result.migrationsExecuted, "Fresh schema must execute V1 through V4");
         assertHistoryRow(FRESH_DATABASE, "1", "SQL");
         assertHistoryRow(FRESH_DATABASE, "2", "SQL");
         assertHistoryRow(FRESH_DATABASE, "3", "SQL");
+        assertHistoryRow(FRESH_DATABASE, "4", "SQL");
         assertTables(FRESH_DATABASE, Set.of(
-                "task", "message", "tool_call", "event", "incident_intake",
+                "task", "message", "tool_call", "event", "incident_intake", "approval_request",
                 "flyway_schema_history"));
-        assertV3Metadata(FRESH_DATABASE);
+        assertV4Metadata(FRESH_DATABASE);
     }
 
     @Test
     @Order(2)
-    void upgradesLegacyRuntimeSchemaAndConvergesAtVersionThree() throws SQLException {
+    void upgradesLegacyRuntimeSchemaAndConvergesAtVersionFour() throws SQLException {
         createLegacySchema();
         execute(LEGACY_DATABASE, """
                 INSERT INTO task (id, goal, status, recovery_count, lease_epoch)
@@ -81,13 +82,14 @@ class SchemaMigrationIT {
         MigrateResult result = flyway(LEGACY_DATABASE, true).migrate();
 
         assertTrue(result.success, "Flyway baseline migration must succeed");
-        assertEquals(2, result.migrationsExecuted,
-                "Existing V1 schema must baseline then execute V2 and V3");
+        assertEquals(3, result.migrationsExecuted,
+                "Existing V1 schema must baseline then execute V2 through V4");
         assertHistoryRow(LEGACY_DATABASE, "1", "BASELINE");
         assertHistoryRow(LEGACY_DATABASE, "2", "SQL");
         assertHistoryRow(LEGACY_DATABASE, "3", "SQL");
+        assertHistoryRow(LEGACY_DATABASE, "4", "SQL");
         assertTables(LEGACY_DATABASE, Set.of(
-                "task", "message", "tool_call", "event", "incident_intake",
+                "task", "message", "tool_call", "event", "incident_intake", "approval_request",
                 "flyway_schema_history"));
         try (Connection connection = databaseConnection(LEGACY_DATABASE);
              PreparedStatement statement = connection.prepareStatement(
@@ -99,9 +101,9 @@ class SchemaMigrationIT {
             assertEquals(null, rows.getString("profile_snapshot"),
                     "Legacy snapshot remains null until StateStore materializes it under lock");
         }
-        assertV3Metadata(LEGACY_DATABASE);
+        assertV4Metadata(LEGACY_DATABASE);
         assertEquals(columnMetadata(FRESH_DATABASE), columnMetadata(LEGACY_DATABASE),
-                "Fresh and upgraded V3 runtime metadata must converge exactly");
+                "Fresh and upgraded V4 runtime metadata must converge exactly");
     }
 
     private static Flyway flyway(String database, boolean baselineOnMigrate) {
@@ -191,7 +193,7 @@ class SchemaMigrationIT {
         }
     }
 
-    private static void assertV3Metadata(String database) throws SQLException {
+    private static void assertV4Metadata(String database) throws SQLException {
         assertColumn(database, "task", "profile_id", "varchar(64)", "YES");
         assertColumn(database, "task", "profile_snapshot", "mediumtext", "YES");
         assertColumn(database, "task", "status", "varchar(32)", "NO");
@@ -203,6 +205,15 @@ class SchemaMigrationIT {
         assertColumn(database, "incident_intake", "bounded_payload_json", "mediumtext", "NO");
         assertColumn(database, "incident_intake", "task_id", "varchar(255)", "NO");
         assertColumn(database, "incident_intake", "created_at", "datetime(6)", "NO");
+        assertColumn(database, "approval_request", "tool_call_id", "varchar(255)", "NO");
+        assertColumn(database, "approval_request", "task_id", "varchar(255)", "NO");
+        assertColumn(database, "approval_request", "assistant_message_seq", "int", "NO");
+        assertColumn(database, "approval_request", "tool_name", "varchar(64)", "NO");
+        assertColumn(database, "approval_request", "arguments_snapshot", "mediumtext", "NO");
+        assertColumn(database, "approval_request", "status", "varchar(16)", "NO");
+        assertColumn(database, "approval_request", "decision_reason", "varchar(512)", "YES");
+        assertColumn(database, "approval_request", "requested_at", "datetime(6)", "NO");
+        assertColumn(database, "approval_request", "decided_at", "datetime(6)", "YES");
 
         List<String> columns = new java.util.ArrayList<>();
         try (Connection connection = databaseConnection(database);
@@ -224,7 +235,38 @@ class SchemaMigrationIT {
         assertIndexColumns(database, "incident_intake", "uk_incident_source_external",
                 List.of("source", "external_alert_id"));
         assertIndexColumns(database, "incident_intake", "uk_incident_task", List.of("task_id"));
+        assertIndexColumns(database, "approval_request", "idx_approval_task_status",
+                List.of("task_id", "status"));
         assertIncidentTaskForeignKey(database);
+        assertApprovalForeignKey(database, "fk_approval_task", "task_id", "task", "id");
+        assertApprovalForeignKey(
+                database, "fk_approval_tool_call", "tool_call_id", "tool_call", "id");
+    }
+
+    private static void assertApprovalForeignKey(
+            String database,
+            String constraint,
+            String column,
+            String referencedTable,
+            String referencedColumn
+    ) throws SQLException {
+        try (Connection connection = databaseConnection(database);
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT column_name, referenced_table_name, referenced_column_name
+                     FROM information_schema.key_column_usage
+                     WHERE table_schema = ? AND table_name = 'approval_request'
+                       AND constraint_name = ?
+                     """)) {
+            statement.setString(1, database);
+            statement.setString(2, constraint);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertTrue(rows.next(), "Missing approval foreign key " + constraint);
+                assertEquals(column, rows.getString("column_name"));
+                assertEquals(referencedTable, rows.getString("referenced_table_name"));
+                assertEquals(referencedColumn, rows.getString("referenced_column_name"));
+                assertTrue(!rows.next(), "Approval foreign key metadata must be unique");
+            }
+        }
     }
 
     private static void assertIndexColumns(
@@ -300,7 +342,7 @@ class SchemaMigrationIT {
                             column_default, extra, character_set_name, collation_name
                      FROM information_schema.columns
                      WHERE table_schema = ?
-                       AND table_name IN ('task', 'tool_call', 'incident_intake')
+                       AND table_name IN ('task', 'tool_call', 'incident_intake', 'approval_request')
                      ORDER BY table_name, ordinal_position
                      """)) {
             statement.setString(1, database);

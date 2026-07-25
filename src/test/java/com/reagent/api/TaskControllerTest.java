@@ -1,5 +1,6 @@
 package com.reagent.api;
 
+import com.reagent.approval.ApprovalService;
 import com.reagent.core.AgentRunner;
 import com.reagent.core.TaskControl;
 import com.reagent.persist.StateStore;
@@ -27,14 +28,22 @@ class TaskControllerTest {
 
     private AgentRunner runner;
     private StateStore stateStore;
+    private TaskControl taskControl;
+    private ApprovalService approvalService;
     private MockMvc mvc;
 
     @BeforeEach
     void setUp() {
         runner = mock(AgentRunner.class);
         stateStore = mock(StateStore.class);
+        taskControl = mock(TaskControl.class);
+        approvalService = mock(ApprovalService.class);
         TaskController controller = new TaskController(
-                runner, stateStore, mock(StreamTransport.class), mock(TaskControl.class));
+                runner,
+                stateStore,
+                mock(StreamTransport.class),
+                taskControl,
+                approvalService);
         mvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new ApiExceptionHandler())
                 .build();
@@ -140,6 +149,20 @@ class TaskControllerTest {
         mvc.perform(post("/api/tasks/completed-cancel/cancel"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.taskId").value("completed-cancel"));
+    }
+
+    @Test
+    void cancellingWaitingApprovalTaskIsAcceptedWithoutSchedulingResume() throws Exception {
+        when(approvalService.cancelWaiting("waiting-cancel")).thenReturn(true);
+
+        mvc.perform(post("/api/tasks/waiting-cancel/cancel"))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.taskId").value("waiting-cancel"));
+
+        verify(approvalService).cancelWaiting("waiting-cancel");
+        verifyNoInteractions(runner);
+        verifyNoInteractions(stateStore);
+        verifyNoInteractions(taskControl);
     }
 
     @Test

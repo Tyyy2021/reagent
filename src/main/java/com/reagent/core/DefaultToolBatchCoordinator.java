@@ -61,6 +61,13 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
         if (!toolContext.runToken().filter(token::equals).isPresent()) {
             throw new IllegalArgumentException("ToolContext must carry the same TaskRunToken as the batch");
         }
+        if (stateStore.prepareApprovalBarrier(token, catalog, calls)) {
+            bus.publish(
+                    token,
+                    TaskEvent.Type.APPROVAL_REQUIRED,
+                    Map.of("status", "WAITING_APPROVAL"));
+            return BatchDisposition.WAITING_APPROVAL;
+        }
 
         List<ToolCall> toRun = new ArrayList<>();
         List<ToolCall> actionable = new ArrayList<>();
@@ -69,7 +76,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
         for (ToolCall call : calls) {
             ToolCallStatus status = stateStore.statusOf(token, call.id());
             switch (status) {
-                case DONE, IN_DOUBT ->
+                case DONE, IN_DOUBT, REJECTED ->
                         log.info("账本已是终态 {},跳过: {}", status, observableToolName(catalog, call));
                 case IN_PROGRESS -> {
                     actionable.add(call);

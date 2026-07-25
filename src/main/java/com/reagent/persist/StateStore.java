@@ -2,12 +2,20 @@ package com.reagent.persist;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.approval.ApprovalRequestEntity;
+import com.reagent.approval.ApprovalRequestRepository;
+import com.reagent.approval.ApprovalStatus;
 import com.reagent.core.Context;
+import com.reagent.core.FencedExecutionException;
 import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
 import com.reagent.core.WorkerIdentity;
 import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.profile.TaskProfileSnapshot;
+import com.reagent.profile.TaskToolCatalog;
+import com.reagent.profile.ToolSnapshot;
+import com.reagent.tool.ApprovalPolicy;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
@@ -53,6 +61,7 @@ public class StateStore {
     private final long leaseTtlMs;              // M7:租约时长
     private final Clock clock;
     private final TaskLeaseGuard leaseGuard;
+    private final ApprovalRequestRepository approvalRepo;
 
     @Value("${reagent.profiles.max-snapshot-bytes:262144}")
     private int maxProfileSnapshotBytes = 262_144;
@@ -64,6 +73,19 @@ public class StateStore {
                       @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs,
                       Clock clock,
                       TaskLeaseGuard leaseGuard) {
+        this(taskRepo, messageRepo, toolCallRepo, mapper, profileRegistry, worker,
+                leaseTtlMs, clock, leaseGuard, null);
+    }
+
+    @Autowired
+    public StateStore(TaskRepository taskRepo, MessageRepository messageRepo,
+                      ToolCallRepository toolCallRepo, ObjectMapper mapper,
+                      AgentProfileRegistry profileRegistry,
+                      WorkerIdentity worker,
+                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs,
+                      Clock clock,
+                      TaskLeaseGuard leaseGuard,
+                      ApprovalRequestRepository approvalRepo) {
         this.taskRepo = taskRepo;
         this.messageRepo = messageRepo;
         this.toolCallRepo = toolCallRepo;
@@ -73,6 +95,7 @@ public class StateStore {
         this.leaseTtlMs = leaseTtlMs;
         this.clock = clock;
         this.leaseGuard = leaseGuard;
+        this.approvalRepo = approvalRepo;
     }
 
     // ===================== 任务生命周期 =====================
@@ -258,6 +281,92 @@ public class StateStore {
     @Transactional
     public int recoveryCount(TaskRunToken token) {
         return leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING)).getRecoveryCount();
+    }
+
+    /**
+     * Materializes approval rows from the validated durable ledger and frozen catalog before
+     * any call in the assistant batch can become IN_PROGRESS.
+     *
+     * @return true when at least one approval remains pending and this run must stop.
+     */
+    @Transactional
+    public boolean prepareApprovalBarrier(
+            TaskRunToken token,
+            TaskToolCatalog catalog,
+            List<ToolCall> calls
+    ) {
+        if (catalog == null) {
+            return false;
+        }
+        boolean approvalRequired = calls.stream()
+                .map(call -> catalog.snapshot(call.name()))
+                .anyMatch(snapshot -> snapshot != null
+                        && snapshot.approvalPolicy()
+                        == ApprovalPolicy.REQUIRE_APPROVAL);
+        if (!approvalRequired) {
+            return false;
+        }
+        if (approvalRepo == null) {
+            throw new IllegalStateException("Approval repository is unavailable");
+        }
+        TaskEntity task = taskRepo.findByIdForUpdate(token.taskId())
+                .orElseThrow(() -> new FencedExecutionException(
+                        token, null, -1, null));
+        boolean alreadyWaiting = task.getStatus() == TaskStatus.WAITING_APPROVAL
+                && task.getOwnerId() == null
+                && task.getLeaseEpoch() == token.leaseEpoch();
+        String durableTaskId = task.getId();
+        if (!alreadyWaiting) {
+            task = leaseGuard.lockOwned(
+                    token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        }
+        boolean pending = false;
+        Instant now = clock.instant();
+        for (ToolCall call : calls) {
+            ToolSnapshot snapshot = catalog.snapshot(call.name());
+            if (snapshot == null
+                    || snapshot.approvalPolicy() != ApprovalPolicy.REQUIRE_APPROVAL) {
+                continue;
+            }
+            ToolCallEntity ledger = matchingOwnedToolCall(durableTaskId, call)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "Approval requires a validated persisted tool call"));
+            if (ledger.getAssistantMessageSeq() == null) {
+                throw new IllegalStateException(
+                        "Approval requires an assistant message sequence");
+            }
+            ApprovalRequestEntity approval = approvalRepo.findById(call.id())
+                    .orElseGet(() -> approvalRepo.save(ApprovalRequestEntity.pending(
+                            ledger.getId(),
+                            durableTaskId,
+                            ledger.getAssistantMessageSeq(),
+                            snapshot.name(),
+                            ledger.getArguments(),
+                            now)));
+            if (!durableTaskId.equals(approval.getTaskId())
+                    || !snapshot.name().equals(approval.getToolName())
+                    || !ledger.getArguments().equals(approval.getArgumentsSnapshot())
+                    || ledger.getAssistantMessageSeq() != approval.getAssistantMessageSeq()) {
+                throw new IllegalStateException(
+                        "Approval request identity does not match persisted batch");
+            }
+            pending |= approval.getStatus() == ApprovalStatus.PENDING;
+        }
+        if (pending && !alreadyWaiting) {
+            approvalRepo.flush();
+            waitForApproval(token);
+        }
+        return pending;
+    }
+
+    /** Atomically moves the token-owned task to its durable wait state and releases its lease. */
+    @Transactional
+    public void waitForApproval(TaskRunToken token) {
+        leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        if (taskRepo.waitForApproval(
+                token.taskId(), token.workerId(), token.leaseEpoch(), clock.instant()) != 1) {
+            throw new FencedExecutionException(token, null, token.leaseEpoch(), null);
+        }
     }
 
     // ===================== 落库:每步 =====================
