@@ -70,20 +70,22 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             ToolCallStatus status = stateStore.statusOf(token, call.id());
             switch (status) {
                 case DONE, IN_DOUBT ->
-                        log.info("账本已是终态 {},跳过: {}", status, call.name());
+                        log.info("账本已是终态 {},跳过: {}", status, observableToolName(catalog, call));
                 case IN_PROGRESS -> {
                     actionable.add(call);
                     if (canSafelyReplay(catalog, call)) {
-                        log.info("in-doubt 但工具可安全重放,重跑: {}", call.name());
+                        log.info("in-doubt 但工具可安全重放,重跑: {}",
+                                observableToolName(catalog, call));
                         toRun.add(call);
                     } else {
                         Optional<String> journaled = RunJournal.completion(toolContext.workspaceDir(), call.id());
                         if (journaled.isPresent()) {
                             log.info("in-doubt 但 journal 有完成记录(exit={}),对账标 DONE、不重跑: {}",
-                                    journaled.get(), call.name());
+                                    journaled.get(), observableToolName(catalog, call));
                             reconciled.put(call.id(), reconciledMessage(call, journaled.get()));
                         } else {
-                            log.warn("in-doubt 且无 journal 完成记录,未自动重试,上报存疑: {}", call.name());
+                            log.warn("in-doubt 且无 journal 完成记录,未自动重试,上报存疑: {}",
+                                    observableToolName(catalog, call));
                             inDoubt.put(call.id(), inDoubtMessage(call));
                         }
                     }
@@ -105,14 +107,14 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             }
             for (ToolCall call : actionable) {
                 bus.publish(token, TaskEvent.Type.TOOL_CALL, Map.of(
-                        "id", call.id(), "name", call.name()));
+                        "id", call.id(), "name", observableToolName(catalog, call)));
             }
             log.info("并发执行本轮 {} 个工具调用", toRun.size());
             results.putAll(executor.executeConcurrently(catalog, toRun, toolContext));
         } else {
             for (ToolCall call : actionable) {
                 bus.publish(token, TaskEvent.Type.TOOL_CALL, Map.of(
-                        "id", call.id(), "name", call.name()));
+                        "id", call.id(), "name", observableToolName(catalog, call)));
             }
         }
 
@@ -131,9 +133,9 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
             if (ran.contains(call.id())) {
                 if (forced && !canSafelyReplay(catalog, call)) {
                     log.warn("force-cancel 中途打断 SIDE_EFFECTFUL 工具,留 IN_PROGRESS(in-doubt)、不记 DONE: {}",
-                            call.name());
+                            observableToolName(catalog, call));
                     bus.publish(token, TaskEvent.Type.TOOL_RESULT, Map.of(
-                            "id", call.id(), "name", call.name(),
+                            "id", call.id(), "name", observableToolName(catalog, call),
                             "outcome", "IN_DOUBT", "inDoubt", true));
                 } else {
                     ToolExecutionOutcome outcome = results.get(call.id());
@@ -146,7 +148,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                         recoveryRequired = true;
                         bus.publish(token, TaskEvent.Type.TOOL_RESULT, Map.of(
                                 "id", call.id(),
-                                "name", call.name(),
+                                "name", observableToolName(catalog, call),
                                 "outcome", "REMOTE_OUTCOME_UNKNOWN",
                                 "recoveryRequired", true));
                         continue;
@@ -159,7 +161,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                     context.addToolResult(call.id(), result);
                     bus.publish(token, TaskEvent.Type.TOOL_RESULT,
                             Map.of(
-                                    "id", call.id(), "name", call.name(),
+                                    "id", call.id(), "name", observableToolName(catalog, call),
                                     "outcome", "DEFINITIVE"));
                 }
             } else if (reconciled.containsKey(call.id())) {
@@ -171,7 +173,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                 context.addToolResult(call.id(), message);
                 bus.publish(token, TaskEvent.Type.TOOL_RESULT,
                         Map.of(
-                                "id", call.id(), "name", call.name(),
+                                "id", call.id(), "name", observableToolName(catalog, call),
                                 "outcome", "DEFINITIVE", "reconciled", true));
             } else if (inDoubt.containsKey(call.id())) {
                 String message = inDoubt.get(call.id());
@@ -182,7 +184,7 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
                 context.addToolResult(call.id(), message);
                 bus.publish(token, TaskEvent.Type.TOOL_RESULT,
                         Map.of(
-                                "id", call.id(), "name", call.name(),
+                                "id", call.id(), "name", observableToolName(catalog, call),
                                 "outcome", "IN_DOUBT", "inDoubt", true));
             }
         }
@@ -204,6 +206,12 @@ public class DefaultToolBatchCoordinator implements ToolBatchCoordinator {
         }
         IdempotencyClass idempotency = tool.idempotencyClass();
         return idempotency == IdempotencyClass.READ_ONLY || idempotency == IdempotencyClass.IDEMPOTENT;
+    }
+
+    private static String observableToolName(
+            TaskToolCatalog catalog, ToolCall call) {
+        ToolSnapshot snapshot = catalog.snapshot(call.name());
+        return snapshot == null ? "unknown" : snapshot.name();
     }
 
     private static String reconciledMessage(ToolCall call, String exitCode) {

@@ -43,6 +43,9 @@ import java.util.Optional;
 @Service
 public class AgentRunner {
 
+    private static final String TASK_EXECUTION_FAILED =
+            "task_execution_failed";
+
     private static final Logger log = LoggerFactory.getLogger(AgentRunner.class);
 
     /** 停止条件:最多走多少步,防止 agent 死循环烧钱 */
@@ -336,7 +339,10 @@ public class AgentRunner {
             log.error("任务 {} 执行异常,标记 FAILED", taskId);
             try {
                 stateStore.failTask(token, "执行异常: " + ex.getMessage());
-                bus.publish(token, TaskEvent.Type.FAILED, Map.of("error", String.valueOf(ex.getMessage())));
+                bus.publish(
+                        token,
+                        TaskEvent.Type.FAILED,
+                        Map.of("error", TASK_EXECUTION_FAILED));
             } catch (FencedExecutionException fenced) {
                 log.warn("任务 {} 写 FAILED 前已被接管,旧 worker 停止且不发布 FAILED",
                         taskId);

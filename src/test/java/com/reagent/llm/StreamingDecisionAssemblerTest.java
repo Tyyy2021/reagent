@@ -14,6 +14,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -121,6 +122,33 @@ class StreamingDecisionAssemblerTest {
         assertEquals(1, d.getToolCalls().size());
         assertEquals("{}", d.getToolCalls().get(0).arguments());   // 兜底成 {} 而非空串
         assertNull(d.getAnswer());                                  // tools 决策无 answer
+    }
+
+    @Test
+    void unsafeToolIdentityFailsBeforeDecisionCanBePersisted() {
+        StreamingDecisionAssembler invalidId =
+                new StreamingDecisionAssembler(null);
+        invalidId.acceptDelta(toolCallDelta(
+                0,
+                "https://secret.example/CALL_SECRET_SENTINEL",
+                "read_file",
+                "{}"));
+        IllegalArgumentException idError = assertThrows(
+                IllegalArgumentException.class, invalidId::build);
+        assertEquals("Invalid tool call id", idError.getMessage());
+        assertFalse(idError.getMessage().contains("CALL_SECRET_SENTINEL"));
+
+        StreamingDecisionAssembler invalidName =
+                new StreamingDecisionAssembler(null);
+        invalidName.acceptDelta(toolCallDelta(
+                0,
+                "call-safe",
+                "SECRET/TOOL/NAME",
+                "{}"));
+        IllegalArgumentException nameError = assertThrows(
+                IllegalArgumentException.class, invalidName::build);
+        assertEquals("Invalid tool call name", nameError.getMessage());
+        assertFalse(nameError.getMessage().contains("SECRET/TOOL/NAME"));
     }
 
     // ====== M6:token usage(stream_options.include_usage=true 时,流末尾会多一个 choices 为空、带 usage 的 chunk)======

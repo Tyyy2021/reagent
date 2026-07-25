@@ -41,6 +41,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -145,7 +146,7 @@ class ToolExecutorTracingTest {
         AtomicInteger executions = new AtomicInteger();
         Tool listed = new FakeTool("listed");
         Tool extra = new Tool() {
-            @Override public String name() { return "extra"; }
+            @Override public String name() { return "SECRET_UNKNOWN_TOOL"; }
             @Override public String description() { return "not allowlisted"; }
             @Override public Map<String, Object> parameterSchema() { return Map.of("type", "object"); }
             @Override public String execute(JsonNode args, ToolContext ctx) {
@@ -159,16 +160,41 @@ class ToolExecutorTracingTest {
                 new ToolRegistry(List.of(listed, extra)), new SchemaHasher(mapper), properties);
         TaskToolCatalog catalog = resolver.resolve(resolver.snapshot(new AgentProfileDefinition(
                 "coding", "v1", "prompt", null, null, List.of(), List.of("listed"))));
-        Tracer tracer = OpenTelemetrySdk.builder().build().getTracer("test");
-        ToolExecutor executor = new ToolExecutor(mapper, properties, tracer);
+        InMemorySpanExporter exporter = InMemorySpanExporter.create();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(exporter))
+                .build();
+        ToolExecutor executor = new ToolExecutor(
+                mapper,
+                properties,
+                OpenTelemetrySdk.builder()
+                        .setTracerProvider(provider)
+                        .build()
+                        .getTracer("test"));
+        try {
+            ToolExecutionOutcome result = executor.execute(
+                    catalog,
+                    new ToolCall("call-extra", extra.name(), "{}"),
+                    new ToolContext("task-1", Path.of(".")));
 
-        ToolExecutionOutcome result = executor.execute(catalog,
-                new ToolCall("call-extra", "extra", "{}"), new ToolContext("task-1", Path.of(".")));
-
-        assertEquals(0, executions.get());
-        assertEquals(
-                ToolExecutionOutcome.definitive("错误:不存在名为 'extra' 的工具。"),
-                result);
+            assertEquals(0, executions.get());
+            assertEquals(
+                    ToolExecutionOutcome.definitive(
+                            "错误:不存在名为 'SECRET_UNKNOWN_TOOL' 的工具。"),
+                    result);
+            SpanData toolSpan = exporter.getFinishedSpanItems().getFirst();
+            assertEquals("execute_tool unknown", toolSpan.getName());
+            assertEquals(
+                    "unknown",
+                    toolSpan.getAttributes().get(Trace.TOOL_NAME));
+            assertEquals(
+                    "call-extra",
+                    toolSpan.getAttributes().get(Trace.TOOL_CALL_ID));
+            assertFalse((toolSpan.getAttributes() + " " + toolSpan.getEvents())
+                    .contains("SECRET_UNKNOWN_TOOL"));
+        } finally {
+            provider.close();
+        }
     }
 
     @Test
@@ -310,7 +336,8 @@ class ToolExecutorTracingTest {
     }
 
     @Test
-    void fatalCrashAndFenceSignalsEscapeWithoutTextConversionAndCancelSiblings() {
+    void fatalCrashAndFenceSignalsEscapeWithoutTextConversionAndCancelSiblings()
+            throws Exception {
         TaskRunToken token = new TaskRunToken("task-1", "worker-a", 7);
         InjectedWorkerCrashException crash = new InjectedWorkerCrashException(
                 FaultPoint.AFTER_REMOTE_SIDE_EFFECT_BEFORE_LOCAL_RESULT,
@@ -323,7 +350,7 @@ class ToolExecutorTracingTest {
         FencedExecutionException fenced =
                 new FencedExecutionException(token, "worker-b", 8, TaskStatus.RUNNING);
         CountDownLatch siblingStarted = new CountDownLatch(1);
-        AtomicBoolean siblingCancelled = new AtomicBoolean();
+        CountDownLatch siblingCancelled = new CountDownLatch(1);
         Tool crashTool = throwingTool("crash", () -> {
             if (!siblingStarted.await(1, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("sibling did not start");
@@ -335,7 +362,7 @@ class ToolExecutorTracingTest {
             try {
                 new CountDownLatch(1).await(2, TimeUnit.SECONDS);
             } catch (InterruptedException ex) {
-                siblingCancelled.set(true);
+                siblingCancelled.countDown();
                 Thread.currentThread().interrupt();
             }
             return "sibling";
@@ -372,7 +399,7 @@ class ToolExecutorTracingTest {
                                 new ToolCall("call-sibling", "sibling", "{}")),
                         context));
         assertSame(crash, observedCrash);
-        assertTrue(siblingCancelled.get());
+        assertTrue(siblingCancelled.await(1, TimeUnit.SECONDS));
 
         FencedExecutionException observedFence = assertThrows(
                 FencedExecutionException.class,
@@ -583,6 +610,80 @@ class ToolExecutorTracingTest {
                 ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
                 outcomes.get("call-ticket").kind());
         assertTrue(remoteCancelled.get());
+    }
+
+    @Test
+    void serialDeadlineReturnsWhileTimedOutToolIgnoresInterrupt() throws Exception {
+        assertDeadlineReturnsWhileToolIgnoresInterrupt(false);
+    }
+
+    @Test
+    void concurrentDeadlineReturnsWhileTimedOutToolIgnoresInterrupt() throws Exception {
+        assertDeadlineReturnsWhileToolIgnoresInterrupt(true);
+    }
+
+    private static void assertDeadlineReturnsWhileToolIgnoresInterrupt(
+            boolean concurrent) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ToolProperties properties = new ToolProperties();
+        properties.setTimeoutMs(35);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Tool stubborn = throwingTool("stubborn", () -> {
+            started.countDown();
+            while (release.getCount() > 0) {
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                    interrupted.countDown();
+                }
+            }
+            return "late";
+        });
+        Tool fast = new FakeTool("fast");
+        List<Tool> tools = concurrent
+                ? List.of(stubborn, fast)
+                : List.of(stubborn);
+        List<ToolCall> calls = concurrent
+                ? List.of(
+                        new ToolCall("call-stubborn", stubborn.name(), "{}"),
+                        new ToolCall("call-fast", fast.name(), "{}"))
+                : List.of(new ToolCall("call-stubborn", stubborn.name(), "{}"));
+        TaskToolCatalog catalog = catalog(
+                mapper,
+                properties,
+                null,
+                tools,
+                List.of(),
+                tools.stream().map(Tool::name).toList());
+        ToolExecutor executor = new ToolExecutor(
+                mapper,
+                properties,
+                OpenTelemetrySdk.builder().build().getTracer("test"));
+        FutureTask<Map<String, ToolExecutionOutcome>> batch =
+                new FutureTask<>(() -> executor.executeConcurrently(
+                        catalog,
+                        calls,
+                        new ToolContext("task-1", Path.of("."))));
+        Thread driver = Thread.ofPlatform().daemon(true).unstarted(batch);
+        driver.start();
+        try {
+            assertTrue(started.await(1, TimeUnit.SECONDS));
+            Map<String, ToolExecutionOutcome> outcomes =
+                    batch.get(500, TimeUnit.MILLISECONDS);
+            assertTrue(outcomes.get("call-stubborn").content().contains(">35ms"));
+            assertTrue(interrupted.await(1, TimeUnit.SECONDS));
+            if (concurrent) {
+                assertEquals(
+                        ToolExecutionOutcome.definitive("ok:fast"),
+                        outcomes.get("call-fast"));
+            }
+        } finally {
+            release.countDown();
+            driver.join(1_000);
+        }
+        assertFalse(driver.isAlive());
     }
 
     private static Tool throwingTool(String name, ThrowingAction action) {

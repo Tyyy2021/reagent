@@ -92,6 +92,26 @@ class AgentRunnerFaultInjectionTest {
     }
 
     @Test
+    void runtimeFailurePublishesGenericBoundedEvent(@TempDir Path workspace) {
+        String sentinel = "https://secret.example/body=FAILED_SECRET_SENTINEL";
+        Fixture fixture = fixture(workspace, Decision.finalAnswer(
+                "unused", Map.of("role", "assistant", "content", "unused")));
+        when(fixture.llm.chatStream(same(fixture.context), any(), any()))
+                .thenThrow(new IllegalStateException(sentinel));
+
+        AgentRunner.RunResult result =
+                fixture.runner(FaultInjector.none()).run("goal", "coding");
+
+        assertEquals("任务执行失败:" + sentinel, result.result());
+        verify(fixture.stateStore).failTask(
+                fixture.token, "执行异常: " + sentinel);
+        verify(fixture.transport).publish(
+                fixture.token,
+                TaskEvent.Type.FAILED,
+                Map.of("error", "task_execution_failed"));
+    }
+
+    @Test
     void delegatesToolEventPublicationToCoordinator(@TempDir Path workspace) {
         Fixture fixture = fixture(workspace, toolDecision());
         when(fixture.coordinator.process(

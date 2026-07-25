@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ContextTest {
@@ -51,5 +52,42 @@ class ContextTest {
         assertEquals("mutated-live-source",
                 ((Map<String, Object>) ((List<Map<String, Object>>) context.messages().getLast()
                         .get("tool_calls")).getFirst().get("function")).get("name"));
+    }
+
+    @Test
+    void pendingToolCallsRejectUnsafeLegacyIdentityBeforeExecution() {
+        assertPendingIdentityRejected(
+                "https://secret.example/CALL_SECRET_SENTINEL",
+                "read_file",
+                "Invalid tool call id",
+                "CALL_SECRET_SENTINEL");
+        assertPendingIdentityRejected(
+                "call-safe",
+                "SECRET/TOOL/NAME",
+                "Invalid tool call name",
+                "SECRET/TOOL/NAME");
+    }
+
+    private static void assertPendingIdentityRejected(
+            String id,
+            String name,
+            String expectedMessage,
+            String sentinel) {
+        Context context = new Context("system");
+        context.addAssistant(Map.of(
+                "role", "assistant",
+                "content", "",
+                "tool_calls", List.of(Map.of(
+                        "id", id,
+                        "type", "function",
+                        "function", Map.of(
+                                "name", name,
+                                "arguments", "{}")))));
+
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class, context::pendingToolCalls);
+
+        assertEquals(expectedMessage, error.getMessage());
+        assertFalse(error.getMessage().contains(sentinel));
     }
 }

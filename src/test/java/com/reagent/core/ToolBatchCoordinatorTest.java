@@ -155,6 +155,43 @@ class ToolBatchCoordinatorTest {
     }
 
     @Test
+    void unknownToolUsesTrustedObservabilityClassificationButPreservesModelMessage(
+            @TempDir Path workspace) {
+        String modelName = "SECRET_MODEL_TOOL";
+        ClassifiedTool listed = new ClassifiedTool("read", IdempotencyClass.READ_ONLY);
+        TaskToolCatalog catalog = catalog(listed);
+        ToolCall call = new ToolCall("call-unknown", modelName, "{}");
+        Fixture fixture = fixture(workspace);
+        when(fixture.stateStore.statusOf(TOKEN, call.id()))
+                .thenReturn(ToolCallStatus.IN_PROGRESS);
+        ListAppender<ILoggingEvent> logs =
+                captureLogs(DefaultToolBatchCoordinator.class);
+        try {
+            fixture.coordinator.process(
+                    TOKEN, fixture.toolContext, fixture.context, catalog, List.of(call));
+
+            verify(fixture.transport).publish(
+                    TOKEN,
+                    TaskEvent.Type.TOOL_CALL,
+                    Map.of("id", call.id(), "name", "unknown"));
+            verify(fixture.transport).publish(
+                    TOKEN,
+                    TaskEvent.Type.TOOL_RESULT,
+                    Map.of(
+                            "id", call.id(),
+                            "name", "unknown",
+                            "outcome", "IN_DOUBT",
+                            "inDoubt", true));
+            assertTrue(String.valueOf(
+                    fixture.context.messages().getLast().get("content"))
+                    .contains(modelName));
+            assertFalse(capturedLogText(logs).contains(modelName));
+        } finally {
+            detachLogs(DefaultToolBatchCoordinator.class, logs);
+        }
+    }
+
+    @Test
     void journalReconciledSideEffectRecordsDoneWithoutExecution(@TempDir Path workspace) throws Exception {
         ClassifiedTool sideEffect = new ClassifiedTool("side_effect", IdempotencyClass.SIDE_EFFECTFUL);
         TaskToolCatalog catalog = catalog(sideEffect);

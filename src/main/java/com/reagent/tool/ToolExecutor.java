@@ -62,8 +62,9 @@ public class ToolExecutor {
     private ToolExecutionOutcome executeResolved(
             Tool tool, ToolSnapshot snapshot, ToolCall call, ToolContext ctx) {
         // M6:工具 span(parent = 当前 agent.step;并发路径下由 executeConcurrently 跨虚拟线程把 context 传好)
-        Span span = tracer.spanBuilder("execute_tool " + call.name())
-                .setAttribute(Trace.TOOL_NAME, call.name())
+        String observableName = observableToolName(snapshot);
+        Span span = tracer.spanBuilder("execute_tool " + observableName)
+                .setAttribute(Trace.TOOL_NAME, observableName)
                 .setAttribute(Trace.TOOL_CALL_ID, call.id())
                 .startSpan();
         if (tool != null) {
@@ -90,7 +91,7 @@ public class ToolExecutor {
                 JsonNode args = mapper.readTree(rawArgs);
                 // 绑定本次调用的 idempotencyKey(=tool_call_id),供 run_command 等把 key 下推给副作用做幂等
                 String result = tool.execute(args, ctx.forCall(call.id()));
-                log.info("工具完成: {}", call.name());
+                log.info("工具完成: {}", observableName);
                 return withOutcome(span, ToolExecutionOutcome.definitive(result));
             } catch (InjectedWorkerCrashException | FencedExecutionException fatal) {
                 throw fatal;
@@ -105,7 +106,7 @@ public class ToolExecutor {
                         "工具 '" + call.name() + "' 执行失败:remote outcome unavailable"));
             } catch (Exception e) {
                 span.setStatus(StatusCode.ERROR, "tool execution failed");
-                log.warn("工具 '{}' 执行失败", call.name());
+                log.warn("工具 '{}' 执行失败", observableName);
                 return withOutcome(span, ToolExecutionOutcome.definitive(
                         "工具 '" + call.name() + "' 执行失败:" + e.getMessage()));
             }
@@ -143,7 +144,7 @@ public class ToolExecutor {
                                 await(
                                         call,
                                         pending,
-                                        isIdempotentMcp(catalog.snapshot(call.name()))));
+                                        catalog.snapshot(call.name())));
                     } catch (InjectedWorkerCrashException | FencedExecutionException fatal) {
                         pending.future().cancel(true);
                         throw fatal;
@@ -156,7 +157,7 @@ public class ToolExecutor {
         // M6:OTel context 是 ThreadLocal,跨不过下面 pool.submit 的虚拟线程边界 —— 提交【前】捕获当前 context
         // (此刻 = step span),在每个工具线程里 makeCurrent 恢复,execute 开的 execute_tool span 才会正确挂到
         // step span 下。这与当初 ToolContext 选「显式捕获传参而非 ThreadLocal」是同一问题、同一解法。
-        // JDK21:每任务一根虚拟线程;try-with-resources 关闭时等所有任务结束
+        // JDK21:每任务一根虚拟线程;超时 future 先取消,再关闭本批 executor
         try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
             Map<ToolCall, PendingExecution> pendingExecutions = new LinkedHashMap<>();
             for (ToolCall call : calls) {
@@ -172,7 +173,7 @@ public class ToolExecutor {
                             await(
                                     call,
                                     entry.getValue(),
-                                    isIdempotentMcp(catalog.snapshot(call.name()))));
+                                    catalog.snapshot(call.name())));
                 } catch (InjectedWorkerCrashException | FencedExecutionException fatal) {
                     pendingExecutions.values().forEach(
                             pending -> pending.future().cancel(true));
@@ -214,8 +215,10 @@ public class ToolExecutor {
 
     /** 等单个工具的结果,带超时;超时/异常都兜成可读结果回给模型。 */
     private ToolExecutionOutcome await(
-            ToolCall call, PendingExecution pending, boolean unknownOnTimeout) {
+            ToolCall call, PendingExecution pending, ToolSnapshot snapshot) {
         Future<ToolExecutionOutcome> future = pending.future();
+        boolean unknownOnTimeout = isIdempotentMcp(snapshot);
+        String observableName = observableToolName(snapshot);
         try {
             if (pending.deadlineNanos() == Long.MAX_VALUE) {
                 return future.get();
@@ -225,7 +228,7 @@ public class ToolExecutor {
             return future.get(remainingNanos, TimeUnit.NANOSECONDS);
         } catch (TimeoutException te) {
             future.cancel(true);  // 中断该工具线程(真正的硬杀留给子进程/Docker 沙箱那层)
-            log.warn("工具 '{}' 执行超过 {}ms,已中断", call.name(), pending.timeoutMs());
+            log.warn("工具 '{}' 执行超过 {}ms,已中断", observableName, pending.timeoutMs());
             if (unknownOnTimeout) {
                 return ToolExecutionOutcome.remoteOutcomeUnknown(boundedUnknown(call));
             }
@@ -260,6 +263,10 @@ public class ToolExecutor {
         return snapshot != null
                 && snapshot.provider().startsWith("mcp:")
                 && snapshot.idempotencyClass() == IdempotencyClass.IDEMPOTENT;
+    }
+
+    private static String observableToolName(ToolSnapshot snapshot) {
+        return snapshot == null ? "unknown" : snapshot.name();
     }
 
     private static String boundedUnknown(ToolCall call) {
