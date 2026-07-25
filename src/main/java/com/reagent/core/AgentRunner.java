@@ -287,7 +287,7 @@ public class AgentRunner {
                         ctx.addAssistant(decision.getAssistantMessage());
                         stateStore.completeTask(token, decision.getAnswer());
                         bus.publish(token, TaskEvent.Type.COMPLETED, Map.of("result", String.valueOf(decision.getAnswer())));
-                        log.info("====== 任务完成 ======\n{}", decision.getAnswer());
+                        log.info("任务 {} 完成", taskId);
                         return decision.getAnswer();
                     }
 

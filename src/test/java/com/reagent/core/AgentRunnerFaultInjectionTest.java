@@ -1,5 +1,9 @@
 package com.reagent.core;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.spi.ThrowableProxyUtil;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.llm.LlmClient;
@@ -21,6 +25,7 @@ import com.reagent.tool.ToolRegistry;
 import io.opentelemetry.api.OpenTelemetry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.time.Instant;
@@ -92,6 +97,40 @@ class AgentRunnerFaultInjectionTest {
     }
 
     @Test
+    void finalAnswerStaysDurableAndClientVisibleButNotLogged(@TempDir Path workspace) {
+        String answer =
+                "https://secret.example body=FINAL_BODY_SENTINEL "
+                        + "credential=FINAL_CREDENTIAL_SENTINEL "
+                        + "log=FINAL_LOG_LINE_SENTINEL";
+        Fixture fixture = fixture(
+                workspace,
+                Decision.finalAnswer(
+                        answer,
+                        Map.of(
+                                "role", "assistant",
+                                "content", answer)));
+        ListAppender<ILoggingEvent> logs = captureLogs(AgentRunner.class);
+        try {
+            AgentRunner.RunResult result =
+                    fixture.runner(FaultInjector.none()).run("goal", "coding");
+
+            assertEquals(answer, result.result());
+            verify(fixture.stateStore).completeTask(fixture.token, answer);
+            verify(fixture.transport).publish(
+                    fixture.token,
+                    TaskEvent.Type.COMPLETED,
+                    Map.of("result", answer));
+
+            String captured = capturedLogText(logs);
+            assertFalse(captured.contains("FINAL_BODY_SENTINEL"));
+            assertFalse(captured.contains("FINAL_CREDENTIAL_SENTINEL"));
+            assertFalse(captured.contains("FINAL_LOG_LINE_SENTINEL"));
+        } finally {
+            detachLogs(AgentRunner.class, logs);
+        }
+    }
+
+    @Test
     void runtimeFailurePublishesGenericBoundedEvent(@TempDir Path workspace) {
         String sentinel = "https://secret.example/body=FAILED_SECRET_SENTINEL";
         Fixture fixture = fixture(workspace, Decision.finalAnswer(
@@ -126,6 +165,34 @@ class AgentRunnerFaultInjectionTest {
                 same(fixture.token), any(), same(fixture.context), same(fixture.catalog), any());
         verify(fixture.transport, never()).publish(
                 same(fixture.token), eq(TaskEvent.Type.TOOL_CALL), any());
+    }
+
+    private static ListAppender<ILoggingEvent> captureLogs(Class<?> type) {
+        Logger logger = (Logger) LoggerFactory.getLogger(type);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void detachLogs(
+            Class<?> type,
+            ListAppender<ILoggingEvent> appender) {
+        ((Logger) LoggerFactory.getLogger(type)).detachAppender(appender);
+        appender.stop();
+    }
+
+    private static String capturedLogText(
+            ListAppender<ILoggingEvent> appender) {
+        StringBuilder captured = new StringBuilder();
+        for (ILoggingEvent event : appender.list) {
+            captured.append(event.getFormattedMessage());
+            if (event.getThrowableProxy() != null) {
+                captured.append(
+                        ThrowableProxyUtil.asString(event.getThrowableProxy()));
+            }
+        }
+        return captured.toString();
     }
 
     private static Decision toolDecision() {
