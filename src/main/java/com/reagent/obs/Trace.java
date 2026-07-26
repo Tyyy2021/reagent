@@ -32,11 +32,16 @@ public final class Trace {
     public static final AttributeKey<String> TASK_ID = AttributeKey.stringKey("reagent.task.id");
     /** M7:驱动本任务的 worker id —— 失败转移后,同一条 trace 上能看出"从哪个 worker 接管到了哪个"。 */
     public static final AttributeKey<String> WORKER_ID = AttributeKey.stringKey("reagent.worker.id");
+    public static final AttributeKey<Long> WORKER_EPOCH =
+            AttributeKey.longKey("reagent.worker.epoch");
     public static final AttributeKey<String> GOAL = AttributeKey.stringKey("reagent.task.goal");
     public static final AttributeKey<Long> RECOVERY_COUNT = AttributeKey.longKey("reagent.task.recovery_count");
     public static final AttributeKey<String> TASK_STATUS = AttributeKey.stringKey("reagent.task.status");
     public static final AttributeKey<Long> STEP_NUMBER = AttributeKey.longKey("reagent.step.number");
     public static final AttributeKey<Boolean> STEP_PENDING = AttributeKey.booleanKey("reagent.step.pending");
+    public static final String RECOVERY_ATTEMPT = "RECOVERY_ATTEMPT";
+    public static final AttributeKey<String> APPROVAL_DECISION =
+            AttributeKey.stringKey("reagent.approval.decision");
 
     // ===== LLM(对齐 OTel GenAI 语义约定 gen_ai.*)=====
     public static final AttributeKey<String> GENAI_SYSTEM = AttributeKey.stringKey("gen_ai.system");

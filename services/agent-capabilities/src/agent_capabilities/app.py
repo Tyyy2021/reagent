@@ -20,6 +20,7 @@ from agent_capabilities.fake_ops.faults import (
 )
 from agent_capabilities.fake_ops.mcp_server import FakeOpsRuntimeState, create_mcp
 from agent_capabilities.fake_ops.tickets import TicketService
+from agent_capabilities.observability import ObservabilityRuntime
 from agent_capabilities.rag.api import RagRuntime, RagRuntimeState, rag_routes
 from agent_capabilities.rag.embedding import MINILM_MODEL_ID, MiniLmEmbedding
 from agent_capabilities.rag.index import RedisClient, RedisKnowledgeIndex
@@ -45,6 +46,7 @@ def create_app(
     ticket_service_factory: Callable[[], TicketService] | None = None,
     migration_runner: Callable[[str], None] = run_migrations,
     acceptance_tracker: AcceptanceTracker | None = None,
+    observability_runtime: ObservabilityRuntime | None = None,
 ) -> Starlette:
     resolved = settings or Settings()
     readiness_state = [CapabilityReadiness.initial()]
@@ -62,6 +64,11 @@ def create_app(
     )
     fake_ops_state = FakeOpsRuntimeState()
     tracker = acceptance_tracker or AcceptanceTracker()
+    observability = observability_runtime or ObservabilityRuntime(
+        service_name="agent-capabilities",
+        service_version="0.1.0",
+        otlp_endpoint=resolved.otlp_endpoint,
+    )
     mcp = create_mcp(fake_ops_state, fault_gate, tracker)
     mcp_app = mcp.streamable_http_app()
     mcp_app.router.redirect_slashes = False
@@ -70,6 +77,7 @@ def create_app(
     async def lifespan(_: Starlette) -> AsyncGenerator[None, None]:
         runtime: RagRuntime | None = None
         ticket_service: TicketService | None = None
+        observability.activate()
         try:
             ticket_factory = selected_ticket_factory
             if ticket_factory is not None:
@@ -96,11 +104,12 @@ def create_app(
                 await run_sync_in_worker(ticket_service.close)
             if runtime is not None:
                 await run_sync_in_worker(runtime.close)
+            observability.shutdown()
 
     async def readiness(_: Request) -> JSONResponse:
         return JSONResponse(readiness_state[0].as_dict(), status_code=200)
 
-    return Starlette(
+    app = Starlette(
         routes=[
             Route("/internal/readiness", readiness, methods=["GET"]),
             *acceptance_routes(
@@ -115,6 +124,8 @@ def create_app(
         ],
         lifespan=lifespan,
     )
+    observability.instrument(app)
+    return app
 
 
 def _production_runtime(settings: Settings) -> RagRuntime:

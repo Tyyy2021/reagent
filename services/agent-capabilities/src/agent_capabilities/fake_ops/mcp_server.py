@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from functools import partial
+import hashlib
 
 from anyio.to_thread import run_sync as run_sync_in_worker
 from mcp.server.fastmcp import FastMCP
@@ -10,6 +11,7 @@ from agent_capabilities.fake_ops.faults import TicketFaultGate
 from agent_capabilities.fake_ops.logs import search_logs as provide_logs
 from agent_capabilities.fake_ops.metrics import query_metrics as provide_metrics
 from agent_capabilities.fake_ops.tickets import TicketService
+from agent_capabilities.observability import safe_attributes, traced
 
 
 @dataclass(slots=True)
@@ -40,8 +42,9 @@ def create_mcp(
         start: str,
         end: str,
     ) -> dict[str, object]:
-        await tracker.record("query_metrics")
-        return provide_metrics(service, start, end)
+        with traced("mcp.query_metrics", {"mcp.tool": "query_metrics"}):
+            await tracker.record("query_metrics")
+            return provide_metrics(service, start, end)
 
     @mcp.tool()
     async def search_logs(
@@ -51,8 +54,9 @@ def create_mcp(
         query: str,
         limit: int,
     ) -> dict[str, object]:
-        await tracker.record("search_logs")
-        return provide_logs(service, start, end, query, limit)
+        with traced("mcp.search_logs", {"mcp.tool": "search_logs"}):
+            await tracker.record("search_logs")
+            return provide_logs(service, start, end, query, limit)
 
     @mcp.tool()
     async def create_ticket(
@@ -61,21 +65,32 @@ def create_mcp(
         severity: str,
         evidence: str,
     ) -> dict[str, object]:
-        result = await run_sync_in_worker(
-            partial(
-                state.require_ticket_service().create_or_read,
-                idempotency_key,
-                title,
-                severity,
-                evidence,
+        call_id_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        with traced(
+            "mcp.create_ticket",
+            {
+                "mcp.tool": "create_ticket",
+                "mcp.tool_call_id_hash": call_id_hash,
+            },
+        ) as span:
+            result = await run_sync_in_worker(
+                partial(
+                    state.require_ticket_service().create_or_read,
+                    idempotency_key,
+                    title,
+                    severity,
+                    evidence,
+                )
             )
-        )
-        await fault_gate.after_commit(idempotency_key)
-        return {
-            "ticketId": result.ticket_id,
-            "deduplicated": result.deduplicated,
-            "attemptCount": result.attempt_count,
-        }
+            span.set_attributes(
+                safe_attributes({"ticket.deduplicated": result.deduplicated})
+            )
+            await fault_gate.after_commit(idempotency_key)
+            return {
+                "ticketId": result.ticket_id,
+                "deduplicated": result.deduplicated,
+                "attemptCount": result.attempt_count,
+            }
 
     registered_tools = (query_metrics, search_logs, create_ticket)
     del registered_tools

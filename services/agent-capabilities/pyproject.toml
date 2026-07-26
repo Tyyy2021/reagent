@@ -7,6 +7,8 @@ dependencies = [
   "anyio>=4.9,<5",
   "mcp==1.28.1",
   "opentelemetry-api>=1.38,<2",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+  "opentelemetry-instrumentation-asgi==0.65b0",
   "opentelemetry-sdk>=1.38,<2",
   "pydantic-settings>=2.10,<3",
   "pymysql>=1.1,<2",

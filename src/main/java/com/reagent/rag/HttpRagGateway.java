@@ -5,6 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.reagent.obs.Trace;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
@@ -38,8 +43,14 @@ public class HttpRagGateway implements RagGateway {
     private final ObjectWriter requestWriter;
     private final ObjectReader searchReader;
     private final ObjectReader activeReader;
+    private final Tracer tracer;
 
-    public HttpRagGateway(RagProperties properties, ObjectMapper applicationMapper) {
+    @Autowired
+    public HttpRagGateway(
+            RagProperties properties,
+            ObjectMapper applicationMapper,
+            Tracer tracer
+    ) {
         this.properties = properties;
         this.baseUrl = properties.requireTrustedBaseUrl();
         this.client = HttpClient.newBuilder()
@@ -51,10 +62,20 @@ public class HttpRagGateway implements RagGateway {
         this.requestWriter = writerMapper.writerFor(RagSearchRequest.class);
         this.searchReader = RagSearchResponse.reader(applicationMapper);
         this.activeReader = ActiveIndexResponse.reader(applicationMapper);
+        this.tracer = tracer;
+    }
+
+    public HttpRagGateway(RagProperties properties, ObjectMapper applicationMapper) {
+        this(properties, applicationMapper,
+                OpenTelemetry.noop().getTracer(Trace.INSTRUMENTATION_NAME));
     }
 
     @Override
     public String requireActiveVersion(String knowledgeBaseId) {
+        return inHttpSpan(() -> requireActiveVersionTraced(knowledgeBaseId));
+    }
+
+    private String requireActiveVersionTraced(String knowledgeBaseId) {
         RagContract.requireCodePoints(knowledgeBaseId, 1, 64, "knowledgeBaseId");
         String path = "/internal/rag/indexes/" + encodePathSegment(knowledgeBaseId) + "/active";
         HttpRequest request = requestBuilder(endpoint(path)).GET().build();
@@ -71,6 +92,10 @@ public class HttpRagGateway implements RagGateway {
 
     @Override
     public RagSearchResponse search(RagSearchRequest request) {
+        return inHttpSpan(() -> searchTraced(request));
+    }
+
+    private RagSearchResponse searchTraced(RagSearchRequest request) {
         byte[] requestBody;
         try {
             requestBody = requestWriter.writeValueAsBytes(request);
@@ -91,6 +116,15 @@ public class HttpRagGateway implements RagGateway {
                                 "RAG search response does not match the request");
                     }
                 });
+    }
+
+    private <T> T inHttpSpan(java.util.function.Supplier<T> operation) {
+        Span span = tracer.spanBuilder("rag.http").startSpan();
+        try (Scope ignored = span.makeCurrent()) {
+            return operation.get();
+        } finally {
+            span.end();
+        }
     }
 
     private HttpRequest.Builder requestBuilder(URI uri) {

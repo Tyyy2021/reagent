@@ -3,6 +3,10 @@ package com.reagent.mcp;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.obs.Trace;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
@@ -65,13 +69,24 @@ public final class OfficialMcpGateway implements McpGateway {
     private final ObjectMapper mapper;
     private final McpReadiness readiness;
     private final SessionFactory sessionFactory;
+    private Tracer tracer;
     private final Map<String, ServerState> states = new LinkedHashMap<>();
     private boolean closed;
 
     @Autowired
     public OfficialMcpGateway(
             McpProperties properties, ObjectMapper mapper, McpReadiness readiness) {
-        this(properties, mapper, readiness, OfficialMcpGateway::openSdkSession);
+        this(
+                properties,
+                mapper,
+                readiness,
+                OfficialMcpGateway::openSdkSession,
+                OpenTelemetry.noop().getTracer(Trace.INSTRUMENTATION_NAME));
+    }
+
+    @Autowired(required = false)
+    void setTracer(Tracer tracer) {
+        this.tracer = Objects.requireNonNull(tracer, "tracer");
     }
 
     OfficialMcpGateway(
@@ -79,10 +94,25 @@ public final class OfficialMcpGateway implements McpGateway {
             ObjectMapper mapper,
             McpReadiness readiness,
             SessionFactory sessionFactory) {
+        this(
+                properties,
+                mapper,
+                readiness,
+                sessionFactory,
+                OpenTelemetry.noop().getTracer(Trace.INSTRUMENTATION_NAME));
+    }
+
+    OfficialMcpGateway(
+            McpProperties properties,
+            ObjectMapper mapper,
+            McpReadiness readiness,
+            SessionFactory sessionFactory,
+            Tracer tracer) {
         this.properties = Objects.requireNonNull(properties, "properties");
         this.mapper = Objects.requireNonNull(mapper, "mapper");
         this.readiness = Objects.requireNonNull(readiness, "readiness");
         this.sessionFactory = Objects.requireNonNull(sessionFactory, "sessionFactory");
+        this.tracer = Objects.requireNonNull(tracer, "tracer");
         properties.validate();
     }
 
@@ -108,6 +138,21 @@ public final class OfficialMcpGateway implements McpGateway {
 
     @Override
     public synchronized McpCallResult call(
+            String serverId, String toolName, Map<String, Object> arguments) {
+        Span span = tracer.spanBuilder("mcp.call_tool").startSpan();
+        span.setAttribute(Trace.MCP_SERVER, serverId);
+        span.setAttribute(Trace.TOOL_NAME, toolName);
+        try (Scope ignored = span.makeCurrent()) {
+            return callTraced(serverId, toolName, arguments);
+        } catch (RuntimeException failure) {
+            span.recordException(failure);
+            throw failure;
+        } finally {
+            span.end();
+        }
+    }
+
+    private McpCallResult callTraced(
             String serverId, String toolName, Map<String, Object> arguments) {
         ensureOpen();
         McpProperties.Server configured = properties.requireServer(serverId);
@@ -250,11 +295,19 @@ public final class OfficialMcpGateway implements McpGateway {
     private Session openInitialized(String serverId, McpProperties.Server configured) {
         Session session = sessionFactory.open(serverId, configured, mapper);
         boolean initialized = false;
+        Span span = tracer.spanBuilder("mcp.initialize").startSpan();
+        span.setAttribute(Trace.MCP_SERVER, serverId);
         try {
-            session.initialize();
-            initialized = true;
-            return session;
+            try (Scope ignored = span.makeCurrent()) {
+                session.initialize();
+                initialized = true;
+                return session;
+            }
+        } catch (RuntimeException failure) {
+            span.recordException(failure);
+            throw failure;
         } finally {
+            span.end();
             if (!initialized) {
                 session.close();
             }
@@ -263,7 +316,7 @@ public final class OfficialMcpGateway implements McpGateway {
 
     private List<McpRemoteTool> validatedDiscovery(
             String serverId, McpProperties.Server configured, Session session) {
-        List<RawTool> rawTools = session.listTools();
+        List<RawTool> rawTools = listToolsTraced(serverId, session);
         if (rawTools == null || rawTools.size() > MAX_TOOLS) {
             throw new McpContractException("MCP discovery tool count exceeds limit");
         }
@@ -302,6 +355,19 @@ public final class OfficialMcpGateway implements McpGateway {
         }
         validated.sort((left, right) -> left.name().compareTo(right.name()));
         return List.copyOf(validated);
+    }
+
+    private List<RawTool> listToolsTraced(String serverId, Session session) {
+        Span span = tracer.spanBuilder("mcp.list_tools").startSpan();
+        span.setAttribute(Trace.MCP_SERVER, serverId);
+        try (Scope ignored = span.makeCurrent()) {
+            return session.listTools();
+        } catch (RuntimeException failure) {
+            span.recordException(failure);
+            throw failure;
+        } finally {
+            span.end();
+        }
     }
 
     private Map<String, Object> immutableJsonMap(

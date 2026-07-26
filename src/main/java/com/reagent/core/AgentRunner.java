@@ -215,8 +215,18 @@ public class AgentRunner {
                     .setAttribute(Trace.TASK_ID, taskId)
                     .setAttribute(Trace.RECOVERY_COUNT, (long) task.getRecoveryCount())
                     .setAttribute(Trace.WORKER_ID, workerIdentity.id())   // M7:标出本次由哪个 worker 驱动(失败转移后可见接管)
+                    .setAttribute(Trace.WORKER_EPOCH, token.leaseEpoch())
                     .startSpan();
             try (Scope ignored = taskSpan.makeCurrent()) {
+                if (autoRecovery) {
+                    taskSpan.addEvent(Trace.RECOVERY_ATTEMPT);
+                    Span recoverySpan = tracer.spanBuilder("agent.recovery")
+                            .setAttribute(
+                                    Trace.RECOVERY_COUNT,
+                                    (long) stateStore.getTask(taskId).getRecoveryCount())
+                            .startSpan();
+                    recoverySpan.end();
+                }
                 return driveLoop(token, catalog);
             } catch (RuntimeException ex) {
                 taskSpan.setStatus(StatusCode.ERROR, "agent task failed");
@@ -263,6 +273,7 @@ public class AgentRunner {
                         BatchDisposition disposition = toolBatchCoordinator.process(
                                 token, toolCtx, ctx, catalog, pending);
                         if (disposition == BatchDisposition.WAITING_APPROVAL) {
+                            recordApprovalWait();
                             return "任务正在等待审批。";
                         }
                         workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
@@ -302,6 +313,7 @@ public class AgentRunner {
                     BatchDisposition disposition = toolBatchCoordinator.process(
                             token, toolCtx, ctx, catalog, decision.getToolCalls());
                     if (disposition == BatchDisposition.WAITING_APPROVAL) {
+                        recordApprovalWait();
                         return "任务正在等待审批。";
                     }
                     workspaceStore.commit(taskId);   // M7 C:工具可能改了工作区 → 同步给其它 worker(shared-fs no-op)
@@ -350,6 +362,11 @@ public class AgentRunner {
             }
             return "任务执行失败:" + ex.getMessage();
         }
+    }
+
+    private void recordApprovalWait() {
+        Span span = tracer.spanBuilder("approval.wait").startSpan();
+        span.end();
     }
 
     /**

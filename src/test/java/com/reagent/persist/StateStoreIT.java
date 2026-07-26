@@ -3,6 +3,8 @@ package com.reagent.persist;
 import com.reagent.core.Context;
 import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
+import com.reagent.profile.AgentProfileRegistry;
+import com.reagent.profile.TaskProfileSnapshot;
 import com.reagent.testsupport.InfrastructureIT;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.Test;
@@ -15,6 +17,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -32,7 +36,52 @@ class StateStoreIT extends InfrastructureIT {
     private ToolCallRepository toolCallRepository;
 
     @Autowired
+    private TaskRepository taskRepository;
+
+    @Autowired
+    private AgentProfileRegistry profiles;
+
+    @Autowired
     private EntityManager entityManager;
+
+    @Test
+    @Transactional
+    void snapshotFactoryFailureDoesNotPersistGeneratedTaskOrMessages() {
+        long tasksBefore = taskRepository.count();
+        long messagesBefore = messageRepository.count();
+        AtomicReference<String> generatedTaskId = new AtomicReference<>();
+
+        IllegalStateException failure = assertThrows(
+                IllegalStateException.class,
+                () -> stateStore.createTask("snapshot failure", taskId -> {
+                    UUID.fromString(taskId);
+                    generatedTaskId.set(taskId);
+                    throw new IllegalStateException("snapshot-failed");
+                }));
+
+        assertEquals("snapshot-failed", failure.getMessage());
+        assertEquals(36, generatedTaskId.get().length());
+        assertEquals(tasksBefore, taskRepository.count());
+        assertEquals(messagesBefore, messageRepository.count());
+    }
+
+    @Test
+    @Transactional
+    void snapshotFactoryPersistsTheGeneratedUuidWithTheFrozenProfile() {
+        TaskProfileSnapshot snapshot = profiles.snapshot("coding");
+        AtomicReference<String> generatedTaskId = new AtomicReference<>();
+
+        TaskEntity task = stateStore.createTask("snapshot success", taskId -> {
+            UUID.fromString(taskId);
+            generatedTaskId.set(taskId);
+            return snapshot;
+        });
+
+        assertEquals(task.getId(), generatedTaskId.get());
+        assertEquals(snapshot.profileId(), task.getProfileId());
+        assertEquals(TaskStatus.RUNNING, task.getStatus());
+        assertEquals(2, messageRepository.countByTaskId(task.getId()));
+    }
 
     @ParameterizedTest(name = "rejects {0}")
     @MethodSource("malformedAssistantToolCalls")

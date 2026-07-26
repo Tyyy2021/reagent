@@ -28,7 +28,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * ★ M2 的核心:状态存储层。把内存里的 agent 运行状态"投影"到数据库,并能反向重建。
@@ -119,6 +121,33 @@ public class StateStore {
         String snapshotJson = serializeProfile(snapshot);
         Instant now = clock.instant();
         TaskEntity task = TaskEntity.newTask(goal, now);
+        task.freezeProfile(snapshot.profileId(), snapshotJson);
+        task.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
+        TaskEntity saved = taskRepo.save(task);
+        appendMessage(saved.getId(), "system", snapshot.systemPrompt(), null, null, now);
+        appendMessage(saved.getId(), "user", goal, null, null, now);
+        return saved;
+    }
+
+    /**
+     * Creates the final task UUID before resolving its frozen profile.
+     *
+     * <p>The factory runs inside this transaction but before any task or
+     * message write, so profile-resolution failure remains externally
+     * side-effect free.</p>
+     */
+    @Transactional
+    public TaskEntity createTask(
+            String goal,
+            Function<String, TaskProfileSnapshot> snapshotFactory
+    ) {
+        Instant now = clock.instant();
+        TaskEntity task = TaskEntity.newTask(goal, now);
+        TaskProfileSnapshot snapshot = Objects.requireNonNull(
+                Objects.requireNonNull(snapshotFactory, "snapshotFactory")
+                        .apply(task.getId()),
+                "snapshotFactory result");
+        String snapshotJson = serializeProfile(snapshot);
         task.freezeProfile(snapshot.profileId(), snapshotJson);
         task.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
         TaskEntity saved = taskRepo.save(task);

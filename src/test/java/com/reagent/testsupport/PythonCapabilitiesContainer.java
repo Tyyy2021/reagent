@@ -168,6 +168,16 @@ public final class PythonCapabilitiesContainer {
                 "http://" + python.getHost() + ":" + python.getMappedPort(PYTHON_PORT));
     }
 
+    public String mappedMysqlUrl() {
+        return "mysql+pymysql://" + mysql.getUsername() + ":" + mysql.getPassword()
+                + "@" + mysql.getHost() + ":" + mysql.getMappedPort(3306)
+                + "/" + mysql.getDatabaseName();
+    }
+
+    public String mappedRedisUrl() {
+        return "redis://" + redis.getHost() + ":" + redis.getMappedPort(6379) + "/0";
+    }
+
     public AcceptanceSnapshot acceptance(String idempotencyKey) {
         JsonNode body = get(
                 "/internal/acceptance?idempotencyKey=" + idempotencyKey,

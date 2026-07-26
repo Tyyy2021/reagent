@@ -30,6 +30,7 @@ def test_readiness_is_healthy_but_fail_closed() -> None:
     assert response.json() == {
         "ready": False,
         "service": "agent-capabilities",
+        "version": "0.1.0",
         "rag": {"ready": False, "reason": "index-not-initialized"},
         "fakeOps": {"ready": False, "reason": "not-configured"},
     }

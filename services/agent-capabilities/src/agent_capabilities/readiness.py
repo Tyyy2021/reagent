@@ -22,6 +22,7 @@ class CapabilityReadiness:
         return {
             "ready": self.rag_ready and self.fake_ops_ready,
             "service": "agent-capabilities",
+            "version": "0.1.0",
             "rag": {"ready": self.rag_ready, "reason": self.rag_reason},
             "fakeOps": {"ready": self.fake_ops_ready, "reason": self.fake_ops_reason},
         }

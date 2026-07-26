@@ -26,7 +26,7 @@ import com.reagent.profile.ToolCatalogResolver;
 import com.reagent.sandbox.WorkspaceStore;
 import com.reagent.stream.StreamTransport;
 import com.reagent.tool.ToolExecutor;
-import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Tracer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.aop.framework.ProxyFactory;
@@ -81,14 +81,18 @@ public abstract class IncidentScenarioFixture extends InfrastructureIT {
 
     private static final PythonCapabilitiesContainer PYTHON =
             PythonCapabilitiesContainer.shared();
+    private static final AtomicReference<URI> CAPABILITY_BASE_URI_OVERRIDE =
+            new AtomicReference<>();
 
     @DynamicPropertySource
     static void incidentProperties(DynamicPropertyRegistry registry) {
         registry.add("reagent.worker.id", () -> "incident-worker-a");
-        registry.add("reagent.rag.base-url", () -> PYTHON.baseUri().toString());
+        registry.add(
+                "reagent.rag.base-url",
+                () -> capabilityBaseUri().toString());
         registry.add(
                 "reagent.mcp.servers.fake-ops.base-url",
-                () -> PYTHON.baseUri().toString());
+                () -> capabilityBaseUri().toString());
         registry.add(
                 "reagent.mcp.servers.fake-ops.request-timeout",
                 () -> "30s");
@@ -150,6 +154,9 @@ public abstract class IncidentScenarioFixture extends InfrastructureIT {
 
     @Autowired
     protected ApprovalDecisionTransaction approvalDecisionTransaction;
+
+    @Autowired
+    protected Tracer tracer;
 
     @Autowired
     protected PlatformTransactionManager transactionManager;
@@ -283,6 +290,19 @@ public abstract class IncidentScenarioFixture extends InfrastructureIT {
         return PYTHON;
     }
 
+    protected static void useCapabilityBaseUri(URI uri) {
+        CAPABILITY_BASE_URI_OVERRIDE.set(Objects.requireNonNull(uri, "uri"));
+    }
+
+    protected static void resetCapabilityBaseUri() {
+        CAPABILITY_BASE_URI_OVERRIDE.set(null);
+    }
+
+    private static URI capabilityBaseUri() {
+        URI override = CAPABILITY_BASE_URI_OVERRIDE.get();
+        return override == null ? PYTHON.baseUri() : override;
+    }
+
     protected void awaitDriverStopped(String taskId) {
         Instant deadline = Instant.now().plus(SCENARIO_TIMEOUT);
         while (Instant.now().isBefore(deadline)) {
@@ -339,7 +359,7 @@ public abstract class IncidentScenarioFixture extends InfrastructureIT {
                 new InFlightTasks(),
                 streamTransport,
                 workerControl,
-                OpenTelemetry.noop().getTracer("task-11-" + workerId),
+                tracer,
                 identity,
                 maxRecoveryAttempts);
         return new IncidentWorkerRuntime(workerStore, workerRunner, workerControl);

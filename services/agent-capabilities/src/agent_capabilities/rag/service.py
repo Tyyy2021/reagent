@@ -5,6 +5,7 @@ from typing import Protocol
 from agent_capabilities.rag.domain import EmbeddingPort, KnowledgeChunk
 from agent_capabilities.rag.embedding import l2_normalize
 from agent_capabilities.rag.models import RagHit, RagSearchRequest, RagSearchResponse
+from agent_capabilities.observability import safe_attributes, traced
 
 KNOWLEDGE_BASE_ID = "incident-ops"
 MAX_EXCERPT_CODEPOINTS = 1_200
@@ -59,37 +60,55 @@ class RagService:
         self._min_score = min_score
 
     def search(self, request: RagSearchRequest) -> RagSearchResponse:
-        if request.knowledge_base_id != KNOWLEDGE_BASE_ID:
-            raise UnknownKnowledgeBaseError(request.knowledge_base_id)
-        if not self._index.has_version(request.index_version):
-            raise IndexVersionNotFoundError(request.index_version)
+        base_attributes = {
+            "knowledge_base.id": request.knowledge_base_id,
+            "rag.index.version": request.index_version,
+            "rag.top_k": request.top_k,
+        }
+        with traced("rag.search", base_attributes) as search_span:
+            if request.knowledge_base_id != KNOWLEDGE_BASE_ID:
+                raise UnknownKnowledgeBaseError(request.knowledge_base_id)
+            if not self._index.has_version(request.index_version):
+                raise IndexVersionNotFoundError(request.index_version)
 
-        vectors = self._embedding.embed([request.query])
-        if len(vectors) != 1:
-            raise ValueError("embedding adapter returned an unexpected vector count")
-        query_vector = l2_normalize(vectors[0])
-        if len(query_vector) != self._embedding.dimensions:
-            raise ValueError("embedding vector dimension does not match the adapter")
+            with traced("rag.embed", base_attributes):
+                vectors = self._embedding.embed([request.query])
+            if len(vectors) != 1:
+                raise ValueError("embedding adapter returned an unexpected vector count")
+            query_vector = l2_normalize(vectors[0])
+            if len(query_vector) != self._embedding.dimensions:
+                raise ValueError("embedding vector dimension does not match the adapter")
 
-        candidates = self._index.search(request.index_version, query_vector, request.top_k)
-        ranked = sorted(candidates, key=lambda hit: (hit.distance, hit.chunk.chunk_id))
-        hits = [
-            RagHit(
-                chunk_id=hit.chunk.chunk_id,
-                title=hit.chunk.title,
-                section=hit.chunk.section,
-                source=hit.chunk.source,
-                score=_bounded_score(hit.score),
-                excerpt=hit.chunk.content[:MAX_EXCERPT_CODEPOINTS],
+            with traced("rag.index", base_attributes):
+                candidates = self._index.search(
+                    request.index_version, query_vector, request.top_k
+                )
+            ranked = sorted(candidates, key=lambda hit: (hit.distance, hit.chunk.chunk_id))
+            hits = [
+                RagHit(
+                    chunk_id=hit.chunk.chunk_id,
+                    title=hit.chunk.title,
+                    section=hit.chunk.section,
+                    source=hit.chunk.source,
+                    score=_bounded_score(hit.score),
+                    excerpt=hit.chunk.content[:MAX_EXCERPT_CODEPOINTS],
+                )
+                for hit in ranked
+                if hit.score >= self._min_score
+            ][: request.top_k]
+            search_span.set_attributes(
+                safe_attributes(
+                    {
+                        "rag.hit_count": len(hits),
+                        "rag.chunk_ids": [hit.chunk_id for hit in hits],
+                    }
+                )
             )
-            for hit in ranked
-            if hit.score >= self._min_score
-        ][: request.top_k]
-        return RagSearchResponse(
-            contract_version=1,
-            index_version=request.index_version,
-            hits=hits,
-        )
+            return RagSearchResponse(
+                contract_version=1,
+                index_version=request.index_version,
+                hits=hits,
+            )
 
 
 def _bounded_score(score: float) -> float:

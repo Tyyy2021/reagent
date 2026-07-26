@@ -26,6 +26,25 @@ spring:
       port: ${REDIS_PORT:6379}
       timeout: 2000ms
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,reAgentReadiness
+    env:
+      access: none
+    configprops:
+      access: none
+    heapdump:
+      access: none
+
 reagent:
   # ====== Task 3:agent profile 与冻结工具目录 ======
   profiles:

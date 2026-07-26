@@ -3,8 +3,9 @@ package com.reagent.incident;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
+import com.reagent.obs.Trace;
 import com.reagent.profile.AgentProfileRegistry;
-import com.reagent.profile.TaskProfileSnapshot;
+import io.opentelemetry.context.Scope;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -41,8 +42,14 @@ public class IncidentCreationTransaction {
 
     @Transactional
     public IncidentAccepted create(IncidentRequest incident) {
-        TaskProfileSnapshot profile = profiles.snapshot("incident-ops");
-        TaskEntity task = stateStore.createTask(goalFactory.create(incident), profile);
+        TaskEntity task = stateStore.createTask(
+                goalFactory.create(incident),
+                taskId -> {
+                    try (Scope ignored =
+                                 Trace.logicalRootContext(taskId).makeCurrent()) {
+                        return profiles.snapshot("incident-ops");
+                    }
+                });
         IncidentIntakeEntity row = IncidentIntakeEntity.create(
                 UUID.randomUUID().toString(), incident, task.getId(), clock.instant(), mapper);
         repository.saveAndFlush(row);
