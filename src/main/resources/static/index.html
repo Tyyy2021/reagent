@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08121b">
+  <meta name="description" content="ReAgent 可恢复事故响应控制台">
+  <title>ReAgent · 事故飞行记录</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#incident-workspace">跳到事故工作区</a>
+
+  <header class="masthead" aria-labelledby="console-title">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true">
+        <span></span>
+      </span>
+      <div>
+        <p class="eyebrow">REAGENT / INCIDENT RESPONSE</p>
+        <h1 id="console-title">事故飞行记录</h1>
+      </div>
+    </div>
+    <div class="console-state">
+      <span class="signal-dot" aria-hidden="true"></span>
+      <div>
+        <span class="micro-label">CONTROL PLANE</span>
+        <p id="live-status" role="status" aria-live="polite">正在检查控制面…</p>
+      </div>
+    </div>
+  </header>
+
+  <section id="readiness-strip" class="readiness-strip"
+           aria-labelledby="readiness-title">
+    <div class="readiness-heading">
+      <span class="rail-index">00</span>
+      <div>
+        <p class="micro-label">DEPENDENCY RAIL</p>
+        <h2 id="readiness-title">运行就绪度</h2>
+      </div>
+    </div>
+    <ul id="readiness-list" class="readiness-list" aria-live="polite">
+      <li class="readiness-unit" data-state="checking">
+        <span class="unit-led" aria-hidden="true"></span>
+        <span>APP</span>
+        <small>CHECKING</small>
+      </li>
+      <li class="readiness-unit" data-state="checking">
+        <span class="unit-led" aria-hidden="true"></span>
+        <span>PYTHON</span>
+        <small>CHECKING</small>
+      </li>
+      <li class="readiness-unit" data-state="checking">
+        <span class="unit-led" aria-hidden="true"></span>
+        <span>MYSQL</span>
+        <small>CHECKING</small>
+      </li>
+      <li class="readiness-unit" data-state="checking">
+        <span class="unit-led" aria-hidden="true"></span>
+        <span>REDIS</span>
+        <small>CHECKING</small>
+      </li>
+      <li class="readiness-unit" data-state="checking">
+        <span class="unit-led" aria-hidden="true"></span>
+        <span>RAG</span>
+        <small>CHECKING</small>
+      </li>
+      <li class="readiness-unit" data-state="checking">
+        <span class="unit-led" aria-hidden="true"></span>
+        <span>MCP</span>
+        <small>CHECKING</small>
+      </li>
+    </ul>
+    <time id="readiness-time" class="readiness-time">尚未采样</time>
+  </section>
+
+  <main id="incident-workspace">
+    <section id="incident-trigger" class="alert-strip"
+             aria-labelledby="alert-title">
+      <div class="alert-classification" aria-label="严重级别 critical">
+        <span class="alert-pulse" aria-hidden="true"></span>
+        <div>
+          <span class="micro-label">FIXED DEMO ALERT</span>
+          <strong>SEV-1 / CRITICAL</strong>
+        </div>
+      </div>
+
+      <div class="alert-copy">
+        <p class="eyebrow">CHECKOUT · CONNECTION POOL</p>
+        <h2 id="alert-title">结账服务错误率持续越线</h2>
+        <p>连接池耗尽，5xx 与尾延迟同步抬升。触发后由 RAG 与 MCP 完成只读调查，
+          写入工单前必须经过人工审批。</p>
+      </div>
+
+      <dl class="alert-coordinates">
+        <div>
+          <dt>SOURCE</dt>
+          <dd id="alert-source">fake-alertmanager</dd>
+        </div>
+        <div>
+          <dt>EXTERNAL ID</dt>
+          <dd id="alert-external-id">触发时生成</dd>
+        </div>
+        <div>
+          <dt>SERVICE</dt>
+          <dd id="alert-service">checkout</dd>
+        </div>
+        <div>
+          <dt>STARTED</dt>
+          <dd id="alert-started-at">2026-07-19 10:00 UTC</dd>
+        </div>
+      </dl>
+
+      <button id="launch-incident" class="launch-action" type="button">
+        <span>触发事故响应</span>
+        <span aria-hidden="true">↗</span>
+      </button>
+    </section>
+
+    <div class="workspace-frame">
+      <aside id="task-context" class="context-rail"
+             aria-labelledby="context-title">
+        <div class="section-heading">
+          <span class="rail-index">01</span>
+          <div>
+            <p class="micro-label">DURABLE CONTEXT</p>
+            <h2 id="context-title">任务坐标</h2>
+          </div>
+        </div>
+
+        <div class="context-status">
+          <span id="task-status-mark" class="status-mark"
+                data-state="idle" aria-hidden="true"></span>
+          <div>
+            <span class="micro-label">TASK STATE</span>
+            <strong id="task-status">IDLE</strong>
+          </div>
+        </div>
+
+        <dl class="coordinate-list">
+          <div>
+            <dt>TASK ID</dt>
+            <dd id="task-id">—</dd>
+          </div>
+          <div>
+            <dt>PROFILE</dt>
+            <dd id="task-profile">incident-ops</dd>
+          </div>
+          <div>
+            <dt>OWNER</dt>
+            <dd id="task-owner">—</dd>
+          </div>
+          <div class="coordinate-pair">
+            <dt>EPOCH</dt>
+            <dd id="task-epoch">—</dd>
+            <dt>RECOVERY</dt>
+            <dd id="task-recovery">0</dd>
+          </div>
+          <div>
+            <dt>DURABLE CURSOR</dt>
+            <dd id="task-cursor">0</dd>
+          </div>
+          <div>
+            <dt>LAST UPDATE</dt>
+            <dd id="task-updated-at">—</dd>
+          </div>
+        </dl>
+
+        <div class="context-note">
+          <span class="note-glyph" aria-hidden="true">↻</span>
+          <p>浏览器只保存任务 ID 与 durable cursor。刷新后从服务端重建事故上下文。</p>
+        </div>
+
+        <nav class="evidence-links" aria-label="任务证据链接">
+          <a id="acceptance-link" aria-disabled="true">
+            <span>Acceptance evidence</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+          <a id="jaeger-link" aria-disabled="true">
+            <span>Open in Jaeger</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        </nav>
+      </aside>
+
+      <section id="incident-timeline" class="incident-tape"
+               aria-labelledby="timeline-title">
+        <div class="tape-heading">
+          <div class="section-heading">
+            <span class="rail-index">02</span>
+            <div>
+              <p class="micro-label">DURABLE EVENT TAPE</p>
+              <h2 id="timeline-title">调查与处置时序</h2>
+            </div>
+          </div>
+          <div class="tape-legend" aria-label="时间线图例">
+            <span><i class="legend-read"></i> READ</span>
+            <span><i class="legend-write"></i> WRITE</span>
+            <span><i class="legend-durable"></i> DURABLE</span>
+          </div>
+        </div>
+
+        <ol id="event-stream" class="event-stream" aria-live="polite">
+          <li class="tape-event is-placeholder">
+            <span class="event-node" aria-hidden="true"></span>
+            <div class="event-meta">
+              <time>WAITING</time>
+              <span>CURSOR —</span>
+            </div>
+            <div class="event-copy">
+              <strong>等待事故信号</strong>
+              <p>触发固定 checkout 告警，或从本机保存的任务坐标恢复。</p>
+            </div>
+          </li>
+        </ol>
+
+        <section id="citations" class="evidence-band"
+                 aria-labelledby="citations-title">
+          <div class="band-marker" aria-hidden="true">RAG</div>
+          <div class="band-body">
+            <div class="band-heading">
+              <div>
+                <p class="micro-label">FROZEN KNOWLEDGE INDEX</p>
+                <h3 id="citations-title">Runbook 引用</h3>
+              </div>
+              <span id="citation-count" class="evidence-count">0 HITS</span>
+            </div>
+            <div id="citation-list" class="citation-list">
+              <p class="empty-evidence">尚未检索知识库。</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="observation-band" aria-labelledby="observations-title">
+          <div class="band-marker" aria-hidden="true">MCP</div>
+          <div class="band-body">
+            <div class="band-heading">
+              <div>
+                <p class="micro-label">READ-ONLY OBSERVATIONS</p>
+                <h3 id="observations-title">实时证据</h3>
+              </div>
+              <span class="read-only-stamp">NO SIDE EFFECT</span>
+            </div>
+
+            <div class="observation-ledger">
+              <article id="metrics-evidence" class="observation-row">
+                <div class="observation-icon" aria-hidden="true">%</div>
+                <div>
+                  <p class="micro-label">QUERY_METRICS</p>
+                  <h4>错误率与尾延迟</h4>
+                  <p id="metrics-detail">等待只读指标查询。</p>
+                </div>
+                <span id="metrics-state" class="row-state" data-state="idle">QUEUED</span>
+              </article>
+
+              <article id="log-evidence" class="observation-row">
+                <div class="observation-icon" aria-hidden="true">&gt;_</div>
+                <div>
+                  <p class="micro-label">SEARCH_LOGS</p>
+                  <h4>连接池异常样本</h4>
+                  <p id="logs-detail">等待有界日志检索。</p>
+                </div>
+                <span id="logs-state" class="row-state" data-state="idle">QUEUED</span>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="approval-panel" class="approval-boundary"
+                 aria-labelledby="approval-title">
+          <div class="boundary-rule">
+            <span>READ PLANE</span>
+            <strong>HUMAN WRITE BOUNDARY</strong>
+            <span>REMOTE ACTION</span>
+          </div>
+          <div class="approval-layout">
+            <div class="approval-symbol" aria-hidden="true">!</div>
+            <div class="approval-copy">
+              <p class="micro-label">CREATE_TICKET · SIDE EFFECTFUL</p>
+              <h3 id="approval-title">远端写操作等待人工放行</h3>
+              <p id="approval-evidence">调查证据就绪后，这里只展示服务端提供的有界摘要。</p>
+              <dl class="approval-coordinates">
+                <div>
+                  <dt>CALL ID</dt>
+                  <dd id="approval-call-id">—</dd>
+                </div>
+                <div>
+                  <dt>POLICY</dt>
+                  <dd>REQUIRE APPROVAL</dd>
+                </div>
+                <div>
+                  <dt>STATE</dt>
+                  <dd id="approval-state">NOT REQUESTED</dd>
+                </div>
+              </dl>
+            </div>
+            <div class="approval-actions">
+              <button id="reject-action" class="decision-action reject"
+                      type="button" data-decision="REJECT" disabled>
+                <span>拒绝写入</span>
+                <small>NO REMOTE ACTION</small>
+              </button>
+              <button id="approve-action" class="decision-action approve"
+                      type="button" data-decision="APPROVE" disabled>
+                <span>批准建单</span>
+                <small>ONE IDEMPOTENT WRITE</small>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section class="resilience-band" aria-labelledby="resilience-title">
+          <div class="band-marker" aria-hidden="true">HA</div>
+          <div class="band-body">
+            <div class="band-heading">
+              <div>
+                <p class="micro-label">RECOVERY &amp; FENCING</p>
+                <h3 id="resilience-title">接管证据</h3>
+              </div>
+              <span id="resilience-count" class="evidence-count">0 EVENTS</span>
+            </div>
+            <ol id="resilience-list" class="resilience-list">
+              <li class="empty-evidence">当前运行尚无接管、fence 或去重事件。</li>
+            </ol>
+          </div>
+        </section>
+
+        <section id="final-outcome" class="final-band"
+                 aria-labelledby="outcome-title">
+          <div class="final-seal" data-state="pending" aria-hidden="true">
+            <span></span>
+          </div>
+          <div class="final-copy">
+            <p class="micro-label">AUTHORITATIVE OUTCOME</p>
+            <h3 id="outcome-title">等待最终诊断</h3>
+            <p id="outcome-result">任务终态与 acceptance ledger 将在这里汇合。</p>
+            <dl class="outcome-ledger">
+              <div>
+                <dt>DECISION</dt>
+                <dd id="outcome-decision">—</dd>
+              </div>
+              <div>
+                <dt>TICKET</dt>
+                <dd id="outcome-ticket">—</dd>
+              </div>
+              <div>
+                <dt>UNIQUE WRITES</dt>
+                <dd id="outcome-writes">—</dd>
+              </div>
+              <div>
+                <dt>ACCEPTANCE</dt>
+                <dd id="outcome-acceptance">PENDING</dd>
+              </div>
+            </dl>
+          </div>
+        </section>
+      </section>
+    </div>
+  </main>
+
+  <footer class="console-footer">
+    <p>REAGENT / RECOVERABLE AGENT RUNTIME</p>
+    <p>Durable execution · Human approval · Exactly-once effect</p>
+  </footer>
+
+  <noscript>
+    <p class="noscript-warning">此控制台需要 JavaScript 以订阅 durable event stream。</p>
+  </noscript>
+</body>
+</html>

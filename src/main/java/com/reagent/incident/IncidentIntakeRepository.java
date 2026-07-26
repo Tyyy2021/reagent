@@ -10,4 +10,6 @@ public interface IncidentIntakeRepository extends JpaRepository<IncidentIntakeEn
             String source,
             String externalAlertId
     );
+
+    Optional<IncidentIntakeEntity> findByTaskId(String taskId);
 }

@@ -1,8 +1,12 @@
 package com.reagent.api;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.approval.ApprovalService;
 import com.reagent.core.AgentRunner;
 import com.reagent.core.TaskControl;
+import com.reagent.incident.IncidentIntakeEntity;
+import com.reagent.incident.IncidentIntakeRepository;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskStatus;
@@ -21,6 +25,8 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.time.DateTimeException;
+import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -40,19 +46,25 @@ public class TaskController {
     private final StreamTransport bus;
     private final TaskControl taskControl;
     private final ApprovalService approvalService;
+    private final IncidentIntakeRepository incidents;
+    private final ObjectMapper mapper;
 
     public TaskController(
             AgentRunner runner,
             StateStore stateStore,
             StreamTransport bus,
             TaskControl taskControl,
-            ApprovalService approvalService
+            ApprovalService approvalService,
+            IncidentIntakeRepository incidents,
+            ObjectMapper mapper
     ) {
         this.runner = runner;
         this.stateStore = stateStore;
         this.bus = bus;
         this.taskControl = taskControl;
         this.approvalService = approvalService;
+        this.incidents = incidents;
+        this.mapper = mapper;
     }
 
     /**
@@ -85,10 +97,11 @@ public class TaskController {
      */
     @GetMapping(value = "/{id}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@PathVariable String id,
-                             @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
+                             @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
+                             @RequestParam(value = "cursor", required = false) String queryCursor) {
         stateStore.getTask(id);                          // 不存在 -> IllegalArgumentException(避免给瞎 id 建流)
         // opaque 游标:规整成非 null 串传给 transport 自解释(in-process=event 表 id,redis=stream id);缺省/空=从头
-        String cursor = (lastEventId == null || lastEventId.isBlank()) ? "0" : lastEventId.trim();
+        String cursor = replayCursor(lastEventId, queryCursor);
         SseEmitter emitter = new SseEmitter(3_600_000L);
         AtomicBoolean done = new AtomicBoolean(false);   // 防终态事件重复收尾
 
@@ -116,16 +129,25 @@ public class TaskController {
         return emitter;
     }
 
-    /** 查任务状态:{ taskId, status, goal, result } */
+    /** 查任务状态；只返回浏览器恢复所需的 bounded view。 */
     @GetMapping("/{id}")
-    public Map<String, String> status(@PathVariable String id) {
+    public TaskView status(@PathVariable String id) {
         TaskEntity t = stateStore.getTask(id);
-        return Map.of(
-                "taskId", t.getId(),
-                "status", t.getStatus().name(),
-                "goal", t.getGoal(),
-                "result", t.getResult() == null ? "" : t.getResult(),
-                "profile", t.getProfileId() == null ? "" : t.getProfileId());
+        IncidentSummaryView incident = incidents.findByTaskId(id)
+                .map(this::incidentSummary)
+                .orElse(null);
+        return new TaskView(
+                t.getId(),
+                t.getStatus().name(),
+                incident == null ? t.getGoal() : "",
+                t.getResult() == null ? "" : t.getResult(),
+                t.getProfileId() == null ? "" : t.getProfileId(),
+                t.getRecoveryCount(),
+                t.getOwnerId(),
+                t.getLeaseEpoch(),
+                t.getCreatedAt(),
+                t.getUpdatedAt(),
+                incident);
     }
 
     /** M4:取消任务。默认优雅(当前工具跑完后于安全点停);?force=true 硬杀(Stage3b)。 */
@@ -220,6 +242,41 @@ public class TaskController {
 
     private static String defaultProfile(String profile) {
         return profile == null || profile.isBlank() ? "coding" : profile;
+    }
+
+    private static String replayCursor(String lastEventId, String queryCursor) {
+        if (lastEventId != null && !lastEventId.isBlank()) {
+            return lastEventId.trim();
+        }
+        if (queryCursor != null && !queryCursor.isBlank()) {
+            return queryCursor.trim();
+        }
+        return "0";
+    }
+
+    private IncidentSummaryView incidentSummary(IncidentIntakeEntity incident) {
+        try {
+            JsonNode payload = mapper.readTree(incident.getBoundedPayloadJson());
+            return new IncidentSummaryView(
+                    incident.getSource(),
+                    incident.getExternalAlertId(),
+                    persistedText(payload, "service", 64),
+                    persistedText(payload, "severity", 16),
+                    Instant.parse(persistedText(payload, "startedAt", 64)));
+        } catch (IOException | DateTimeException | IllegalArgumentException failure) {
+            throw new IllegalStateException("Persisted incident summary is invalid", failure);
+        }
+    }
+
+    private static String persistedText(JsonNode payload, String field, int maxCodePoints) {
+        JsonNode value = payload == null ? null : payload.get(field);
+        if (value == null || !value.isTextual() || value.textValue().isBlank()
+                || value.textValue().codePointCount(0, value.textValue().length())
+                > maxCodePoints) {
+            throw new IllegalArgumentException(
+                    "Persisted incident field is invalid: " + field);
+        }
+        return value.textValue();
     }
 
     /** 请求体:{ "goal": "...", "profile": "coding" } */

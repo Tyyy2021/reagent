@@ -1,8 +1,10 @@
 package com.reagent.api;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.approval.ApprovalService;
 import com.reagent.core.AgentRunner;
 import com.reagent.core.TaskControl;
+import com.reagent.incident.IncidentIntakeRepository;
 import com.reagent.persist.StateStore;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskNotFoundException;
@@ -45,7 +47,9 @@ class TaskControllerTest {
                 stateStore,
                 mock(StreamTransport.class),
                 taskControl,
-                approvalService);
+                approvalService,
+                mock(IncidentIntakeRepository.class),
+                new ObjectMapper());
         mvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new ApiExceptionHandler())
                 .build();
