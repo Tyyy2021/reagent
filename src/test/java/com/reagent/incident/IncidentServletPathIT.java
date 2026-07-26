@@ -36,6 +36,7 @@ class IncidentServletPathIT extends InfrastructureIT {
     void clearDurableState() {
         jdbc.update("DELETE FROM incident_intake");
         jdbc.update("DELETE FROM event");
+        jdbc.update("DELETE FROM approval_request");
         jdbc.update("DELETE FROM tool_call");
         jdbc.update("DELETE FROM message");
         jdbc.update("DELETE FROM task");

@@ -1,6 +1,8 @@
 package com.reagent.mcp;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.core.FaultInjector;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -12,12 +14,23 @@ public class McpToolConfiguration {
     private final McpGateway gateway;
     private final McpProperties properties;
     private final ObjectMapper mapper;
+    private final FaultInjector faultInjector;
 
     public McpToolConfiguration(
             McpGateway gateway, McpProperties properties, ObjectMapper mapper) {
+        this(gateway, properties, mapper, FaultInjector.none());
+    }
+
+    @Autowired
+    public McpToolConfiguration(
+            McpGateway gateway,
+            McpProperties properties,
+            ObjectMapper mapper,
+            FaultInjector faultInjector) {
         this.gateway = gateway;
         this.properties = properties;
         this.mapper = mapper;
+        this.faultInjector = faultInjector;
     }
 
     @Bean
@@ -36,6 +49,7 @@ public class McpToolConfiguration {
     }
 
     private McpToolAdapter adapter(String toolName) {
-        return new McpToolAdapter(gateway, properties, mapper, SERVER_ID, toolName);
+        return new McpToolAdapter(
+                gateway, properties, mapper, SERVER_ID, toolName, faultInjector);
     }
 }

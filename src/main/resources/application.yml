@@ -54,9 +54,13 @@ reagent:
           unavailable, and never invent or claim an external action.
         knowledge-base-id: incident-ops
         knowledge-index-version: active
-        mcp-server-ids: []
+        mcp-server-ids:
+          - fake-ops
         tool-names:
           - search_knowledge
+          - query_metrics
+          - search_logs
+          - create_ticket
   # ====== Task 7:trusted internal Python RAG boundary ======
   rag:
     base-url: ${REAGENT_RAG_BASE_URL:http://localhost:8090}

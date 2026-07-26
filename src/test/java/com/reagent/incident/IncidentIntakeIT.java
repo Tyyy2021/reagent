@@ -2,6 +2,8 @@ package com.reagent.incident;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.AgentRunner;
+import com.reagent.mcp.McpGateway;
+import com.reagent.mcp.McpRemoteTool;
 import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.rag.RagGateway;
 import com.reagent.testsupport.InfrastructureIT;
@@ -54,6 +56,7 @@ class IncidentIntakeIT extends InfrastructureIT {
     @SpyBean private AgentProfileRegistry profiles;
     @MockBean private AgentRunner runner;
     @MockBean private RagGateway ragGateway;
+    @MockBean private McpGateway mcpGateway;
     @LocalServerPort private int port;
 
     private final HttpClient http = HttpClient.newBuilder()
@@ -64,11 +67,13 @@ class IncidentIntakeIT extends InfrastructureIT {
     void clearDurableState() {
         jdbc.update("DELETE FROM incident_intake");
         jdbc.update("DELETE FROM event");
+        jdbc.update("DELETE FROM approval_request");
         jdbc.update("DELETE FROM tool_call");
         jdbc.update("DELETE FROM message");
         jdbc.update("DELETE FROM task");
-        reset(runner, ragGateway);
+        reset(runner, ragGateway, mcpGateway);
         when(ragGateway.requireActiveVersion("incident-ops")).thenReturn("v1-test");
+        when(mcpGateway.discover("fake-ops")).thenReturn(fakeOpsTools());
     }
 
     @Test
@@ -253,5 +258,17 @@ class IncidentIntakeIT extends InfrastructureIT {
                 "5xx error rate exceeded 10% for five minutes",
                 Instant.parse("2026-07-19T10:00:00Z"),
                 labels);
+    }
+
+    private static List<McpRemoteTool> fakeOpsTools() {
+        Map<String, Object> schema =
+                Map.of("type", "object", "properties", Map.of());
+        return List.of(
+                new McpRemoteTool(
+                        "fake-ops", "create_ticket", "Create a ticket", schema),
+                new McpRemoteTool(
+                        "fake-ops", "query_metrics", "Query metrics", schema),
+                new McpRemoteTool(
+                        "fake-ops", "search_logs", "Search logs", schema));
     }
 }

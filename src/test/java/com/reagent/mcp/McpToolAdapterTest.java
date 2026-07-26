@@ -7,6 +7,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.core.FaultContext;
+import com.reagent.core.FaultInjector;
+import com.reagent.core.FaultPoint;
+import com.reagent.core.InjectedWorkerCrashException;
+import com.reagent.core.TaskRunToken;
 import com.reagent.profile.AgentProfileDefinition;
 import com.reagent.profile.SchemaHasher;
 import com.reagent.profile.TaskProfileSnapshot;
@@ -28,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class McpToolAdapterTest {
@@ -131,6 +137,62 @@ class McpToolAdapterTest {
         assertTrue(failure.getMessage().contains("outcome is unknown"));
         assertFalse(failure.getMessage().contains("secret"));
         assertTrue(failure.getMessage().length() <= 200);
+    }
+
+    @Test
+    void successfulTicketHitsRemoteSideEffectBoundaryOnlyWithRunIdentity() throws Exception {
+        FakeGateway gateway = new FakeGateway();
+        AtomicInteger hits = new AtomicInteger();
+        AtomicReference<FaultPoint> observedPoint = new AtomicReference<>();
+        AtomicReference<FaultContext> observedContext = new AtomicReference<>();
+        FaultInjector injector = (point, context) -> {
+            hits.incrementAndGet();
+            observedPoint.set(point);
+            observedContext.set(context);
+            throw new InjectedWorkerCrashException(point, context);
+        };
+        McpToolAdapter ticket = adapter(gateway, "create_ticket", injector);
+        TaskRunToken token = new TaskRunToken("task-1", "worker-a", 7);
+        ToolContext running =
+                new ToolContext(token, Path.of(".")).forCall("persisted-ticket-call");
+        gateway.results.add(new McpCallResult("{\"ticket_id\":\"T-1\"}", false));
+
+        InjectedWorkerCrashException crash = assertThrows(
+                InjectedWorkerCrashException.class,
+                () -> ticket.execute(MAPPER.readTree("{\"title\":\"incident\"}"), running));
+
+        FaultContext expected = new FaultContext(
+                "task-1",
+                "worker-a",
+                7,
+                java.util.Optional.of("persisted-ticket-call"),
+                java.util.Optional.empty());
+        assertEquals(FaultPoint.AFTER_REMOTE_SIDE_EFFECT_BEFORE_LOCAL_RESULT, crash.point());
+        assertEquals(expected, crash.faultContext());
+        assertEquals(FaultPoint.AFTER_REMOTE_SIDE_EFFECT_BEFORE_LOCAL_RESULT, observedPoint.get());
+        assertEquals(expected, observedContext.get());
+        assertEquals(1, hits.get());
+        assertEquals(1, gateway.callCount.get());
+
+        gateway.results.add(new McpCallResult("{\"ticket_id\":\"T-2\"}", false));
+        assertEquals(
+                "{\"ticket_id\":\"T-2\"}",
+                ticket.execute(
+                        MAPPER.readTree("{\"title\":\"without-run-token\"}"),
+                        new ToolContext("task-2", Path.of(".")).forCall("call-no-token")));
+
+        McpToolAdapter metrics = adapter(gateway, "query_metrics", injector);
+        gateway.results.add(new McpCallResult("{\"value\":14.2}", false));
+        assertEquals(
+                "{\"value\":14.2}",
+                metrics.execute(MAPPER.readTree("{}"), running.forCall("metrics-call")));
+
+        gateway.results.add(new McpCallResult("validation failed", true));
+        assertTrue(ticket.execute(
+                        MAPPER.readTree("{\"title\":\"bad\"}"),
+                        running.forCall("ticket-error-call"))
+                .contains("validation failed"));
+        assertEquals(1, hits.get());
     }
 
     @Test
@@ -254,6 +316,17 @@ class McpToolAdapterTest {
 
     private static McpToolAdapter adapter(FakeGateway gateway, String toolName) {
         return new McpToolAdapter(gateway, properties(), MAPPER, "fake-ops", toolName);
+    }
+
+    private static McpToolAdapter adapter(
+            FakeGateway gateway, String toolName, FaultInjector faultInjector) {
+        return new McpToolAdapter(
+                gateway,
+                properties(),
+                MAPPER,
+                "fake-ops",
+                toolName,
+                faultInjector);
     }
 
     private static McpRemoteTool remote(String name, Map<String, Object> schema) {

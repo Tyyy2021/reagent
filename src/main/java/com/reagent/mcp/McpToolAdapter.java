@@ -3,6 +3,9 @@ package com.reagent.mcp;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.core.FaultContext;
+import com.reagent.core.FaultInjector;
+import com.reagent.core.FaultPoint;
 import com.reagent.tool.ApprovalPolicy;
 import com.reagent.tool.IdempotencyClass;
 import com.reagent.tool.Tool;
@@ -21,6 +24,7 @@ public final class McpToolAdapter implements Tool {
     private final McpGateway gateway;
     private final McpProperties properties;
     private final ObjectMapper mapper;
+    private final FaultInjector faultInjector;
     private final String serverId;
     private final String remoteToolName;
 
@@ -30,9 +34,20 @@ public final class McpToolAdapter implements Tool {
             ObjectMapper mapper,
             String serverId,
             String remoteToolName) {
+        this(gateway, properties, mapper, serverId, remoteToolName, FaultInjector.none());
+    }
+
+    public McpToolAdapter(
+            McpGateway gateway,
+            McpProperties properties,
+            ObjectMapper mapper,
+            String serverId,
+            String remoteToolName,
+            FaultInjector faultInjector) {
         this.gateway = gateway;
         this.properties = properties;
         this.mapper = mapper;
+        this.faultInjector = Objects.requireNonNull(faultInjector, "faultInjector");
         this.serverId = serverId;
         this.remoteToolName = remoteToolName;
         properties.requireServer(serverId).requireTool(remoteToolName);
@@ -100,6 +115,16 @@ public final class McpToolAdapter implements Tool {
                     serverId, remoteToolName, Collections.unmodifiableMap(arguments));
             if (result.error()) {
                 return boundedObservation("Remote MCP error: " + result.text());
+            }
+            if ("create_ticket".equals(remoteToolName)) {
+                ctx.runToken().ifPresent(runToken -> faultInjector.hit(
+                        FaultPoint.AFTER_REMOTE_SIDE_EFFECT_BEFORE_LOCAL_RESULT,
+                        new FaultContext(
+                                runToken.taskId(),
+                                runToken.workerId(),
+                                runToken.leaseEpoch(),
+                                java.util.Optional.of(ctx.idempotencyKey()),
+                                java.util.Optional.empty())));
             }
             return result.text();
         } catch (OfficialMcpGateway.TransportFailureException ex) {

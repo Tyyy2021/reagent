@@ -3,6 +3,8 @@ package com.reagent.profile;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.core.TaskRunToken;
+import com.reagent.mcp.McpGateway;
+import com.reagent.mcp.McpRemoteTool;
 import com.reagent.persist.MessageEntity;
 import com.reagent.persist.MessageRepository;
 import com.reagent.persist.StateStore;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
@@ -45,6 +48,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.when;
 
 @Import(TaskProfilePersistenceIT.RagTestConfiguration.class)
 class TaskProfilePersistenceIT extends InfrastructureIT {
@@ -69,21 +74,30 @@ class TaskProfilePersistenceIT extends InfrastructureIT {
     @Autowired private AgentProfileRegistry profileRegistry;
     @Autowired private KnowledgeSearchTool knowledgeSearchTool;
     @Autowired private MutableRagGateway ragGateway;
+    @MockBean private McpGateway mcpGateway;
 
     @BeforeEach
     void clearRuntimeRows() {
         jdbc.update("DELETE FROM event");
+        jdbc.update("DELETE FROM approval_request");
         jdbc.update("DELETE FROM tool_call");
         jdbc.update("DELETE FROM message");
         jdbc.update("DELETE FROM task");
         ragGateway.reset("v1-a");
+        reset(mcpGateway);
+        when(mcpGateway.discover("fake-ops")).thenReturn(fakeOpsTools());
     }
 
     @Test
     void incidentRecoveryKeepsCreationTimeIndexAndCodingProfileUnchanged() throws Exception {
         TaskProfileSnapshot createdSnapshot = profileRegistry.snapshot("incident-ops");
         assertEquals("v1-a", createdSnapshot.knowledgeIndexVersion());
-        assertEquals(List.of("search_knowledge"),
+        assertEquals(
+                List.of(
+                        "search_knowledge",
+                        "query_metrics",
+                        "search_logs",
+                        "create_ticket"),
                 createdSnapshot.tools().stream().map(ToolSnapshot::name).toList());
 
         TaskEntity created = stateStore.createTask("investigate checkout pool exhaustion", createdSnapshot);
@@ -233,6 +247,18 @@ class TaskProfilePersistenceIT extends InfrastructureIT {
         return new AgentProfileDefinition(
                 "coding", "v1", prompt, null, null, List.of(),
                 List.of("read_file", "list_dir", "write_file", "run_command", "sleep_ms"));
+    }
+
+    private static List<McpRemoteTool> fakeOpsTools() {
+        Map<String, Object> schema =
+                Map.of("type", "object", "properties", Map.of());
+        return List.of(
+                new McpRemoteTool(
+                        "fake-ops", "create_ticket", "Create a ticket", schema),
+                new McpRemoteTool(
+                        "fake-ops", "query_metrics", "Query metrics", schema),
+                new McpRemoteTool(
+                        "fake-ops", "search_logs", "Search logs", schema));
     }
 
     private static Tool schemaChanged(Tool delegate, AtomicBoolean executed) {
