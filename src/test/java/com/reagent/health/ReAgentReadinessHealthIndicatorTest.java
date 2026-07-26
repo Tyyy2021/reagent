@@ -37,6 +37,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -160,6 +161,42 @@ class ReAgentReadinessHealthIndicatorTest {
 
         assertTrue(python.ready());
         assertEquals("0.1.0", python.version());
+    }
+
+    @Test
+    void pythonReadinessUsesUvicornCompatibleHttp11WithoutH2cUpgrade() throws Exception {
+        AtomicReference<String> upgrade = new AtomicReference<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/internal/readiness", exchange -> {
+            String observedUpgrade = exchange.getRequestHeaders().getFirst("Upgrade");
+            upgrade.set(observedUpgrade);
+            byte[] body = (observedUpgrade == null
+                    ? """
+                      {"ready":true,"service":"agent-capabilities","version":"0.1.0"}
+                      """
+                    : "Invalid HTTP request received.")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add(
+                    "Content-Type",
+                    observedUpgrade == null ? "application/json" : "text/plain");
+            exchange.sendResponseHeaders(observedUpgrade == null ? 200 : 400, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+        try {
+            RagProperties rag = new RagProperties();
+            rag.setBaseUrl(URI.create(
+                    "http://127.0.0.1:" + server.getAddress().getPort()));
+
+            ComponentReadiness python = pythonReadiness(rag);
+
+            assertTrue(python.ready());
+            assertEquals("0.1.0", python.version());
+            assertNull(upgrade.get());
+        } finally {
+            server.stop(0);
+        }
     }
 
     @ParameterizedTest

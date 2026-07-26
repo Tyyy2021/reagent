@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.TestPropertySource;
 
 import java.time.Clock;
@@ -55,6 +56,9 @@ class RedisStreamTransportIT extends InfrastructureIT {
     @Autowired
     private StateStore stateStore;
 
+    @Autowired
+    private JdbcTemplate jdbc;
+
     @Test
     void runtimeTokenUsesFencedAppendAndInjectedUtcClock() {
         String taskId = stateStore.createTask("redis runtime event", "system").getId();
@@ -91,6 +95,100 @@ class RedisStreamTransportIT extends InfrastructureIT {
 
         assertEquals(List.of(TaskEvent.Type.STEP, TaskEvent.Type.TOOL_RESULT), types(received));
         assertEquals(2, received.stream().map(TaskEvent::eventId).distinct().count());
+    }
+
+    @Test
+    void subscriptionBeforeFirstPublishWaitsForTheNewTaskStream() throws InterruptedException {
+        String taskId =
+                stateStore.createTask("subscribe before first publish", "system").getId();
+        List<TaskEvent> received = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch firstEventReceived = new CountDownLatch(1);
+
+        StreamTransport.Subscription subscription =
+                transport.subscribeWithReplay(taskId, "0", event -> {
+                    received.add(event);
+                    firstEventReceived.countDown();
+                    return true;
+                });
+        transport.publish(taskId, TaskEvent.Type.TASK_STARTED, Map.of("leaseEpoch", 1));
+
+        assertAwait(
+                firstEventReceived,
+                "Subscription opened before the first XADD must remain live");
+        subscription.close();
+        assertEquals(List.of(TaskEvent.Type.TASK_STARTED), types(received));
+    }
+
+    @Test
+    void runningTaskDoesNotTreatAPriorRunBoundaryAsAnExpiredTask()
+            throws InterruptedException {
+        String taskId =
+                stateStore.createTask("resume after approval", "system").getId();
+        transport.publish(
+                taskId,
+                TaskEvent.Type.APPROVAL_REQUIRED,
+                Map.of("status", "WAITING_APPROVAL"));
+        assertTrue(Boolean.TRUE.equals(redis.delete(KEY_PREFIX + taskId)));
+
+        List<TaskEvent> received = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch resumedStepReceived = new CountDownLatch(1);
+        StreamTransport.Subscription subscription =
+                transport.subscribeWithReplay(taskId, "0", event -> {
+                    received.add(event);
+                    if (event.type() == TaskEvent.Type.STEP) {
+                        resumedStepReceived.countDown();
+                    }
+                    return true;
+                });
+        transport.publish(taskId, TaskEvent.Type.STEP, Map.of("step", 4));
+
+        assertAwait(
+                resumedStepReceived,
+                "A RUNNING task must wait for its replacement Redis stream");
+        subscription.close();
+        assertEquals(List.of(TaskEvent.Type.STEP), types(received));
+    }
+
+    @Test
+    void waitingApprovalTaskKeepsSubscriptionForTheResumedRun()
+            throws InterruptedException {
+        String taskId =
+                stateStore.createTask("wait then approve", "system").getId();
+        transport.publish(
+                taskId,
+                TaskEvent.Type.APPROVAL_REQUIRED,
+                Map.of("status", "WAITING_APPROVAL"));
+        assertEquals(
+                1,
+                jdbc.update(
+                        """
+                        UPDATE task
+                           SET status = 'WAITING_APPROVAL',
+                               owner_id = NULL,
+                               lease_expires_at = NULL
+                         WHERE id = ?
+                        """,
+                        taskId));
+        assertTrue(Boolean.TRUE.equals(redis.delete(KEY_PREFIX + taskId)));
+
+        List<TaskEvent> received = Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch resumedStepReceived = new CountDownLatch(1);
+        StreamTransport.Subscription subscription =
+                transport.subscribeWithReplay(taskId, "0", event -> {
+                    received.add(event);
+                    if (event.type() == TaskEvent.Type.STEP) {
+                        resumedStepReceived.countDown();
+                    }
+                    return true;
+                });
+        stateStore.markRunning(taskId);
+        transport.publish(taskId, TaskEvent.Type.STEP, Map.of("step", 4));
+
+        assertAwait(
+                resumedStepReceived,
+                "WAITING_APPROVAL remains resumable after its stream is absent");
+        subscription.close();
+        assertEquals(List.of(TaskEvent.Type.STEP), types(received));
     }
 
     @Test

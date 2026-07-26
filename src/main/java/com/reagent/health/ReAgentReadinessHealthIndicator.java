@@ -154,6 +154,7 @@ public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
             HttpClient client = HttpClient.newBuilder()
                     .connectTimeout(properties.getConnectTimeout())
                     .followRedirects(HttpClient.Redirect.NEVER)
+                    .version(HttpClient.Version.HTTP_1_1)
                     .build();
             byte[] responseBody = BoundedHttpBody.send(
                     client,
