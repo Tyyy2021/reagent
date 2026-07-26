@@ -3,20 +3,19 @@ from contextlib import contextmanager
 from re import Pattern, compile as compile_pattern
 from typing import TypeAlias
 
-from opentelemetry import context, propagate, trace
+from opentelemetry import context, trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.asgi import (  # pyright: ignore[reportMissingTypeStubs]
-    OpenTelemetryMiddleware,
-)
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.trace import Span, Tracer
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     SimpleSpanProcessor,
     SpanExporter,
 )
 from starlette.applications import Starlette
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 AttributeValue: TypeAlias = str | bool | int | float | list[str]
 
@@ -37,6 +36,7 @@ _ALLOWED_KEYS = {
     "alert.external_id",
 }
 _tracer: Tracer = trace.get_tracer(_INSTRUMENTATION_NAME)
+_TRACE_CONTEXT = TraceContextTextMapPropagator()
 
 
 class ObservabilityRuntime:
@@ -72,14 +72,11 @@ class ObservabilityRuntime:
         _tracer = self._provider.get_tracer(_INSTRUMENTATION_NAME)
 
     def instrument(self, app: Starlette) -> None:
-        app.add_middleware(
-            OpenTelemetryMiddleware,
-            tracer_provider=self._provider,
-        )
+        app.add_middleware(_W3cExtractionMiddleware)
 
     @contextmanager
     def incoming_context(self, headers: Mapping[str, str]) -> Generator[None, None, None]:
-        token = context.attach(propagate.extract(headers))
+        token = context.attach(_TRACE_CONTEXT.extract(headers))
         try:
             yield
         finally:
@@ -100,6 +97,8 @@ def traced(
     with _tracer.start_as_current_span(
         name,
         attributes=safe_attributes(attributes or {}),
+        record_exception=False,
+        set_status_on_exception=False,
     ) as span:
         yield span
 
@@ -137,3 +136,27 @@ def _provider(service_name: str, service_version: str) -> TracerProvider:
             }
         )
     )
+
+
+class _W3cExtractionMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] not in {"http", "websocket"}:
+            await self._app(scope, receive, send)
+            return
+        headers = {
+            name.decode("latin-1"): value.decode("latin-1")
+            for name, value in scope.get("headers", [])
+        }
+        token = context.attach(_TRACE_CONTEXT.extract(headers))
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            context.detach(token)

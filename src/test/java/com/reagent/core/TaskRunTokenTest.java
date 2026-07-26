@@ -28,6 +28,11 @@ class TaskRunTokenTest {
     }
 
     @Test
+    void rejectsZeroLeaseEpoch() {
+        assertThrows(IllegalArgumentException.class, () -> new TaskRunToken("task-1", "worker-a", 0));
+    }
+
+    @Test
     void mutableClockAdvancesInUtcWithoutSleeping() {
         Instant initial = Instant.parse("2026-07-18T00:00:00Z");
         MutableClock clock = new MutableClock(initial);

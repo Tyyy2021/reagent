@@ -1,9 +1,16 @@
 from pathlib import Path
 
+import pytest
+from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 from agent_capabilities.app import create_app
 from agent_capabilities.config import Settings
+from agent_capabilities.fake_ops.tickets import TicketService
+from agent_capabilities.observability import ObservabilityRuntime
+from agent_capabilities.rag.api import RagRuntime
+from agent_capabilities.rag.service import RagService
+from fakes import FakeEmbeddingPort, InMemoryKnowledgeIndex
 
 
 def settings(**overrides: object) -> Settings:
@@ -64,6 +71,38 @@ def test_rag_search_rejects_oversized_body_before_json_parsing() -> None:
     assert response.status_code == 413
 
 
+def test_lifespan_attempts_every_cleanup_when_ticket_close_fails() -> None:
+    events: list[str] = []
+    embedding = FakeEmbeddingPort()
+    index = _ActiveIndex()
+    runtime = RagRuntime(
+        initializer=_ReadyInitializer(),
+        service=RagService(embedding=embedding, index=index),
+        index=index,
+        close=lambda: events.append("rag.close"),
+    )
+    ticket = _FailingTicketService(events)
+    observability = _RecordingObservability(events)
+
+    with pytest.raises(RuntimeError, match="ticket close failed"):
+        with TestClient(
+            create_app(
+                settings(),
+                runtime_factory=lambda: runtime,
+                ticket_service_factory=lambda: ticket,
+                migration_runner=lambda _: None,
+                observability_runtime=observability,
+            )
+        ):
+            pass
+
+    assert events == [
+        "ticket.close",
+        "rag.close",
+        "observability.shutdown",
+    ]
+
+
 def assert_settings_are_not_echoed(body: str, configured: Settings) -> None:
     for value in (
         configured.redis_url,
@@ -73,3 +112,43 @@ def assert_settings_are_not_echoed(body: str, configured: Settings) -> None:
         configured.otlp_endpoint,
     ):
         assert value not in body
+
+
+class _ReadyInitializer:
+    def initialize(self) -> str:
+        return "v1-cleanup"
+
+
+class _ActiveIndex(InMemoryKnowledgeIndex):
+    def __init__(self) -> None:
+        super().__init__(
+            version="v1-cleanup",
+            embedding=FakeEmbeddingPort(),
+            chunks=[],
+        )
+
+    def active_version(self) -> str | None:
+        return "v1-cleanup"
+
+
+class _FailingTicketService(TicketService):
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def close(self) -> None:
+        self._events.append("ticket.close")
+        raise RuntimeError("ticket close failed")
+
+
+class _RecordingObservability(ObservabilityRuntime):
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def activate(self) -> None:
+        pass
+
+    def instrument(self, app: Starlette) -> None:
+        del app
+
+    def shutdown(self) -> None:
+        self._events.append("observability.shutdown")

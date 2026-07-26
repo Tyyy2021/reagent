@@ -100,11 +100,15 @@ def create_app(
         finally:
             fake_ops_state.ticket_service = None
             rag_state.runtime = None
-            if ticket_service is not None:
-                await run_sync_in_worker(ticket_service.close)
-            if runtime is not None:
-                await run_sync_in_worker(runtime.close)
-            observability.shutdown()
+            try:
+                if ticket_service is not None:
+                    await run_sync_in_worker(ticket_service.close)
+            finally:
+                try:
+                    if runtime is not None:
+                        await run_sync_in_worker(runtime.close)
+                finally:
+                    observability.shutdown()
 
     async def readiness(_: Request) -> JSONResponse:
         return JSONResponse(readiness_state[0].as_dict(), status_code=200)

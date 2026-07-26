@@ -1,6 +1,7 @@
 package com.reagent.core;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.llm.LlmClient;
 import com.reagent.persist.EventEntity;
 import com.reagent.persist.EventRepository;
@@ -62,6 +63,7 @@ class AgentRunnerIT extends InfrastructureIT {
     @Autowired private MessageRepository messageRepository;
     @Autowired private ToolCallRepository toolCallRepository;
     @Autowired private EventRepository eventRepository;
+    @Autowired private ObjectMapper objectMapper;
     @Autowired private StreamTransport transport;
     @Autowired private JdbcTemplate jdbc;
     @Autowired private SwitchableLlmClient llm;
@@ -80,7 +82,7 @@ class AgentRunnerIT extends InfrastructureIT {
     }
 
     @Test
-    void runsToolThenCompletesAndRebuildsContext() {
+    void runsToolThenCompletesAndRebuildsContext() throws Exception {
         ToolCall call = new ToolCall("call-happy", recordingTool.name(), "{\"value\":1}");
         Decision tools = Decision.tools(assistantWithCall(call), List.of(call));
         Decision done = Decision.finalAnswer(
@@ -116,7 +118,8 @@ class AgentRunnerIT extends InfrastructureIT {
         assertEquals(call.id(), messages.get(3).getToolCallId());
         assertEquals("recorded-result", messages.get(3).getContent());
 
-        List<TaskEvent.Type> eventTypes = durableEvents(result.taskId()).stream()
+        List<EventEntity> durable = durableEvents(result.taskId());
+        List<TaskEvent.Type> eventTypes = durable.stream()
                 .map(event -> TaskEvent.Type.valueOf(event.getType()))
                 .toList();
         assertEquals(List.of(
@@ -127,6 +130,8 @@ class AgentRunnerIT extends InfrastructureIT {
                         TaskEvent.Type.STEP,
                         TaskEvent.Type.COMPLETED),
                 eventTypes);
+        JsonNode started = objectMapper.readTree(durable.getFirst().getData());
+        assertEquals(task.getLeaseEpoch(), started.path("leaseEpoch").asLong());
     }
 
     @Test

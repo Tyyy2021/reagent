@@ -4,12 +4,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.approval.ApprovalRequestEntity;
 import com.reagent.approval.ApprovalRequestRepository;
+import com.reagent.persist.EventRepository;
 import com.reagent.persist.TaskEntity;
 import com.reagent.persist.TaskNotFoundException;
 import com.reagent.persist.TaskRepository;
 import com.reagent.persist.TaskStatus;
 import com.reagent.persist.ToolCallEntity;
 import com.reagent.persist.ToolCallRepository;
+import com.reagent.stream.TaskEvent;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -18,19 +21,22 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
-import java.util.stream.LongStream;
 
 @Service
 public final class AcceptanceService {
 
     private static final List<String> MCP_TOOL_ORDER =
             List.of("query_metrics", "search_logs", "create_ticket");
-    private static final Pattern SAFE_ID = Pattern.compile("^[A-Za-z0-9._:/#-]{1,256}$");
+    private static final Pattern SAFE_ID =
+            Pattern.compile("^[A-Za-z0-9][A-Za-z0-9._/#-]{0,255}$");
     private static final Pattern TICKET_ID = Pattern.compile("^OPS-[A-Z0-9]{12}$");
+    private static final Pattern EPOCH_VALUE = Pattern.compile("^[1-9][0-9]{0,18}$");
+    private static final int MAX_WORKER_EPOCHS = 16;
 
     private final TaskRepository tasks;
     private final ToolCallRepository calls;
     private final ApprovalRequestRepository approvals;
+    private final EventRepository events;
     private final PythonAcceptanceClient python;
     private final ObjectMapper mapper;
 
@@ -38,12 +44,14 @@ public final class AcceptanceService {
             TaskRepository tasks,
             ToolCallRepository calls,
             ApprovalRequestRepository approvals,
+            EventRepository events,
             PythonAcceptanceClient python,
             ObjectMapper mapper
     ) {
         this.tasks = tasks;
         this.calls = calls;
         this.approvals = approvals;
+        this.events = events;
         this.python = python;
         this.mapper = mapper;
     }
@@ -60,13 +68,9 @@ public final class AcceptanceService {
                 .toList();
         String approval = approvalDecision(taskId);
         String ticketId = ticketId(ledger);
+        List<Long> epochs = workerEpochs(taskId);
         PythonAcceptanceClient.PythonAcceptanceResponse scoped = python.fetch(taskId);
-        List<Long> epochs = task.getLeaseEpoch() <= 0
-                ? List.of()
-                : LongStream.rangeClosed(1, Math.min(task.getLeaseEpoch(), 16))
-                .boxed()
-                .toList();
-        boolean passed = passed(task, approval, ticketId, scoped);
+        boolean passed = passed(task, approval, ticketId, scoped, epochs);
         return new AcceptanceEvidence(
                 1,
                 task.getId(),
@@ -138,13 +142,51 @@ public final class AcceptanceService {
         return "";
     }
 
+    private List<Long> workerEpochs(String taskId) {
+        List<String> values;
+        try {
+            values = events.findOrderedDistinctEpochValues(
+                    taskId,
+                    TaskEvent.Type.TASK_STARTED.name(),
+                    PageRequest.of(0, MAX_WORKER_EPOCHS + 1));
+        } catch (RuntimeException failure) {
+            throw invalidLedger();
+        }
+        if (values == null) {
+            throw invalidLedger();
+        }
+        if (values.isEmpty()) {
+            return List.of();
+        }
+        Set<Long> epochs = new LinkedHashSet<>();
+        for (String value : values) {
+            if (value == null || !EPOCH_VALUE.matcher(value).matches()) {
+                throw invalidLedger();
+            }
+            long epoch;
+            try {
+                epoch = Long.parseLong(value);
+            } catch (NumberFormatException failure) {
+                throw invalidLedger();
+            }
+            if (epoch <= 0 || !epochs.add(epoch)) {
+                throw invalidLedger();
+            }
+        }
+        if (epochs.size() > MAX_WORKER_EPOCHS) {
+            throw invalidLedger();
+        }
+        return List.copyOf(epochs);
+    }
+
     private static boolean passed(
             TaskEntity task,
             String approval,
             String ticketId,
-            PythonAcceptanceClient.PythonAcceptanceResponse scoped
+            PythonAcceptanceClient.PythonAcceptanceResponse scoped,
+            List<Long> epochs
     ) {
-        if (task.getStatus() != TaskStatus.COMPLETED) {
+        if (task.getStatus() != TaskStatus.COMPLETED || epochs.isEmpty()) {
             return false;
         }
         if (ticketId.isEmpty()) {

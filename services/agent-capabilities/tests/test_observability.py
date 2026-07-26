@@ -1,8 +1,12 @@
 import pytest
 import anyio
+from opentelemetry import baggage
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace import ReadableSpan
 from pathlib import Path
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from agent_capabilities.app import create_app
@@ -187,6 +191,109 @@ def test_app_lifecycle_exports_nested_rag_spans_under_incoming_java_trace() -> N
     assert search_attributes is not None
     assert search_attributes["rag.hit_count"] == 1
     assert search_attributes["rag.chunk_ids"] == ("chunk-observed",)
+
+
+def test_app_exports_no_transport_or_exception_data_from_sentinel_requests() -> None:
+    exporter = InMemorySpanExporter()
+    observability = ObservabilityRuntime.for_exporter(
+        service_name="agent-capabilities",
+        service_version="0.1.0",
+        exporter=exporter,
+    )
+    settings = Settings.model_validate(
+        {
+            "env": "test",
+            "knowledge_root": Path("/unused"),
+            "acceptance_enabled": True,
+            "otlp_endpoint": "http://unused.invalid/v1/traces",
+        }
+    )
+    app = create_app(settings, observability_runtime=observability)
+    observed_baggage: list[object] = []
+
+    async def fail_with_sensitive_exception(_: Request) -> Response:
+        observed_baggage.append(baggage.get_baggage("sensitive"))
+        try:
+            with traced("rag.search", {"rag.index.version": "v1-safe"}):
+                raise RuntimeError(
+                    "BUSINESS_EXCEPTION_SENTINEL https://secret.invalid/private"
+                )
+        except RuntimeError:
+            return Response(status_code=500)
+
+    app.router.routes.insert(
+        0,
+        Route("/internal/failing-business-span", fail_with_sensitive_exception),
+    )
+    trace_id = "2123456789abcdef0123456789abcdef"
+    with TestClient(app, raise_server_exceptions=False) as client:
+        acceptance = client.get(
+            "/internal/acceptance",
+            params={
+                "idempotencyKey": (
+                    "QUERY_SENTINEL-https://secret.invalid/private?token=hidden"
+                )
+            },
+        )
+        failure = client.get(
+            "/internal/failing-business-span",
+            headers={
+                "traceparent": f"00-{trace_id}-0123456789abcdef-01",
+                "tracestate": "vendor=safe",
+                "baggage": "sensitive=BAGGAGE_SENTINEL",
+                "x-secret-header": "HEADER_SENTINEL",
+            },
+        )
+
+    assert acceptance.status_code == 503
+    assert failure.status_code == 500
+    assert observability.force_flush()
+    spans = exporter.get_finished_spans()
+    assert {span.name for span in spans} == {"rag.search"}
+    assert {format(_trace_id(span), "032x") for span in spans} == {trace_id}
+    assert observed_baggage == [None]
+    span_context = spans[0].context
+    assert span_context is not None
+    assert span_context.trace_state.get("vendor") == "safe"
+    exported = repr(
+        [
+            (
+                span.name,
+                dict(span.attributes or {}),
+                [
+                    (event.name, dict(event.attributes or {}))
+                    for event in span.events
+                ],
+            )
+            for span in spans
+        ]
+    )
+    for sentinel in (
+        "QUERY_SENTINEL",
+        "BUSINESS_EXCEPTION_SENTINEL",
+        "HEADER_SENTINEL",
+        "BAGGAGE_SENTINEL",
+        "secret.invalid",
+        "idempotencyKey",
+    ):
+        assert sentinel not in exported
+    for span in spans:
+        attributes = span.attributes or {}
+        assert not any(
+            key.startswith(
+                (
+                    "http.",
+                    "url.",
+                    "server.",
+                    "client.",
+                    "network.",
+                    "exception.",
+                )
+            )
+            for key in attributes
+        )
+        assert span.events == ()
+    observability.shutdown()
 
 
 def test_real_mcp_tool_functions_emit_the_exact_safe_span_names() -> None:

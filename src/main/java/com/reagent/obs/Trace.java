@@ -60,6 +60,8 @@ public final class Trace {
             AttributeKey.stringKey("reagent.tool.provider");
     public static final AttributeKey<String> MCP_SERVER =
             AttributeKey.stringKey("reagent.mcp.server");
+    public static final AttributeKey<String> MCP_ERROR_TYPE =
+            AttributeKey.stringKey("reagent.mcp.error_type");
     public static final AttributeKey<String> TOOL_OUTCOME =
             AttributeKey.stringKey("reagent.tool.outcome");
     public static final AttributeKey<String> SANDBOX_TYPE = AttributeKey.stringKey("reagent.sandbox.type");

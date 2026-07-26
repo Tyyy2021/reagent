@@ -75,6 +75,7 @@ class AgentRunnerEventFencingTest {
                         TaskEvent.Type.COMPLETED),
                 transport.fencedTypes);
         assertEquals(List.of(token, token, token, token), transport.tokens);
+        assertEquals(Map.of("leaseEpoch", 7L), transport.fencedData.getFirst());
     }
 
     @Test
@@ -516,6 +517,7 @@ class AgentRunnerEventFencingTest {
         private final List<TaskEvent.Type> controlPlaneTypes = new ArrayList<>();
         private final List<TaskEvent.Type> fencedTypes = new ArrayList<>();
         private final List<TaskRunToken> tokens = new ArrayList<>();
+        private final List<Object> fencedData = new ArrayList<>();
 
         @Override
         public TaskEvent publish(String taskId, TaskEvent.Type type, Object data) {
@@ -527,6 +529,7 @@ class AgentRunnerEventFencingTest {
         public TaskEvent publish(TaskRunToken token, TaskEvent.Type type, Object data) {
             tokens.add(token);
             fencedTypes.add(type);
+            fencedData.add(data);
             return TaskEvent.of(token.taskId(), null, type, data, Instant.EPOCH);
         }
 

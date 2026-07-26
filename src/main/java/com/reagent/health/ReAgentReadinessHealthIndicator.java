@@ -2,6 +2,7 @@ package com.reagent.health;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.http.BoundedHttpBody;
 import com.reagent.mcp.McpReadiness;
 import com.reagent.profile.AgentProfileRegistry;
 import com.reagent.rag.KnowledgeVersionProvider;
@@ -20,7 +21,6 @@ import javax.sql.DataSource;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.time.Clock;
 import java.util.ArrayList;
@@ -28,12 +28,15 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 @Component("reAgentReadiness")
 public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
 
     private static final Set<String> REQUIRED_MCP_TOOLS =
             Set.of("query_metrics", "search_logs", "create_ticket");
+    private static final Pattern SAFE_VERSION =
+            Pattern.compile("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
 
     private final Clock clock;
     private final List<Probe> probes;
@@ -82,10 +85,7 @@ public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
         boolean ready = true;
         for (Probe probe : probes) {
             try {
-                String version = probe.version().get();
-                if (version == null || version.isBlank()) {
-                    throw new IllegalStateException("component version unavailable");
-                }
+                String version = requireSafeVersion(probe.version().get());
                 components.add(new ComponentReadiness(probe.name(), true, version, "ready"));
             } catch (RuntimeException failure) {
                 ready = false;
@@ -113,7 +113,7 @@ public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
                 throw new IllegalStateException("database unavailable");
             }
             String product = connection.getMetaData().getDatabaseProductName();
-            return product == null || product.isBlank() ? "database" : bounded(product);
+            return product == null || product.isBlank() ? "database" : product;
         } catch (Exception failure) {
             throw new IllegalStateException("database unavailable");
         }
@@ -124,7 +124,7 @@ public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
             ObjectProvider<StringRedisTemplate> redisProvider
     ) {
         if (!(transport instanceof RedisStreamTransport)) {
-            return "in-process";
+            throw new IllegalStateException("redis unavailable");
         }
         StringRedisTemplate template = redisProvider.getIfAvailable();
         if (template == null || template.getConnectionFactory() == null) {
@@ -151,22 +151,25 @@ public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
                     .header("Accept", "application/json")
                     .GET()
                     .build();
-            HttpResponse<byte[]> response = HttpClient.newBuilder()
+            HttpClient client = HttpClient.newBuilder()
                     .connectTimeout(properties.getConnectTimeout())
                     .followRedirects(HttpClient.Redirect.NEVER)
-                    .build()
-                    .send(request, HttpResponse.BodyHandlers.ofByteArray());
-            if (response.statusCode() != 200
-                    || response.body().length > properties.getMaximumResponseBytes()) {
-                throw new IllegalStateException("python unavailable");
-            }
-            JsonNode body = mapper.readTree(response.body());
+                    .build();
+            byte[] responseBody = BoundedHttpBody.send(
+                    client,
+                    request,
+                    properties.getMaximumResponseBytes(),
+                    properties.getRequestTimeout());
+            JsonNode body = mapper.readTree(responseBody);
             if (!body.path("ready").asBoolean(false)
                     || !"agent-capabilities".equals(body.path("service").asText())) {
                 throw new IllegalStateException("python unavailable");
             }
-            String version = body.path("version").asText("0.1.0");
-            return bounded(version);
+            JsonNode version = body.get("version");
+            if (version == null || !version.isTextual()) {
+                throw new IllegalStateException("python unavailable");
+            }
+            return version.textValue();
         } catch (Exception failure) {
             if (failure instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
@@ -183,8 +186,11 @@ public final class ReAgentReadinessHealthIndicator implements HealthIndicator {
         return state.toolCount() + "-tools";
     }
 
-    private static String bounded(String value) {
-        return value.length() <= 64 ? value : value.substring(0, 64);
+    private static String requireSafeVersion(String value) {
+        if (value == null || !SAFE_VERSION.matcher(value).matches()) {
+            throw new IllegalStateException("component version unavailable");
+        }
+        return value;
     }
 
     record Probe(String name, String failureReason, Supplier<String> version) {

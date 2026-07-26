@@ -3,6 +3,7 @@ package com.reagent.acceptance;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
+import com.reagent.http.BoundedHttpBody;
 import com.reagent.persist.ToolCallEntity;
 import com.reagent.persist.ToolCallRepository;
 import com.reagent.rag.RagProperties;
@@ -13,7 +14,6 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -69,13 +69,12 @@ public class PythonAcceptanceClient {
                 .GET()
                 .build();
         try {
-            HttpResponse<byte[]> response =
-                    http.send(request, HttpResponse.BodyHandlers.ofByteArray());
-            if (response.statusCode() != 200
-                    || response.body().length > properties.getMaximumResponseBytes()) {
-                throw invalid();
-            }
-            PythonAcceptanceResponse parsed = reader.readValue(response.body());
+            byte[] responseBody = BoundedHttpBody.send(
+                    http,
+                    request,
+                    properties.getMaximumResponseBytes(),
+                    properties.getRequestTimeout());
+            PythonAcceptanceResponse parsed = reader.readValue(responseBody);
             validate(parsed);
             return parsed;
         } catch (IOException failure) {

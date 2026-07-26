@@ -14,12 +14,17 @@ import com.reagent.tool.IdempotencyClass;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.modelcontextprotocol.spec.McpTransportException;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.baggage.Baggage;
 import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import java.time.Duration;
 import java.net.ConnectException;
 import java.net.InetAddress;
@@ -606,6 +611,81 @@ class McpGatewayContractTest {
     }
 
     @Test
+    void mcpFailureSpansExportOnlyValidatedIdentifiersAndStableErrorTypes() {
+        InMemorySpanExporter exporter = InMemorySpanExporter.create();
+        SdkTracerProvider provider = SdkTracerProvider.builder()
+                .addSpanProcessor(SimpleSpanProcessor.create(exporter))
+                .build();
+        Tracer tracer = provider.get(Trace.INSTRUMENTATION_NAME);
+        List<OfficialMcpGateway> gateways = new java.util.ArrayList<>();
+        try {
+            ScriptedFactory initializeFactory = new ScriptedFactory();
+            initializeFactory.addSession().failInitialize = new IllegalStateException(
+                    "INITIALIZE_SECRET_SENTINEL https://secret.invalid/init");
+            OfficialMcpGateway initialize = gateway(initializeFactory, tracer);
+            gateways.add(initialize);
+            assertThrows(McpContractException.class, () -> initialize.discover("fake-ops"));
+
+            ScriptedFactory listFactory = new ScriptedFactory();
+            listFactory.addSession().failList = new IllegalStateException(
+                    "LIST_SECRET_SENTINEL https://secret.invalid/list");
+            OfficialMcpGateway list = gateway(listFactory, tracer);
+            gateways.add(list);
+            assertThrows(McpContractException.class, () -> list.discover("fake-ops"));
+
+            ScriptedFactory callFactory = new ScriptedFactory();
+            ScriptedSession callSession = callFactory.addSession();
+            callSession.discovery.add(List.of(tool("query_metrics", objectSchema())));
+            callSession.failCall = new McpContractException(
+                    "CALL_SECRET_SENTINEL https://secret.invalid/call");
+            OfficialMcpGateway call = gateway(callFactory, tracer);
+            gateways.add(call);
+            call.discover("fake-ops");
+            assertThrows(
+                    McpContractException.class,
+                    () -> call.call("fake-ops", "query_metrics", Map.of()));
+
+            OfficialMcpGateway invalid = gateway(new ScriptedFactory(), tracer);
+            gateways.add(invalid);
+            assertThrows(
+                    McpContractException.class,
+                    () -> invalid.call(
+                            "https://SERVER_SECRET_SENTINEL",
+                            "https://TOOL_SECRET_SENTINEL",
+                            Map.of()));
+
+            List<SpanData> spans = exporter.getFinishedSpanItems();
+            List<SpanData> errors = spans.stream()
+                    .filter(span -> span.getStatus().getStatusCode() == StatusCode.ERROR)
+                    .toList();
+            AttributeKey<String> errorType =
+                    AttributeKey.stringKey("reagent.mcp.error_type");
+
+            assertEquals(4, errors.size());
+            assertTrue(errors.stream().allMatch(span ->
+                    Set.of("contract", "transport", "runtime")
+                            .contains(span.getAttributes().get(errorType))));
+            assertTrue(spans.stream().allMatch(span -> span.getEvents().isEmpty()));
+            assertTrue(spans.stream().flatMap(span ->
+                            span.getAttributes().asMap().values().stream())
+                    .filter(String.class::isInstance)
+                    .map(String.class::cast)
+                    .allMatch(value -> value.length() <= 64));
+            String exported = spans.toString();
+            for (String forbidden : List.of(
+                    "SECRET_SENTINEL",
+                    "secret.invalid",
+                    "exception.message",
+                    "exception.stacktrace")) {
+                assertFalse(exported.contains(forbidden), forbidden);
+            }
+        } finally {
+            gateways.forEach(OfficialMcpGateway::close);
+            provider.close();
+        }
+    }
+
+    @Test
     void traceCaptureContainsOnlyCurrentW3cTraceHeaders() {
         SdkTracerProvider provider = SdkTracerProvider.builder().build();
         Tracer tracer = OpenTelemetrySdk.builder()
@@ -750,6 +830,18 @@ class McpGatewayContractTest {
     private static OfficialMcpGateway gateway(ScriptedFactory factory) {
         return new OfficialMcpGateway(
                 validProperties(), new ObjectMapper(), new McpReadiness(), factory);
+    }
+
+    private static OfficialMcpGateway gateway(
+            ScriptedFactory factory,
+            Tracer tracer
+    ) {
+        return new OfficialMcpGateway(
+                validProperties(),
+                new ObjectMapper(),
+                new McpReadiness(),
+                factory,
+                tracer);
     }
 
     private static OfficialMcpGateway.RawTool tool(String name, Object schema) {
@@ -983,15 +1075,23 @@ class McpGatewayContractTest {
         private final AtomicInteger initializes = new AtomicInteger();
         private final AtomicInteger calls = new AtomicInteger();
         private final AtomicInteger closes = new AtomicInteger();
+        private RuntimeException failInitialize;
+        private RuntimeException failList;
         private RuntimeException failCall;
 
         @Override
         public void initialize() {
             initializes.incrementAndGet();
+            if (failInitialize != null) {
+                throw failInitialize;
+            }
         }
 
         @Override
         public List<OfficialMcpGateway.RawTool> listTools() {
+            if (failList != null) {
+                throw failList;
+            }
             List<OfficialMcpGateway.RawTool> result = discovery.poll();
             if (result == null) {
                 throw new AssertionError("No scripted discovery");

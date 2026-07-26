@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.reagent.obs.Trace;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import io.modelcontextprotocol.client.McpClient;
@@ -140,12 +141,12 @@ public final class OfficialMcpGateway implements McpGateway {
     public synchronized McpCallResult call(
             String serverId, String toolName, Map<String, Object> arguments) {
         Span span = tracer.spanBuilder("mcp.call_tool").startSpan();
-        span.setAttribute(Trace.MCP_SERVER, serverId);
-        span.setAttribute(Trace.TOOL_NAME, toolName);
+        setSafeServer(span, serverId);
+        setSafeTool(span, toolName);
         try (Scope ignored = span.makeCurrent()) {
             return callTraced(serverId, toolName, arguments);
         } catch (RuntimeException failure) {
-            span.recordException(failure);
+            markFailure(span, failure);
             throw failure;
         } finally {
             span.end();
@@ -296,7 +297,7 @@ public final class OfficialMcpGateway implements McpGateway {
         Session session = sessionFactory.open(serverId, configured, mapper);
         boolean initialized = false;
         Span span = tracer.spanBuilder("mcp.initialize").startSpan();
-        span.setAttribute(Trace.MCP_SERVER, serverId);
+        setSafeServer(span, serverId);
         try {
             try (Scope ignored = span.makeCurrent()) {
                 session.initialize();
@@ -304,7 +305,7 @@ public final class OfficialMcpGateway implements McpGateway {
                 return session;
             }
         } catch (RuntimeException failure) {
-            span.recordException(failure);
+            markFailure(span, failure);
             throw failure;
         } finally {
             span.end();
@@ -359,11 +360,11 @@ public final class OfficialMcpGateway implements McpGateway {
 
     private List<RawTool> listToolsTraced(String serverId, Session session) {
         Span span = tracer.spanBuilder("mcp.list_tools").startSpan();
-        span.setAttribute(Trace.MCP_SERVER, serverId);
+        setSafeServer(span, serverId);
         try (Scope ignored = span.makeCurrent()) {
             return session.listTools();
         } catch (RuntimeException failure) {
-            span.recordException(failure);
+            markFailure(span, failure);
             throw failure;
         } finally {
             span.end();
@@ -626,6 +627,32 @@ public final class OfficialMcpGateway implements McpGateway {
             current = current.getCause();
         }
         return false;
+    }
+
+    private static void setSafeServer(Span span, String serverId) {
+        if (serverId != null && McpProperties.LEGAL_ID.matcher(serverId).matches()) {
+            span.setAttribute(Trace.MCP_SERVER, serverId);
+        }
+    }
+
+    private static void setSafeTool(Span span, String toolName) {
+        if (toolName != null && McpProperties.LEGAL_ID.matcher(toolName).matches()) {
+            span.setAttribute(Trace.TOOL_NAME, toolName);
+        }
+    }
+
+    private static void markFailure(Span span, RuntimeException failure) {
+        String errorType;
+        if (failure instanceof McpContractException
+                || hasDefinitiveProtocolCause(failure)) {
+            errorType = "contract";
+        } else if (isTransportFailure(failure)) {
+            errorType = "transport";
+        } else {
+            errorType = "runtime";
+        }
+        span.setAttribute(Trace.MCP_ERROR_TYPE, errorType);
+        span.setStatus(StatusCode.ERROR);
     }
 
     private static boolean hasDefinitiveProtocolCause(Throwable failure) {

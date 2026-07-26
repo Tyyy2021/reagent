@@ -55,12 +55,13 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
 
     private static final PythonCapabilitiesContainer SHARED_CAPABILITIES =
             PythonCapabilitiesContainer.shared();
-    private static final GenericContainer<?> JAEGER = startJaeger();
-    private static final PythonRuntime PYTHON = startPython();
-
-    static {
-        useCapabilityBaseUri(PYTHON.baseUri());
-    }
+    private static final FailureSafeTraceInfrastructure<
+            GenericContainer<?>, PythonRuntime> TRACE_INFRASTRUCTURE =
+            startTraceInfrastructure();
+    private static final GenericContainer<?> JAEGER =
+            TRACE_INFRASTRUCTURE.jaeger();
+    private static final PythonRuntime PYTHON =
+            TRACE_INFRASTRUCTURE.python();
 
     @Autowired
     private AcceptanceService acceptanceService;
@@ -121,10 +122,9 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
     @AfterAll
     void stopTraceInfrastructure() {
         try {
-            PYTHON.close();
+            TRACE_INFRASTRUCTURE.close();
         } finally {
             resetCapabilityBaseUri();
-            JAEGER.stop();
         }
     }
 
@@ -293,18 +293,30 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
     }
 
     private static GenericContainer<?> startJaeger() {
-        GenericContainer<?> jaeger =
-                new GenericContainer<>("jaegertracing/all-in-one:1.62.0")
+        return FailureSafeTraceInfrastructure.startOwned(
+                () -> new GenericContainer<>("jaegertracing/all-in-one:1.62.0")
                         .withEnv("COLLECTOR_OTLP_ENABLED", "true")
                         .withExposedPorts(16686, 4318)
                         .waitingFor(Wait.forHttp("/")
                                 .forPort(16686)
-                                .withStartupTimeout(Duration.ofMinutes(2)));
-        jaeger.start();
-        return jaeger;
+                                .withStartupTimeout(Duration.ofMinutes(2))),
+                container -> container.start(),
+                container -> container.stop());
     }
 
-    private static PythonRuntime startPython() {
+    private static FailureSafeTraceInfrastructure<
+            GenericContainer<?>, PythonRuntime> startTraceInfrastructure() {
+        return FailureSafeTraceInfrastructure.start(
+                CrossServiceTraceIT::startJaeger,
+                CrossServiceTraceIT::launchPython,
+                (jaeger, python) -> awaitPythonReady(
+                        python,
+                        Duration.ofMinutes(4)),
+                PythonRuntime::close,
+                GenericContainer::stop);
+    }
+
+    private static PythonRuntime launchPython(GenericContainer<?> jaeger) {
         try {
             int port = availablePort();
             Path repositoryRoot = Path.of("").toAbsolutePath().normalize();
@@ -342,7 +354,7 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
                     repositoryRoot.resolve("knowledge").toString());
             environment.put(
                     "AGENT_CAPABILITIES_OTLP_ENDPOINT",
-                    otlpEndpoint());
+                    otlpEndpoint(jaeger));
             environment.put(
                     "AGENT_CAPABILITIES_ACCEPTANCE_ENABLED",
                     "true");
@@ -356,24 +368,22 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
             environment.put("HF_HUB_OFFLINE", "1");
             environment.put("TRANSFORMERS_OFFLINE", "1");
 
-            Process process = builder.start();
             URI baseUri = URI.create("http://127.0.0.1:" + port);
-            awaitPythonReady(
-                    process, baseUri, runtimeLog, Duration.ofMinutes(4));
-            return new PythonRuntime(process, baseUri);
+            Process process = builder.start();
+            return new PythonRuntime(process, baseUri, runtimeLog);
         } catch (IOException failure) {
-            JAEGER.stop();
             throw new IllegalStateException(
                     "Cannot start current-source Python runtime", failure);
         }
     }
 
     private static void awaitPythonReady(
-            Process process,
-            URI baseUri,
-            Path runtimeLog,
+            PythonRuntime python,
             Duration timeout
     ) {
+        Process process = python.process();
+        URI baseUri = python.baseUri();
+        Path runtimeLog = python.runtimeLog();
         HttpClient client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(1))
                 .build();
@@ -395,6 +405,7 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
                         HttpResponse.BodyHandlers.ofString());
                 if (response.statusCode() == 200
                         && response.body().contains("\"ready\":true")) {
+                    useCapabilityBaseUri(baseUri);
                     return;
                 }
             } catch (IOException ignored) {
@@ -414,7 +425,6 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
                         interrupted);
             }
         }
-        process.destroyForcibly();
         throw new IllegalStateException(
                 "Current-source Python runtime did not become ready; log="
                         + boundedLog(runtimeLog));
@@ -438,8 +448,12 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
     }
 
     private static String otlpEndpoint() {
-        return "http://" + JAEGER.getHost() + ":"
-                + JAEGER.getMappedPort(4318) + "/v1/traces";
+        return otlpEndpoint(JAEGER);
+    }
+
+    private static String otlpEndpoint(GenericContainer<?> jaeger) {
+        return "http://" + jaeger.getHost() + ":"
+                + jaeger.getMappedPort(4318) + "/v1/traces";
     }
 
     private static String jaegerQueryBase() {
@@ -447,7 +461,7 @@ class CrossServiceTraceIT extends IncidentScenarioFixture {
                 + JAEGER.getMappedPort(16686);
     }
 
-    private record PythonRuntime(Process process, URI baseUri) {
+    private record PythonRuntime(Process process, URI baseUri, Path runtimeLog) {
         private void close() {
             process.destroy();
             try {

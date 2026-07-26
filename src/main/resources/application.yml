@@ -39,11 +39,11 @@ management:
         readiness:
           include: readinessState,reAgentReadiness
     env:
-      access: none
+      enabled: false
     configprops:
-      access: none
+      enabled: false
     heapdump:
-      access: none
+      enabled: false
 
 reagent:
   # ====== Task 3:agent profile 与冻结工具目录 ======

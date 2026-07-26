@@ -253,7 +253,10 @@ public class AgentRunner {
         ToolContext toolCtx = new ToolContext(token, workspaceStore.checkout(taskId));
 
         try {
-            bus.publish(token, TaskEvent.Type.TASK_STARTED, Map.of());
+            bus.publish(
+                    token,
+                    TaskEvent.Type.TASK_STARTED,
+                    Map.of("leaseEpoch", token.leaseEpoch()));
             for (int step = 1; step <= MAX_STEPS; step++) {
                 // M6:每步一个 span(parent = 当前 agent.task span);span scope 内开的 llm/tool span 自动挂其下
                 Span stepSpan = tracer.spanBuilder("agent.step")
