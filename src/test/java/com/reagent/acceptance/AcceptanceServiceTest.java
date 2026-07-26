@@ -25,11 +25,51 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class AcceptanceServiceTest {
+
+    @Test
+    void evidenceDoesNotMaterializeUnrelatedTaskLedgers() {
+        TaskRepository tasks = mock(TaskRepository.class);
+        ToolCallRepository calls = mock(ToolCallRepository.class);
+        ApprovalRequestRepository approvals = mock(ApprovalRequestRepository.class);
+        EventRepository events = mock(EventRepository.class);
+        PythonAcceptanceClient python = mock(PythonAcceptanceClient.class);
+        TaskEntity task = mock(TaskEntity.class);
+        when(task.getId()).thenReturn("task-scoped-ledger");
+        when(task.getProfileId()).thenReturn("incident-ops");
+        when(task.getStatus()).thenReturn(TaskStatus.COMPLETED);
+        when(tasks.findById("task-scoped-ledger")).thenReturn(Optional.of(task));
+        doThrow(new AssertionError("global tool-call ledger read"))
+                .when(calls).findAll();
+        when(calls.findByTaskId("task-scoped-ledger")).thenReturn(List.of());
+        when(approvals.findByTaskIdOrderByAssistantMessageSeqAscToolCallIdAsc(
+                "task-scoped-ledger")).thenReturn(List.of());
+        when(events.findOrderedDistinctEpochValues(
+                org.mockito.ArgumentMatchers.eq("task-scoped-ledger"),
+                org.mockito.ArgumentMatchers.eq("TASK_STARTED"),
+                any(Pageable.class))).thenReturn(List.of("1"));
+        when(python.fetch("task-scoped-ledger")).thenReturn(
+                new PythonAcceptanceClient.PythonAcceptanceResponse(
+                        1, "idempotency-key",
+                        Map.of(
+                                "query_metrics", 0,
+                                "search_logs", 0,
+                                "create_ticket", 0),
+                        0, 0, List.of(), "not-invoked"));
+
+        AcceptanceEvidence evidence = new AcceptanceService(
+                tasks, calls, approvals, events, python, new ObjectMapper())
+                .evidence("task-scoped-ledger");
+
+        assertTrue(evidence.passed());
+        assertEquals(List.of(), evidence.mcpTools());
+        assertEquals("", evidence.ticketId());
+    }
 
     @Test
     void authoritativeLedgersAndScopedPythonCountsProduceOnlyBoundedEvidence() {
@@ -66,7 +106,8 @@ class AcceptanceServiceTest {
         ToolCallEntity ticket = done(
                 "call-ticket", "task-acceptance", "create_ticket",
                 "{\"ticketId\":\"OPS-0123456789AB\",\"evidence\":\"SECRET_SENTINEL\"}");
-        when(calls.findAll()).thenReturn(List.of(rag, metrics, logs, ticket));
+        when(calls.findByTaskId("task-acceptance"))
+                .thenReturn(List.of(rag, metrics, logs, ticket));
 
         ApprovalRequestEntity approval = ApprovalRequestEntity.pending(
                 "call-ticket", "task-acceptance", 8, "create_ticket",
@@ -129,7 +170,7 @@ class AcceptanceServiceTest {
                 org.mockito.ArgumentMatchers.eq("task-no-hit"),
                 org.mockito.ArgumentMatchers.eq("TASK_STARTED"),
                 any(Pageable.class))).thenReturn(List.of("11"));
-        when(calls.findAll()).thenReturn(List.of(done(
+        when(calls.findByTaskId("task-no-hit")).thenReturn(List.of(done(
                 "call-rag", "task-no-hit", "search_knowledge",
                 "{\"contractVersion\":1,\"indexVersion\":\"v1\",\"hits\":[]}")));
         when(approvals.findByTaskIdOrderByAssistantMessageSeqAscToolCallIdAsc(
@@ -276,7 +317,7 @@ class AcceptanceServiceTest {
         when(task.getProfileId()).thenReturn("incident-ops");
         when(task.getStatus()).thenReturn(TaskStatus.COMPLETED);
         when(tasks.findById("task-invalid-epochs")).thenReturn(Optional.of(task));
-        when(calls.findAll()).thenReturn(List.of());
+        when(calls.findByTaskId("task-invalid-epochs")).thenReturn(List.of());
         when(approvals.findByTaskIdOrderByAssistantMessageSeqAscToolCallIdAsc(
                 "task-invalid-epochs")).thenReturn(List.of());
         when(events.findOrderedDistinctEpochValues(
@@ -310,7 +351,7 @@ class AcceptanceServiceTest {
         when(task.getProfileId()).thenReturn(profile);
         when(task.getStatus()).thenReturn(TaskStatus.COMPLETED);
         when(tasks.findById("task-ledger-path")).thenReturn(Optional.of(task));
-        when(calls.findAll()).thenReturn(List.of(done(
+        when(calls.findByTaskId("task-ledger-path")).thenReturn(List.of(done(
                 "call-rag",
                 "task-ledger-path",
                 "search_knowledge",

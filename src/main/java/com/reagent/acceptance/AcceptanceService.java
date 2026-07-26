@@ -59,9 +59,7 @@ public final class AcceptanceService {
     public AcceptanceEvidence evidence(String taskId) {
         TaskEntity task = tasks.findById(taskId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
-        List<ToolCallEntity> ledger = calls.findAll().stream()
-                .filter(call -> taskId.equals(call.getTaskId()))
-                .toList();
+        List<ToolCallEntity> ledger = calls.findByTaskId(taskId);
         CitationProjection citations = citations(ledger);
         List<String> mcpTools = MCP_TOOL_ORDER.stream()
                 .filter(name -> ledger.stream().anyMatch(call -> name.equals(call.getToolName())))

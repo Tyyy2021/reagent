@@ -51,8 +51,7 @@ public class PythonAcceptanceClient {
     }
 
     public PythonAcceptanceResponse fetch(String taskId) {
-        ToolCallEntity createTicket = toolCalls.findAll().stream()
-                .filter(call -> taskId.equals(call.getTaskId()))
+        ToolCallEntity createTicket = toolCalls.findByTaskId(taskId).stream()
                 .filter(call -> "create_ticket".equals(call.getToolName()))
                 .findFirst()
                 .orElse(null);

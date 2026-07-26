@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -82,12 +83,28 @@ class PythonAcceptanceClientTest {
     }
 
     @Test
+    void missingTicketLookupDoesNotMaterializeUnrelatedTaskLedgers() {
+        ToolCallRepository ledger = mock(ToolCallRepository.class);
+        doThrow(new AssertionError("global tool-call ledger read"))
+                .when(ledger).findAll();
+        when(ledger.findByTaskId("task-scoped-ledger")).thenReturn(List.of());
+
+        PythonAcceptanceClient.PythonAcceptanceResponse actual =
+                client(ledger).fetch("task-scoped-ledger");
+
+        assertEquals(0, actual.createTicketAttempts());
+        assertEquals(0, actual.uniqueTicketCount());
+        assertEquals(List.of(), actual.ticketIds());
+        assertEquals(0, requests.get());
+    }
+
+    @Test
     void persistedCreateTicketCallIdScopesTheStrictPythonResponse() {
         ToolCallRepository ledger = mock(ToolCallRepository.class);
         ToolCallEntity create = new ToolCallEntity(
                 "call-create-ticket-a/b", "task-1", "create_ticket", "{}",
                 Instant.EPOCH);
-        when(ledger.findAll()).thenReturn(List.of(create));
+        when(ledger.findByTaskId("task-1")).thenReturn(List.of(create));
         response.set("""
                 {"contractVersion":1,"scope":"idempotency-key",
                  "toolAttempts":{"query_metrics":0,"search_logs":0,"create_ticket":2},
@@ -107,7 +124,7 @@ class PythonAcceptanceClientTest {
     @Test
     void missingCreateTicketLedgerRowReturnsScopedZeroWithoutHttp() {
         ToolCallRepository ledger = mock(ToolCallRepository.class);
-        when(ledger.findAll()).thenReturn(List.of(
+        when(ledger.findByTaskId("task-2")).thenReturn(List.of(
                 new ToolCallEntity("call-rag", "task-2", "search_knowledge", "{}")));
 
         PythonAcceptanceClient.PythonAcceptanceResponse actual =
@@ -122,7 +139,7 @@ class PythonAcceptanceClientTest {
     @Test
     void unknownFieldsNegativeCountsAndInvalidTicketIdsAreRejected() {
         ToolCallRepository ledger = mock(ToolCallRepository.class);
-        when(ledger.findAll()).thenReturn(List.of(
+        when(ledger.findByTaskId("task-3")).thenReturn(List.of(
                 new ToolCallEntity("call-ticket", "task-3", "create_ticket", "{}")));
         PythonAcceptanceClient client = client(ledger);
 
@@ -207,7 +224,7 @@ class PythonAcceptanceClientTest {
 
     private static ToolCallRepository createTicketLedger(String taskId) {
         ToolCallRepository ledger = mock(ToolCallRepository.class);
-        when(ledger.findAll()).thenReturn(List.of(
+        when(ledger.findByTaskId(taskId)).thenReturn(List.of(
                 new ToolCallEntity("call-ticket", taskId, "create_ticket", "{}")));
         return ledger;
     }
