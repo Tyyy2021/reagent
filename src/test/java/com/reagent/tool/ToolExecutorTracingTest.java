@@ -44,7 +44,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -414,7 +413,7 @@ class ToolExecutorTracingTest {
         ToolProperties toolProperties = new ToolProperties();
         toolProperties.setTimeoutMs(5_000);
         CountDownLatch started = new CountDownLatch(1);
-        AtomicBoolean cancelled = new AtomicBoolean();
+        CountDownLatch cancelled = new CountDownLatch(1);
         McpProperties properties = mcpProperties(
                 Duration.ofMillis(35),
                 Map.of("create_ticket", IdempotencyClass.IDEMPOTENT));
@@ -452,7 +451,7 @@ class ToolExecutorTracingTest {
         assertEquals(
                 ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
                 outcomes.get("call-ticket").kind());
-        assertTrue(cancelled.get());
+        assertTrue(awaitLatch(cancelled));
     }
 
     @Test
@@ -461,7 +460,7 @@ class ToolExecutorTracingTest {
         ToolProperties toolProperties = new ToolProperties();
         toolProperties.setTimeoutMs(5_000);
         CountDownLatch started = new CountDownLatch(1);
-        AtomicBoolean cancelled = new AtomicBoolean();
+        CountDownLatch cancelled = new CountDownLatch(1);
         McpProperties properties = mcpProperties(
                 Duration.ofMillis(35),
                 Map.of("query_metrics", IdempotencyClass.READ_ONLY));
@@ -499,7 +498,7 @@ class ToolExecutorTracingTest {
                 ToolExecutionOutcome.Kind.DEFINITIVE,
                 outcomes.get("call-metrics").kind());
         assertTrue(outcomes.get("call-metrics").content().contains(">35ms"));
-        assertTrue(cancelled.get());
+        assertTrue(awaitLatch(cancelled));
     }
 
     @Test
@@ -508,14 +507,14 @@ class ToolExecutorTracingTest {
         ToolProperties toolProperties = new ToolProperties();
         toolProperties.setTimeoutMs(35);
         CountDownLatch started = new CountDownLatch(1);
-        AtomicBoolean cancelled = new AtomicBoolean();
+        CountDownLatch cancelled = new CountDownLatch(1);
         Tool local = throwingTool("local_slow", () -> {
             started.countDown();
             try {
                 new CountDownLatch(1).await(250, TimeUnit.MILLISECONDS);
                 return "unexpected";
             } catch (InterruptedException ex) {
-                cancelled.set(true);
+                cancelled.countDown();
                 Thread.currentThread().interrupt();
                 return "cancelled";
             }
@@ -544,7 +543,7 @@ class ToolExecutorTracingTest {
                 ToolExecutionOutcome.Kind.DEFINITIVE,
                 outcomes.get("call-local").kind());
         assertTrue(outcomes.get("call-local").content().contains(">35ms"));
-        assertTrue(cancelled.get());
+        assertTrue(awaitLatch(cancelled));
     }
 
     @Test
@@ -554,7 +553,7 @@ class ToolExecutorTracingTest {
         toolProperties.setTimeoutMs(200);
         CountDownLatch localStarted = new CountDownLatch(1);
         CountDownLatch remoteStarted = new CountDownLatch(1);
-        AtomicBoolean remoteCancelled = new AtomicBoolean();
+        CountDownLatch remoteCancelled = new CountDownLatch(1);
         McpProperties properties = mcpProperties(
                 Duration.ofMillis(30),
                 Map.of("create_ticket", IdempotencyClass.IDEMPOTENT));
@@ -609,7 +608,7 @@ class ToolExecutorTracingTest {
         assertEquals(
                 ToolExecutionOutcome.Kind.REMOTE_OUTCOME_UNKNOWN,
                 outcomes.get("call-ticket").kind());
-        assertTrue(remoteCancelled.get());
+        assertTrue(awaitLatch(remoteCancelled));
     }
 
     @Test
@@ -724,7 +723,7 @@ class ToolExecutorTracingTest {
     private static McpGateway blockingGateway(
             List<McpRemoteTool> remoteTools,
             CountDownLatch started,
-            AtomicBoolean cancelled,
+            CountDownLatch cancelled,
             long fallbackMs) {
         return new McpGateway() {
             @Override
@@ -740,7 +739,7 @@ class ToolExecutorTracingTest {
                     new CountDownLatch(1).await(fallbackMs, TimeUnit.MILLISECONDS);
                     return new McpCallResult("unexpected", false);
                 } catch (InterruptedException ex) {
-                    cancelled.set(true);
+                    cancelled.countDown();
                     Thread.currentThread().interrupt();
                     throw new RemoteOutcomeUnknownException(toolName, ex);
                 }
