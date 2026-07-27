@@ -1,52 +1,167 @@
-# ReAgent 依赖一键起:MySQL(持久化/断点续跑)+ Redis(M7 跨 worker 流式)+ Jaeger(M6 全链路 trace)
-#
-# 用法:
-#   docker compose up -d          # 起三件套(首次会拉镜像)
-#   export DEEPSEEK_API_KEY=sk-xxx
-#   mvn spring-boot:run           # 再跑 app(端口默认对齐 application.yml)
-#   docker compose down           # 停;down -v 连数据卷一起删
-#
-# 注意:端口对齐 application.yml 默认值(3306/6379/4318)。若本机已跑着 MySQL/Redis,
-#       先停掉本地实例或改这里的宿主端口,免得冲突。
+x-worker-environment: &worker-environment
+  SPRING_DATASOURCE_URL: >-
+    jdbc:mysql://mysql:3306/reagent?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+  MYSQL_USER: ${REAGENT_DB_USER:-reagent_app}
+  MYSQL_PASSWORD: ${REAGENT_DB_PASSWORD:-reagent-local-only}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REAGENT_STREAMING_TRANSPORT: redis
+  REAGENT_RAG_BASE_URL: http://agent-capabilities:8090
+  REAGENT_MCP_FAKE_OPS_BASE_URL: http://agent-capabilities:8090
+  REAGENT_TRACING_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+  REAGENT_SANDBOX_TYPE: subprocess
+  REAGENT_WORKER_LEASE_TTL_MS: "6000"
+  REAGENT_WORKER_HEARTBEAT_MS: "2000"
+  REAGENT_WORKER_SCAN_MS: "1000"
+  SPRING_PROFILES_ACTIVE: ${REAGENT_DEMO_PROFILES:-}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  TZ: UTC
+
+x-worker-service: &worker-service
+  image: reagent/reagent:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    agent-capabilities:
+      condition: service_healthy
+  volumes:
+    - worker-workspaces:/var/reagent/workspaces
+  networks:
+    - reagent-backend
+  restart: "no"
+  healthcheck:
+    test:
+      - CMD
+      - wget
+      - -q
+      - -O
+      - /dev/null
+      - http://127.0.0.1:8080/actuator/health/readiness
+    interval: 5s
+    timeout: 3s
+    start_period: 30s
+    retries: 24
+
 services:
   mysql:
     image: mysql:8.0
-    container_name: reagent-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: root       # 对齐 application.yml 的 ${MYSQL_PASSWORD:root}
-      MYSQL_DATABASE: reagent         # 自动建库,省去手动 CREATE DATABASE
-      TZ: Asia/Shanghai
-    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
-    ports:
-      - "3306:3306"
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-reagent-root-local-only}
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
     volumes:
-      - reagent-mysql-data:/var/lib/mysql
-    healthcheck:                       # app 等 MySQL ready 再连,避免启动竞态
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      - mysql-data:/var/lib/mysql
+      - ./deploy/mysql/init/001-create-schemas.sql:/docker-entrypoint-initdb.d/001-create-schemas.sql:ro
+    networks:
+      - reagent-backend
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent
       interval: 5s
       timeout: 3s
-      retries: 20
+      start_period: 20s
+      retries: 24
 
   redis:
-    image: redis:7-alpine
-    container_name: reagent-redis
-    ports:
-      - "6379:6379"
+    image: redis:8
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    volumes:
+      - redis-data:/data
+    networks:
+      - reagent-backend
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - CMD
+        - redis-cli
+        - ping
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 24
 
   jaeger:
-    image: jaegertracing/all-in-one:1.60
-    container_name: reagent-jaeger
+    image: jaegertracing/all-in-one:1.62.0
     environment:
-      COLLECTOR_OTLP_ENABLED: "true"   # 开 OTLP 接收(app 的 tracing.otlp-endpoint 指向 4318)
+      COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"                  # Jaeger UI:浏览器开 http://localhost:16686 看 trace
-      - "4318:4318"                    # OTLP/HTTP 收集端点
-    restart: always                    # 踩过 all-in-one 容器莫名 Exited(0),加 restart 兜底
+      - "127.0.0.1:${JAEGER_UI_PORT:-16686}:16686"
+    networks:
+      - reagent-backend
+    restart: unless-stopped
+
+  agent-capabilities:
+    image: reagent/agent-capabilities:local
+    build:
+      context: .
+      dockerfile: services/agent-capabilities/Dockerfile
+    environment:
+      AGENT_CAPABILITIES_ENV: container
+      AGENT_CAPABILITIES_REDIS_URL: redis://redis:6379/0
+      AGENT_CAPABILITIES_MYSQL_URL: >-
+        mysql+pymysql://${FAKE_OPS_DB_USER:-fake_ops_app}:${FAKE_OPS_DB_PASSWORD:-fake-ops-local-only}@mysql:3306/fake_ops
+      AGENT_CAPABILITIES_KNOWLEDGE_ROOT: /app/knowledge
+      AGENT_CAPABILITIES_ACCEPTANCE_ENABLED: ${AGENT_CAPABILITIES_ACCEPTANCE_ENABLED:-false}
+      AGENT_CAPABILITIES_CHAOS_ENABLED: ${AGENT_CAPABILITIES_CHAOS_ENABLED:-false}
+      AGENT_CAPABILITIES_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+      TZ: UTC
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - model-cache:/app/.cache/huggingface
+    networks:
+      - reagent-backend
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8090/internal/readiness',
+          timeout=2).read(1)
+      interval: 10s
+      timeout: 3s
+      start_period: 5m
+      retries: 18
+
+  reagent-worker-a:
+    <<: *worker-service
+    environment:
+      <<: *worker-environment
+      REAGENT_WORKER_ID: worker-a
+    ports:
+      - "127.0.0.1:${REAGENT_HTTP_PORT:-8080}:8080"
+
+  reagent-worker-b:
+    <<: *worker-service
+    profiles:
+      - failover
+    environment:
+      <<: *worker-environment
+      REAGENT_WORKER_ID: worker-b
+
+networks:
+  reagent-backend:
+    name: reagent-demo-backend
 
 volumes:
-  reagent-mysql-data:
+  mysql-data:
+  redis-data:
+  model-cache:
+  worker-workspaces:

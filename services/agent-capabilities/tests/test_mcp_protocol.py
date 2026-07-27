@@ -93,6 +93,59 @@ def test_exact_mcp_initialize_does_not_redirect() -> None:
     anyio.run(exercise)
 
 
+def test_mcp_transport_host_allowlist_includes_compose_service() -> None:
+    async def exercise() -> None:
+        configured = Settings.model_validate(
+            {
+                "env": "test",
+                "acceptance_enabled": False,
+                "chaos_enabled": False,
+                "knowledge_root": Path("/unused"),
+            }
+        )
+        app = create_app(configured)
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "compose-host-regression",
+                    "version": "1.0.0",
+                },
+            },
+        }
+        request_headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": "2025-06-18",
+        }
+
+        async with _serve(app) as server_url:
+            async with httpx.AsyncClient(follow_redirects=False) as client:
+                unknown = await client.post(
+                    server_url,
+                    headers={**request_headers, "Host": "untrusted.invalid:8090"},
+                    json=payload,
+                )
+                compose = await client.post(
+                    server_url,
+                    headers={
+                        **request_headers,
+                        "Host": "agent-capabilities:8090",
+                    },
+                    json=payload,
+                )
+
+        assert unknown.status_code == 421
+        assert compose.status_code < 300
+        assert compose.json()["result"]["protocolVersion"] == "2025-06-18"
+
+    anyio.run(exercise)
+
+
 @pytest.fixture(scope="module")
 def mysql_url() -> Generator[str]:
     with MySqlContainer(

@@ -5,6 +5,7 @@ import hashlib
 from anyio.to_thread import run_sync as run_sync_in_worker
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.tools.tool_manager import ToolManager
+from mcp.server.transport_security import TransportSecuritySettings
 
 from agent_capabilities.fake_ops.acceptance import AcceptanceTracker
 from agent_capabilities.fake_ops.faults import TicketFaultGate
@@ -34,6 +35,20 @@ def create_mcp(
         stateless_http=True,
         json_response=True,
         streamable_http_path="/mcp",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "127.0.0.1:*",
+                "localhost:*",
+                "[::1]:*",
+                "agent-capabilities:8090",
+            ],
+            allowed_origins=[
+                "http://127.0.0.1:*",
+                "http://localhost:*",
+                "http://[::1]:*",
+            ],
+        ),
     )
 
     @mcp.tool()
