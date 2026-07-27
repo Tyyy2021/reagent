@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * 工具注册表。
@@ -15,11 +16,19 @@ import java.util.Map;
 @Component
 public class ToolRegistry {
 
+    private static final Pattern LEGAL_NAME = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+
     private final Map<String, Tool> tools = new LinkedHashMap<>();
 
     public ToolRegistry(List<Tool> toolBeans) {
         for (Tool t : toolBeans) {
-            tools.put(t.name(), t);
+            String name = t.name();
+            if (name == null || !LEGAL_NAME.matcher(name).matches()) {
+                throw new IllegalArgumentException("Illegal tool name: " + name);
+            }
+            if (tools.putIfAbsent(name, t) != null) {
+                throw new IllegalArgumentException("Duplicate tool name: " + name);
+            }
         }
     }
 

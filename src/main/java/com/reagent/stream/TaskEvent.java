@@ -27,20 +27,29 @@ public record TaskEvent(String taskId, String eventId, Type type, Object data, I
         TOKEN,          // 模型回答的一个文本增量(Stage2 token 级流式;live-only,不落库)
         TOOL_CALL,      // 要调某工具
         TOOL_RESULT,    // 某工具返回
+        KNOWLEDGE_RETRIEVED, // RAG citations retrieved; event data is metadata-only
+        APPROVAL_REQUIRED, // durable task state is WAITING_APPROVAL; this event ends the current run
         COMPLETED,      // 任务完成(终态)
         FAILED,         // 任务失败(终态)
         CANCELLED,      // 用户取消(终态)
         PAUSED          // 用户暂停(非任务终态,但本次 run 的事件流到此为止)
     }
 
-    /** live 事件工厂(补当前时刻):持久事件传游标 id,TOKEN 传 {@code null}。 */
-    public static TaskEvent of(String taskId, String eventId, Type type, Object data) {
-        return new TaskEvent(taskId, eventId, type, data, Instant.now());
+    /** live 事件工厂:持久事件传游标 id,TOKEN 传 {@code null};时间由统一 UTC Clock 显式提供。 */
+    public static TaskEvent of(String taskId, String eventId, Type type, Object data, Instant at) {
+        return new TaskEvent(taskId, eventId, type, data, at);
     }
 
     /** 本次 run 的收尾事件:之后该 run 不再有新事件,SSE 端据此收尾。注意 PAUSED 非任务终态(可 resume),但对"本次 SSE 流"而言已结束。 */
     public boolean isTerminal() {
-        return type == Type.COMPLETED || type == Type.FAILED
-                || type == Type.CANCELLED || type == Type.PAUSED;
+        return isTaskTerminal() || type == Type.PAUSED
+                || type == Type.APPROVAL_REQUIRED;
+    }
+
+    /** 不可恢复的任务终态；与只结束当前 SSE run 的 PAUSED/APPROVAL_REQUIRED 明确分开。 */
+    public boolean isTaskTerminal() {
+        return type == Type.COMPLETED
+                || type == Type.FAILED
+                || type == Type.CANCELLED;
     }
 }

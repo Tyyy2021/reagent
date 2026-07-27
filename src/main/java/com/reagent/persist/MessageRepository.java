@@ -1,6 +1,8 @@
 package com.reagent.persist;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.util.List;
 
@@ -13,6 +15,14 @@ public interface MessageRepository extends JpaRepository<MessageEntity, Long> {
      */
     List<MessageEntity> findByTaskIdOrderByIdAsc(String taskId);
 
-    /** 仅用于生成人类可读的 seq 序号(非排序依据);seq 唯一性另由 (task_id, seq) 唯一约束兜底 */
-    int countByTaskId(String taskId);
+    /** 必须在持有对应 task 行锁时调用,生成稠密且唯一的任务内序号。 */
+    @Query("select coalesce(max(m.seq), -1) + 1 from MessageEntity m where m.taskId = :taskId")
+    int nextSequenceForLockedTask(@Param("taskId") String taskId);
+
+    boolean existsByTaskIdAndRoleAndToolCallId(
+            String taskId,
+            String role,
+            String toolCallId);
+
+    long countByTaskId(String taskId);
 }

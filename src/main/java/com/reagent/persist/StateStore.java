@@ -2,19 +2,35 @@ package com.reagent.persist;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.approval.ApprovalRequestEntity;
+import com.reagent.approval.ApprovalRequestRepository;
+import com.reagent.approval.ApprovalStatus;
 import com.reagent.core.Context;
+import com.reagent.core.FencedExecutionException;
+import com.reagent.core.TaskRunToken;
 import com.reagent.core.ToolCall;
 import com.reagent.core.WorkerIdentity;
+import com.reagent.profile.AgentProfileRegistry;
+import com.reagent.profile.TaskProfileSnapshot;
+import com.reagent.profile.TaskToolCatalog;
+import com.reagent.profile.ToolSnapshot;
+import com.reagent.tool.ApprovalPolicy;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * ★ M2 的核心:状态存储层。把内存里的 agent 运行状态"投影"到数据库,并能反向重建。
@@ -31,23 +47,57 @@ import java.util.Map;
 @Service
 public class StateStore {
 
+    private static final String TOOL_CALL_ID_ALREADY_EXISTS =
+            "Tool call id already exists";
+    private static final String TOOL_CALL_OWNERSHIP_MISMATCH =
+            "Tool call id belongs to another task";
+    private static final String TOOL_CALL_IDENTITY_MISMATCH =
+            "Tool call identity does not match ledger";
+
     private final TaskRepository taskRepo;
     private final MessageRepository messageRepo;
     private final ToolCallRepository toolCallRepo;
     private final ObjectMapper mapper;
+    private final AgentProfileRegistry profileRegistry;
     private final WorkerIdentity worker;        // M7:本 worker 身份(claim 的 owner)
     private final long leaseTtlMs;              // M7:租约时长
+    private final Clock clock;
+    private final TaskLeaseGuard leaseGuard;
+    private final ApprovalRequestRepository approvalRepo;
+
+    @Value("${reagent.profiles.max-snapshot-bytes:262144}")
+    private int maxProfileSnapshotBytes = 262_144;
 
     public StateStore(TaskRepository taskRepo, MessageRepository messageRepo,
                       ToolCallRepository toolCallRepo, ObjectMapper mapper,
+                      AgentProfileRegistry profileRegistry,
                       WorkerIdentity worker,
-                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs) {
+                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs,
+                      Clock clock,
+                      TaskLeaseGuard leaseGuard) {
+        this(taskRepo, messageRepo, toolCallRepo, mapper, profileRegistry, worker,
+                leaseTtlMs, clock, leaseGuard, null);
+    }
+
+    @Autowired
+    public StateStore(TaskRepository taskRepo, MessageRepository messageRepo,
+                      ToolCallRepository toolCallRepo, ObjectMapper mapper,
+                      AgentProfileRegistry profileRegistry,
+                      WorkerIdentity worker,
+                      @Value("${reagent.worker.lease-ttl-ms:30000}") long leaseTtlMs,
+                      Clock clock,
+                      TaskLeaseGuard leaseGuard,
+                      ApprovalRequestRepository approvalRepo) {
         this.taskRepo = taskRepo;
         this.messageRepo = messageRepo;
         this.toolCallRepo = toolCallRepo;
         this.mapper = mapper;
+        this.profileRegistry = profileRegistry;
         this.worker = worker;
         this.leaseTtlMs = leaseTtlMs;
+        this.clock = clock;
+        this.leaseGuard = leaseGuard;
+        this.approvalRepo = approvalRepo;
     }
 
     // ===================== 任务生命周期 =====================
@@ -57,17 +107,91 @@ public class StateStore {
     public TaskEntity createTask(String goal, String systemPrompt) {
         // M7:新任务出生即认领租约(owner=本 worker),避免出现"无主 RUNNING"空窗 —— 否则创建者若在
         // createTask 与首次 drive 之间崩了,该任务会成 owner=null/lease=null 的孤儿,失效扫描(只盯过期租约)永远漏掉。
-        TaskEntity t = TaskEntity.newTask(goal);
-        t.assignLease(worker.id(), Instant.now().plusMillis(leaseTtlMs));
+        Instant now = clock.instant();
+        TaskEntity t = TaskEntity.newTask(goal, now);
+        t.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
         TaskEntity task = taskRepo.save(t);
-        appendMessage(task.getId(), "system", systemPrompt, null, null);
-        appendMessage(task.getId(), "user", goal, null, null);
+        appendMessage(task.getId(), "system", systemPrompt, null, null, now);
+        appendMessage(task.getId(), "user", goal, null, null, now);
         return task;
+    }
+
+    @Transactional
+    public TaskEntity createTask(String goal, TaskProfileSnapshot snapshot) {
+        String snapshotJson = serializeProfile(snapshot);
+        Instant now = clock.instant();
+        TaskEntity task = TaskEntity.newTask(goal, now);
+        task.freezeProfile(snapshot.profileId(), snapshotJson);
+        task.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
+        TaskEntity saved = taskRepo.save(task);
+        appendMessage(saved.getId(), "system", snapshot.systemPrompt(), null, null, now);
+        appendMessage(saved.getId(), "user", goal, null, null, now);
+        return saved;
+    }
+
+    /**
+     * Creates the final task UUID before resolving its frozen profile.
+     *
+     * <p>The factory runs inside this transaction but before any task or
+     * message write, so profile-resolution failure remains externally
+     * side-effect free.</p>
+     */
+    @Transactional
+    public TaskEntity createTask(
+            String goal,
+            Function<String, TaskProfileSnapshot> snapshotFactory
+    ) {
+        Instant now = clock.instant();
+        TaskEntity task = TaskEntity.newTask(goal, now);
+        TaskProfileSnapshot snapshot = Objects.requireNonNull(
+                Objects.requireNonNull(snapshotFactory, "snapshotFactory")
+                        .apply(task.getId()),
+                "snapshotFactory result");
+        String snapshotJson = serializeProfile(snapshot);
+        task.freezeProfile(snapshot.profileId(), snapshotJson);
+        task.assignLease(worker.id(), now.plusMillis(leaseTtlMs), now);
+        TaskEntity saved = taskRepo.save(task);
+        appendMessage(saved.getId(), "system", snapshot.systemPrompt(), null, null, now);
+        appendMessage(saved.getId(), "user", goal, null, null, now);
+        return saved;
+    }
+
+    @Transactional(readOnly = true)
+    public TaskProfileSnapshot loadProfile(String taskId) {
+        TaskEntity task = taskRepo.findById(taskId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+        if (task.getProfileSnapshot() == null) {
+            throw new IllegalStateException(
+                    "Legacy task profile materialization requires a claimed task run token: " + taskId);
+        }
+        return deserializeAndValidateProfile(task);
+    }
+
+    @Transactional
+    public TaskProfileSnapshot loadProfile(TaskRunToken token) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        if (task.getProfileSnapshot() == null) {
+            if (task.getProfileId() != null && !"coding".equals(task.getProfileId())) {
+                throw new IllegalStateException("Legacy task has unsupported profile: " + task.getProfileId());
+            }
+            TaskProfileSnapshot coding = profileRegistry.snapshot("coding");
+            task.freezeProfile(coding.profileId(), serializeProfile(coding));
+            taskRepo.save(task);
+        }
+        return deserializeAndValidateProfile(task);
+    }
+
+    private TaskProfileSnapshot deserializeAndValidateProfile(TaskEntity task) {
+        TaskProfileSnapshot snapshot = deserializeProfile(task.getProfileSnapshot());
+        if (!snapshot.profileId().equals(task.getProfileId())) {
+            throw new IllegalStateException("Task profile ID does not match persisted snapshot: " + task.getId());
+        }
+        return snapshot;
     }
 
     public TaskEntity getTask(String taskId) {
         return taskRepo.findById(taskId)
-                .orElseThrow(() -> new IllegalArgumentException("找不到任务: " + taskId));
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
     }
 
     /** 崩溃恢复扫描:所有仍处于 RUNNING 的任务 */
@@ -79,17 +203,17 @@ public class StateStore {
      * ★ M7 Stage1:抢占任务执行租约(原子 claim 的薄封装)。委托 {@link TaskRepository#claim} 做
      * 单条条件 UPDATE,owner=本 worker、续租 {@code leaseTtlMs}。
      *
-     * @return true = 本 worker 抢到执行权(可驱动);false = 别人持活租约,应跳过本次驱动。
+     * @return 本 worker 抢到执行权时返回完整 run token；别人持活租约时返回 empty。
      */
     @Transactional
-    public long claim(String taskId) {
-        Instant now = Instant.now();
+    public Optional<TaskRunToken> claim(String taskId) {
+        Instant now = clock.instant();
         int rows = taskRepo.claim(taskId, worker.id(), now, now.plusMillis(leaseTtlMs));
         if (rows != 1) {
-            return -1L;   // 没抢到:别人持活租约
+            return Optional.empty();
         }
-        // 抢到了:回读本次获得的 epoch 当 fencing token(同事务;claim 已 clearAutomatically,findById 取 DB 最新值)
-        return taskRepo.findById(taskId).map(TaskEntity::getLeaseEpoch).orElse(-1L);
+        return taskRepo.findById(taskId)
+                .map(task -> new TaskRunToken(taskId, worker.id(), task.getLeaseEpoch()));
     }
 
     /**
@@ -97,13 +221,14 @@ public class StateStore {
      * @return true = 续上了(仍归我);false = 这任务已不归我(被接管 / 已释放),调用方据此自停(Stage3)。
      */
     @Transactional
-    public boolean renew(String taskId, long epoch) {
-        return taskRepo.renew(taskId, worker.id(), epoch, Instant.now().plusMillis(leaseTtlMs)) == 1;
+    public boolean renew(TaskRunToken token) {
+        return taskRepo.renew(token.taskId(), token.workerId(), token.leaseEpoch(),
+                clock.instant().plusMillis(leaseTtlMs)) == 1;
     }
 
     /** ★ M7 Stage2:失效扫描 —— 取最多 {@code limit} 个 RUNNING 且租约已过期的孤儿任务(供失败转移接管)。 */
-    public List<TaskEntity> findExpired(int limit) {
-        return taskRepo.findByStatusAndLeaseExpiresAtLessThan(TaskStatus.RUNNING, Instant.now(), Limit.of(limit));
+    public List<TaskEntity> findRecoverable(int limit) {
+        return taskRepo.findRecoverable(clock.instant(), Limit.of(limit));
     }
 
     // ===================== M7 Stage4:跨 worker 控制面 =====================
@@ -122,56 +247,155 @@ public class StateStore {
 
     /** ★ M7 Stage4:owner 消费信号后清回 NONE。 */
     @Transactional
-    public void clearControlSignal(String taskId) {
-        taskRepo.clearControlSignal(taskId);
+    public void clearControlSignal(TaskRunToken token) {
+        leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        taskRepo.clearControlSignal(token.taskId());
     }
 
     /**
-     * 完成任务(终态),带 M7 Stage3 epoch 守卫:仅当本 worker 仍持有该 epoch 的租约才写得进(顺带释放租约)。
-     * @return true=写成功;false=租约已被接管(fence)→ 调用方放弃,绝不覆盖接管者成果。
+     * 完成任务(终态),带 M7 Stage3 token 守卫:仅当本 worker 仍持有该 epoch 的租约才写得进(顺带释放租约)。
+     * 租约已被接管时抛 {@code FencedExecutionException}，调用方必须停手。
      */
     @Transactional
-    public boolean completeTask(String taskId, String answer, long epoch) {
-        return taskRepo.completeIfOwner(taskId, worker.id(), epoch, answer, Instant.now()) == 1;
+    public void completeTask(TaskRunToken token, String answer) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.complete(answer, clock.instant());
+        taskRepo.save(task);
     }
 
     /** 失败置终态,带 epoch 守卫(语义同 {@link #completeTask})。 */
     @Transactional
-    public boolean failTask(String taskId, String error, long epoch) {
-        return taskRepo.failIfOwner(taskId, worker.id(), epoch, error, Instant.now()) == 1;
+    public void failTask(TaskRunToken token, String error) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.fail(error, clock.instant());
+        taskRepo.save(task);
     }
 
     /** M4:用户取消(终态)。 */
     @Transactional
-    public void cancelTask(String taskId, String note) {
-        TaskEntity t = getTask(taskId);
-        t.cancel(note);
-        taskRepo.save(t);
+    public void cancelTask(TaskRunToken token, String note) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.cancel(note, clock.instant());
+        task.clearControlSignal();
+        taskRepo.save(task);
     }
 
     /** M4:用户暂停(非终态,仅显式 resume 续跑)。 */
     @Transactional
-    public void pauseTask(String taskId) {
-        TaskEntity t = getTask(taskId);
-        t.pause();
-        taskRepo.save(t);
+    public void pauseTask(TaskRunToken token) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        task.pause(clock.instant());
+        task.clearControlSignal();
+        taskRepo.save(task);
     }
 
     /** M4:PAUSED -> RUNNING(resume 续跑前)。 */
     @Transactional
     public void markRunning(String taskId) {
         TaskEntity t = getTask(taskId);
-        t.markRunning();
+        t.markRunning(clock.instant());
         taskRepo.save(t);
     }
 
     /** 崩溃恢复:把该任务的恢复计数 +1 并持久化,返回新的计数值(这是第几次恢复)。 */
     @Transactional
-    public int incrementRecoveryCount(String taskId) {
-        TaskEntity t = getTask(taskId);
-        int n = t.incrementRecovery();
-        taskRepo.save(t);
+    public int incrementRecoveryCount(TaskRunToken token) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        int n = task.incrementRecovery(clock.instant());
+        taskRepo.save(task);
         return n;
+    }
+
+    /** 运行期恢复止损判定读取;先锁定并校验本次 run token，旧 worker 不得据此继续做控制决策。 */
+    @Transactional
+    public int recoveryCount(TaskRunToken token) {
+        return leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING)).getRecoveryCount();
+    }
+
+    /**
+     * Materializes approval rows from the validated durable ledger and frozen catalog before
+     * any call in the assistant batch can become IN_PROGRESS.
+     *
+     * @return true when at least one approval remains pending and this run must stop.
+     */
+    @Transactional
+    public boolean prepareApprovalBarrier(
+            TaskRunToken token,
+            TaskToolCatalog catalog,
+            List<ToolCall> calls
+    ) {
+        if (catalog == null) {
+            return false;
+        }
+        boolean approvalRequired = calls.stream()
+                .map(call -> catalog.snapshot(call.name()))
+                .anyMatch(snapshot -> snapshot != null
+                        && snapshot.approvalPolicy()
+                        == ApprovalPolicy.REQUIRE_APPROVAL);
+        if (!approvalRequired) {
+            return false;
+        }
+        if (approvalRepo == null) {
+            throw new IllegalStateException("Approval repository is unavailable");
+        }
+        TaskEntity task = taskRepo.findByIdForUpdate(token.taskId())
+                .orElseThrow(() -> new FencedExecutionException(
+                        token, null, -1, null));
+        boolean alreadyWaiting = task.getStatus() == TaskStatus.WAITING_APPROVAL
+                && task.getOwnerId() == null
+                && task.getLeaseEpoch() == token.leaseEpoch();
+        String durableTaskId = task.getId();
+        if (!alreadyWaiting) {
+            task = leaseGuard.lockOwned(
+                    token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        }
+        boolean pending = false;
+        Instant now = clock.instant();
+        for (ToolCall call : calls) {
+            ToolSnapshot snapshot = catalog.snapshot(call.name());
+            if (snapshot == null
+                    || snapshot.approvalPolicy() != ApprovalPolicy.REQUIRE_APPROVAL) {
+                continue;
+            }
+            ToolCallEntity ledger = matchingOwnedToolCall(durableTaskId, call)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "Approval requires a validated persisted tool call"));
+            if (ledger.getAssistantMessageSeq() == null) {
+                throw new IllegalStateException(
+                        "Approval requires an assistant message sequence");
+            }
+            ApprovalRequestEntity approval = approvalRepo.findById(call.id())
+                    .orElseGet(() -> approvalRepo.save(ApprovalRequestEntity.pending(
+                            ledger.getId(),
+                            durableTaskId,
+                            ledger.getAssistantMessageSeq(),
+                            snapshot.name(),
+                            ledger.getArguments(),
+                            now)));
+            if (!durableTaskId.equals(approval.getTaskId())
+                    || !snapshot.name().equals(approval.getToolName())
+                    || !ledger.getArguments().equals(approval.getArgumentsSnapshot())
+                    || ledger.getAssistantMessageSeq() != approval.getAssistantMessageSeq()) {
+                throw new IllegalStateException(
+                        "Approval request identity does not match persisted batch");
+            }
+            pending |= approval.getStatus() == ApprovalStatus.PENDING;
+        }
+        if (pending && !alreadyWaiting) {
+            approvalRepo.flush();
+            waitForApproval(token);
+        }
+        return pending;
+    }
+
+    /** Atomically moves the token-owned task to its durable wait state and releases its lease. */
+    @Transactional
+    public void waitForApproval(TaskRunToken token) {
+        leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        if (taskRepo.waitForApproval(
+                token.taskId(), token.workerId(), token.leaseEpoch(), clock.instant()) != 1) {
+            throw new FencedExecutionException(token, null, token.leaseEpoch(), null);
+        }
     }
 
     // ===================== 落库:每步 =====================
@@ -181,26 +405,40 @@ public class StateStore {
      * content 可能为 null(模型只调工具、不带文本时)。
      */
     @Transactional
-    public void appendAssistant(String taskId, Map<String, Object> assistantMessage) {
+    public int appendAssistant(TaskRunToken token, Map<String, Object> assistantMessage) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
         String content = asStringOrNull(assistantMessage.get("content"));
-        Object toolCalls = assistantMessage.get("tool_calls");
-        String toolCallsJson = toolCalls == null ? null : toJson(toolCalls);
-
-        appendMessage(taskId, "assistant", content, toolCallsJson, null);
-
-        if (toolCalls instanceof List<?> list) {
-            for (Object o : list) {
-                if (!(o instanceof Map<?, ?> tc)) continue;
-                String id = String.valueOf(tc.get("id"));
-                Map<?, ?> fn = (Map<?, ?>) tc.get("function");
-                String name = String.valueOf(fn.get("name"));
-                String args = asArguments(fn.get("arguments"));
-                // 同一 id 不重复登记(恢复路径里 assistant 不会被重复落库,这里仅作防御)
-                if (!toolCallRepo.existsById(id)) {
-                    toolCallRepo.save(new ToolCallEntity(id, taskId, name, args));
-                }
+        Object rawToolCalls = assistantMessage.get("tool_calls");
+        List<ToolCall> parsedCalls = rawToolCalls == null
+                ? List.of()
+                : ToolCall.parseAssistantToolCalls(rawToolCalls);
+        for (ToolCall call : parsedCalls) {
+            if (toolCallRepo.findById(call.id()).isPresent()) {
+                throw new IllegalStateException(
+                        TOOL_CALL_ID_ALREADY_EXISTS);
             }
         }
+        String toolCallsJson = rawToolCalls == null ? null : toJson(rawToolCalls);
+
+        int sequence = appendMessage(
+                task.getId(),
+                "assistant",
+                content,
+                toolCallsJson,
+                null,
+                now);
+        List<ToolCallEntity> ledgerRows = parsedCalls.stream()
+                .map(call -> new ToolCallEntity(
+                        call.id(),
+                        task.getId(),
+                        call.name(),
+                        call.arguments(),
+                        now,
+                        sequence))
+                .toList();
+        toolCallRepo.saveAll(ledgerRows);
+        return sequence;
     }
 
     /**
@@ -209,10 +447,13 @@ public class StateStore {
      * attemptCount 也在此 +1,供 per-tool 重试上限止损。
      */
     @Transactional
-    public void markInProgress(String taskId, ToolCall call) {
-        ToolCallEntity e = toolCallRepo.findById(call.id())
-                .orElseGet(() -> new ToolCallEntity(call.id(), taskId, call.name(), call.arguments()));
-        e.markInProgress();
+    public void markInProgress(TaskRunToken token, ToolCall call) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
+        ToolCallEntity e = matchingOwnedToolCall(task.getId(), call)
+                .orElseGet(() -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(), now));
+        e.markInProgress(now);
         toolCallRepo.save(e);
     }
 
@@ -221,12 +462,52 @@ public class StateStore {
      * 二者在同一事务里,尽量缩小"账本与消息不一致"的窗口。
      */
     @Transactional
-    public void recordToolResult(String taskId, ToolCall call, String result) {
-        ToolCallEntity e = toolCallRepo.findById(call.id())
-                .orElseGet(() -> new ToolCallEntity(call.id(), taskId, call.name(), call.arguments()));
-        e.markDone(result);
+    public void recordToolResult(TaskRunToken token, ToolCall call, String result) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
+        ToolCallEntity e = matchingOwnedToolCall(task.getId(), call)
+                .orElseGet(() -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(), now));
+        e.markDone(result, now);
         toolCallRepo.save(e);
-        appendMessage(taskId, "tool", result, null, call.id());
+        appendMessage(task.getId(), "tool", result, null, call.id(), now);
+    }
+
+    /**
+     * Materializes a durable REJECTED ledger result into the conversation only when its
+     * ordered coordinator pass reaches this call. The task row lock and message lookup make
+     * crash replay idempotent without letting approval-decision order reorder tool messages.
+     *
+     * @return the result when this call appended its missing message; empty when already present
+     */
+    @Transactional
+    public Optional<String> materializeRejectedToolResult(
+            TaskRunToken token,
+            ToolCall call
+    ) {
+        TaskEntity task =
+                leaseGuard.lockOwned(
+                        token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        ToolCallEntity ledger = matchingOwnedToolCall(task.getId(), call)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Rejected tool call is missing from the durable ledger"));
+        if (ledger.getStatus() != ToolCallStatus.REJECTED
+                || ledger.getResult() == null) {
+            throw new IllegalStateException(
+                    "Rejected tool call has no durable synthetic result");
+        }
+        if (messageRepo.existsByTaskIdAndRoleAndToolCallId(
+                task.getId(), "tool", call.id())) {
+            return Optional.empty();
+        }
+        appendMessage(
+                task.getId(),
+                "tool",
+                ledger.getResult(),
+                null,
+                call.id(),
+                clock.instant());
+        return Optional.of(ledger.getResult());
     }
 
     /**
@@ -234,19 +515,29 @@ public class StateStore {
      * (把"未知"作为观察回给模型,既满足"每个 tool_call 必有结果"的协议,又绝不替它重放副作用)。
      */
     @Transactional
-    public void markInDoubt(String taskId, ToolCall call, String result) {
-        ToolCallEntity e = toolCallRepo.findById(call.id())
-                .orElseGet(() -> new ToolCallEntity(call.id(), taskId, call.name(), call.arguments()));
-        e.markInDoubt(result);
+    public void markInDoubt(TaskRunToken token, ToolCall call, String result) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        Instant now = clock.instant();
+        ToolCallEntity e = matchingOwnedToolCall(task.getId(), call)
+                .orElseGet(() -> new ToolCallEntity(
+                        call.id(), task.getId(), call.name(), call.arguments(), now));
+        e.markInDoubt(result, now);
         toolCallRepo.save(e);
-        appendMessage(taskId, "tool", result, null, call.id());
+        appendMessage(task.getId(), "tool", result, null, call.id(), now);
     }
 
-    /** 账本当前状态(用于恢复决策表);账本里没有这条 = 从没登记过 → 当 PENDING(安全重跑)处理。 */
-    public ToolCallStatus statusOf(String toolCallId) {
-        return toolCallRepo.findById(toolCallId)
+    /** 任务内账本当前状态;本任务没有这条(含其它任务占用同 ID)=从没登记过 → 当 PENDING 处理。 */
+    public ToolCallStatus statusOf(String taskId, String toolCallId) {
+        return toolCallRepo.findByIdAndTaskId(toolCallId, taskId)
                 .map(ToolCallEntity::getStatus)
                 .orElse(ToolCallStatus.PENDING);
+    }
+
+    /** 运行期工具分类读取;先锁定并校验本次 run token，再按任务边界查询账本。 */
+    @Transactional
+    public ToolCallStatus statusOf(TaskRunToken token, String toolCallId) {
+        TaskEntity task = leaseGuard.lockOwned(token, java.util.EnumSet.of(TaskStatus.RUNNING));
+        return statusOf(task.getId(), toolCallId);
     }
 
     // ===================== 重建上下文 =====================
@@ -278,19 +569,41 @@ public class StateStore {
 
     // ===================== 内部小工具 =====================
 
-    private void appendMessage(String taskId, String role, String content,
-                               String toolCallsJson, String toolCallId) {
-        int seq = messageRepo.countByTaskId(taskId);
-        messageRepo.save(new MessageEntity(taskId, seq, role, content, toolCallsJson, toolCallId));
+    /** 返回本任务账本行；同 ID 已属于其它任务时在调用方修改任何实体前 fail closed。 */
+    private Optional<ToolCallEntity> ownedToolCall(String taskId, String toolCallId) {
+        Optional<ToolCallEntity> existing = toolCallRepo.findById(toolCallId);
+        if (existing.isPresent() && !taskId.equals(existing.orElseThrow().getTaskId())) {
+            throw new IllegalStateException(
+                    TOOL_CALL_OWNERSHIP_MISMATCH);
+        }
+        return existing;
+    }
+
+    private Optional<ToolCallEntity> matchingOwnedToolCall(
+            String taskId, ToolCall call) {
+        Optional<ToolCallEntity> existing =
+                ownedToolCall(taskId, call.id());
+        if (existing.isPresent()) {
+            ToolCallEntity row = existing.orElseThrow();
+            if (!call.name().equals(row.getToolName())
+                    || !call.arguments().equals(row.getArguments())) {
+                throw new IllegalStateException(
+                        TOOL_CALL_IDENTITY_MISMATCH);
+            }
+        }
+        return existing;
+    }
+
+    private int appendMessage(String taskId, String role, String content,
+                              String toolCallsJson, String toolCallId, Instant now) {
+        int seq = messageRepo.nextSequenceForLockedTask(taskId);
+        messageRepo.save(new MessageEntity(
+                taskId, seq, role, content, toolCallsJson, toolCallId, now));
+        return seq;
     }
 
     private static String asStringOrNull(Object o) {
         return o == null ? null : String.valueOf(o);
-    }
-
-    /** arguments 在 OpenAI/DeepSeek 协议里是字符串;Ollama 可能给对象,统一转成字符串 */
-    private String asArguments(Object arguments) {
-        return arguments instanceof String s ? s : toJson(arguments);
     }
 
     private String toJson(Object o) {
@@ -298,6 +611,29 @@ public class StateStore {
             return mapper.writeValueAsString(o);
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("序列化失败: " + o, ex);
+        }
+    }
+
+    private String serializeProfile(TaskProfileSnapshot snapshot) {
+        String json = toJson(snapshot);
+        int bytes = json.getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > maxProfileSnapshotBytes) {
+            throw new IllegalArgumentException(
+                    "Task profile snapshot exceeds " + maxProfileSnapshotBytes + " bytes: " + bytes);
+        }
+        return json;
+    }
+
+    private TaskProfileSnapshot deserializeProfile(String json) {
+        int bytes = json.getBytes(StandardCharsets.UTF_8).length;
+        if (bytes > maxProfileSnapshotBytes) {
+            throw new IllegalStateException(
+                    "Persisted task profile snapshot exceeds " + maxProfileSnapshotBytes + " bytes: " + bytes);
+        }
+        try {
+            return mapper.readValue(json, TaskProfileSnapshot.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("Cannot deserialize task profile snapshot", ex);
         }
     }
 

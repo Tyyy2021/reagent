@@ -13,6 +13,7 @@ package com.reagent.persist;
  */
 public enum TaskStatus {
     RUNNING,
+    WAITING_APPROVAL,
     COMPLETED,
     FAILED,
     CANCELLED,

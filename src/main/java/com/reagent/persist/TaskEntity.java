@@ -28,6 +28,12 @@ public class TaskEntity {
     @Column(length = 1_000_000)
     private String goal;
 
+    @Column(length = 64)
+    private String profileId;
+
+    @Column(length = 1_000_000)
+    private String profileSnapshot;
+
     // 显式 length=32 让 Hibernate 生成 varchar(32) 而非 MySQL 原生 enum——否则 EnumType.STRING 在 MySQL 上
     // 会建成 enum('RUNNING','COMPLETED','FAILED'),后加 CANCELLED/PAUSED 写入即报 "Data truncated",
     // 且 ddl-auto=update 不改已存在列(与 tool_call.status 同源的坑)。运行库已 ALTER ... MODIFY status VARCHAR(32)。
@@ -59,7 +65,7 @@ public class TaskEntity {
      * ★ M7:租约到期时刻。owner 持租期间独占驱动;过期未续租 = 疑似已死,可被其它 worker claim 接管。
      *
      * <p>用 {@code TIMESTAMP_UTC} 强制按 UTC 读写:让租约时间的存取与各 worker 的 {@code serverTimezone}
-     * 配置【解耦】—— 无论部署在哪个时区,claim / renew / findExpired 都在同一 UTC 基准上比较,杜绝"跨时区
+     * 配置【解耦】—— 无论部署在哪个时区,claim / renew / findRecoverable 都在同一 UTC 基准上比较,杜绝"跨时区
      * worker 把没过期的当过期、或把过期的当没过期"的错位。(普通 datetime 依赖连接时区,曾导致失效扫描漏判。)</p>
      */
     @JdbcTypeCode(SqlTypes.TIMESTAMP_UTC)
@@ -83,21 +89,26 @@ public class TaskEntity {
     protected TaskEntity() {
     }
 
-    public static TaskEntity newTask(String goal) {
+    public static TaskEntity newTask(String goal, Instant now) {
         TaskEntity t = new TaskEntity();
         t.id = UUID.randomUUID().toString();
         t.goal = goal;
         t.status = TaskStatus.RUNNING;
-        t.createdAt = Instant.now();
+        t.createdAt = now;
         t.updatedAt = t.createdAt;
         return t;
     }
 
+    void freezeProfile(String profileId, String profileSnapshot) {
+        this.profileId = profileId;
+        this.profileSnapshot = profileSnapshot;
+    }
+
     /** ★ M7:认领租约 —— 新任务出生即归本 worker(owner 一并落库,杜绝"无主 RUNNING"空窗被漏扫)。 */
-    public void assignLease(String workerId, Instant expiresAt) {
+    public void assignLease(String workerId, Instant expiresAt, Instant now) {
         this.ownerId = workerId;
         this.leaseExpiresAt = expiresAt;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
     }
 
     /** ★ M7:释放租约 —— 进入终态 / 暂停时清空 owner,让任何 worker 可立即接手,也不留陈旧 owner。 */
@@ -106,50 +117,57 @@ public class TaskEntity {
         this.leaseExpiresAt = null;
     }
 
-    public void complete(String answer) {
+    /** Owner consumes a persisted control request as part of the guarded state transition. */
+    public void clearControlSignal() {
+        this.controlSignal = "NONE";
+    }
+
+    public void complete(String answer, Instant now) {
         this.status = TaskStatus.COMPLETED;
         this.result = answer;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
         releaseLease();
     }
 
-    public void fail(String error) {
+    public void fail(String error, Instant now) {
         this.status = TaskStatus.FAILED;
         this.result = error;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
         releaseLease();
     }
 
     /** M4:用户取消(终态)。 */
-    public void cancel(String note) {
+    public void cancel(String note, Instant now) {
         this.status = TaskStatus.CANCELLED;
         this.result = note;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
         releaseLease();
     }
 
     /** M4:用户暂停(非终态;result 不动,留待 resume 后真正完成时再写)。 */
-    public void pause() {
+    public void pause(Instant now) {
         this.status = TaskStatus.PAUSED;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
         releaseLease();
     }
 
     /** M4:PAUSED -> RUNNING(resume 续跑前调用)。 */
-    public void markRunning() {
+    public void markRunning(Instant now) {
         this.status = TaskStatus.RUNNING;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
     }
 
     /** 恢复计数 +1,返回新值(这是第几次恢复)。 */
-    public int incrementRecovery() {
+    public int incrementRecovery(Instant now) {
         this.recoveryCount++;
-        this.updatedAt = Instant.now();
+        this.updatedAt = now;
         return this.recoveryCount;
     }
 
     public String getId() { return id; }
     public String getGoal() { return goal; }
+    public String getProfileId() { return profileId; }
+    public String getProfileSnapshot() { return profileSnapshot; }
     public TaskStatus getStatus() { return status; }
     public String getResult() { return result; }
     public Instant getCreatedAt() { return createdAt; }

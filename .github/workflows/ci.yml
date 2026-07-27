@@ -1,27 +1,275 @@
 name: CI
 
-# push 到 main / 提 PR 时自动跑 54 个测试(不依赖 MySQL/Redis,runner 自带 Docker 让沙箱用例也真跑)
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "21"
+  UV_VERSION: "0.8.3"
+  PYTHON_VERSION: "3.12"
 
 jobs:
-  test:
-    runs-on: ubuntu-latest        # 自带 Docker daemon -> DockerSandboxTest 能真跑
+  java-fast:
+    name: Java fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 21
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: ${{ env.JAVA_VERSION }}
           cache: maven
 
-      - name: Pull sandbox image  # 预拉镜像,否则 Docker 沙箱用例会被 assumeTrue 跳过(而非真跑)
-        run: docker pull python:3.12-slim
+      - name: Verify Docker prerequisites
+        run: |
+          docker info
+          docker compose version
+          docker pull python:3.12-slim
 
-      - name: Run tests
+      - name: Run Java fast tests
         run: ./mvnw -B test
+
+      - name: Upload Java fast reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-fast-reports
+          path: target/surefire-reports
+          if-no-files-found: error
+
+  python-fast:
+    name: Python fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: services/agent-capabilities
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Lint
+        run: uv run --locked ruff check .
+
+      - name: Type check
+        run: uv run --locked pyright
+
+      - name: Run Python fast tests
+        run: >-
+          uv run --locked pytest
+          -m "not integration and not quality"
+          -q
+          --junitxml=build/reports/python-fast.xml
+
+      - name: Upload Python fast reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-fast-reports
+          path: services/agent-capabilities/build/reports/python-fast.xml
+          if-no-files-found: error
+
+  integration-quality:
+    name: Integration and quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Restore MiniLM cache
+        uses: actions/cache@v4
+        with:
+          path: .superpowers/sdd/hf-cache-task9
+          key: minilm-${{ runner.os }}-${{ hashFiles('services/agent-capabilities/uv.lock') }}
+
+      - name: Verify Docker prerequisites
+        run: |
+          docker info
+          docker compose version
+          docker pull mysql:8.0
+          docker pull redis:8.0-alpine
+          docker pull jaegertracing/all-in-one:1.62.0
+          docker pull python:3.12-slim
+
+      - name: Sync Python and populate the fixed model cache
+        working-directory: services/agent-capabilities
+        env:
+          HF_HUB_CACHE: ${{ github.workspace }}/.superpowers/sdd/hf-cache-task9
+        run: |
+          uv sync --locked --all-groups
+          mkdir -p "$HF_HUB_CACHE"
+          uv run --locked python -c \
+            "import os; from pathlib import Path; from agent_capabilities.rag.embedding import MiniLmEmbedding; MiniLmEmbedding(cache_dir=Path(os.environ['HF_HUB_CACHE']))"
+
+      - name: Run Python integration tests
+        working-directory: services/agent-capabilities
+        env:
+          HF_HUB_CACHE: ${{ github.workspace }}/.superpowers/sdd/hf-cache-task9
+        run: >-
+          uv run --locked pytest
+          -m integration
+          -q
+          --junitxml=build/reports/python-integration.xml
+
+      - name: Run Python retrieval quality
+        working-directory: services/agent-capabilities
+        env:
+          HF_HOME: ${{ github.workspace }}/.superpowers/sdd/hf-cache-task9
+          HF_HUB_CACHE: ${{ github.workspace }}/.superpowers/sdd/hf-cache-task9
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_OFFLINE: "1"
+        run: >-
+          uv run --locked pytest
+          -m quality
+          -q
+          --junitxml=build/reports/python-quality.xml
+
+      - name: Release host Python dependency storage
+        run: |
+          rm -r -- services/agent-capabilities/.venv
+          uv cache clean
+
+      - name: Build current and Task 7 compatibility images
+        run: |
+          docker build \
+            --file services/agent-capabilities/Dockerfile \
+            --tag reagent/agent-capabilities:local \
+            --tag reagent-agent-capabilities:task9 \
+            .
+          task7_context="$(mktemp -d)"
+          git archive b94930e services/agent-capabilities/src \
+            | tar -x -C "$task7_context"
+          printf '%s\n' \
+            'FROM reagent-agent-capabilities:task9' \
+            'COPY --chown=app:app services/agent-capabilities/src /app/src' \
+            > "$task7_context/Dockerfile"
+          docker build \
+            --file "$task7_context/Dockerfile" \
+            --tag reagent-agent-capabilities:task7 \
+            "$task7_context"
+          rm -r -- "$task7_context"
+
+      - name: Run Java integration gate
+        env:
+          REAGENT_TEST_HF_CACHE: ${{ github.workspace }}/.superpowers/sdd/hf-cache-task9
+        run: ./mvnw -B -Pci verify
+
+      - name: Upload integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-quality-evidence
+          path: |
+            target/surefire-reports
+            target/failsafe-reports
+            target/acceptance
+            services/agent-capabilities/build/reports
+          if-no-files-found: error
+
+  compose-smoke-failover:
+    name: Compose smoke and failover
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Docker and host prerequisites
+        run: |
+          docker info
+          docker compose version
+          python3 --version
+          curl --version
+
+      - name: Reset fixed demo project
+        run: bash scripts/demo-reset.sh
+
+      - name: Run approved happy path
+        run: bash scripts/demo-smoke.sh
+
+      - name: Run rejection path
+        run: bash scripts/demo-reject.sh
+
+      - name: Run committed-before-response failover
+        run: bash scripts/demo-failover.sh
+
+      - name: Collect Compose and trace evidence
+        if: always()
+        run: |
+          mkdir -p build/compose-artifacts
+          docker compose \
+            --project-name reagent-demo \
+            --env-file .env.example \
+            --file docker-compose.yml \
+            --profile failover \
+            ps --all \
+            > build/compose-artifacts/compose-ps.txt || true
+          docker compose \
+            --project-name reagent-demo \
+            --env-file .env.example \
+            --file docker-compose.yml \
+            --profile failover \
+            logs --no-color --tail 1000 \
+            > build/compose-artifacts/compose.log 2>&1 || true
+          curl --fail --silent --show-error \
+            'http://127.0.0.1:16686/api/traces?service=reagent&limit=20' \
+            > build/compose-artifacts/jaeger-traces.json \
+            || printf '{"data":[]}\n' \
+              > build/compose-artifacts/jaeger-traces.json
+
+      - name: Stop while preserving volumes
+        if: always()
+        run: bash scripts/demo-down.sh
+
+      - name: Upload Compose evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-failover-evidence
+          path: build/compose-artifacts
+          if-no-files-found: error

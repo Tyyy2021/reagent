@@ -1,6 +1,7 @@
 package com.reagent.core;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -61,6 +62,18 @@ public class Context {
         return messages;
     }
 
+    /**
+     * Detached, deeply immutable view for observers that must inspect persisted conversation state
+     * without gaining a mutation path into the live Agent loop.
+     */
+    public List<Map<String, Object>> messageSnapshot() {
+        List<Map<String, Object>> snapshot = new ArrayList<>(messages.size());
+        for (Map<String, Object> message : messages) {
+            snapshot.add(immutableMap(message));
+        }
+        return Collections.unmodifiableList(snapshot);
+    }
+
     /** 当前消息条数,粗略用于停止条件 / 调试 */
     public int size() {
         return messages.size();
@@ -93,26 +106,20 @@ public class Context {
         for (int i = idx + 1; i < messages.size(); i++) {
             Map<String, Object> m = messages.get(i);
             if ("tool".equals(m.get("role"))) {
-                answered.add(String.valueOf(m.get("tool_call_id")));
+                Object rawId = m.get("tool_call_id");
+                if (!(rawId instanceof String id)) {
+                    throw new IllegalArgumentException(
+                            "Invalid tool result call id");
+                }
+                answered.add(id);
             }
         }
 
-        List<ToolCall> pending = new ArrayList<>();
-        Object toolCalls = messages.get(idx).get("tool_calls");
-        if (toolCalls instanceof List<?> list) {
-            for (Object o : list) {
-                if (!(o instanceof Map<?, ?> tc)) continue;
-                String id = String.valueOf(tc.get("id"));
-                if (answered.contains(id)) continue;
-                Map<?, ?> fn = (Map<?, ?>) tc.get("function");
-                String name = String.valueOf(fn.get("name"));
-                Object argsObj = fn.get("arguments");
-                String args = argsObj instanceof String s ? s
-                        : (argsObj == null ? "{}" : argsObj.toString());
-                pending.add(new ToolCall(id, name, args));
-            }
-        }
-        return pending;
+        return ToolCall.parseAssistantToolCalls(
+                        messages.get(idx).get("tool_calls"))
+                .stream()
+                .filter(call -> !answered.contains(call.id()))
+                .toList();
     }
 
     private static Map<String, Object> message(String role, String content) {
@@ -120,5 +127,34 @@ public class Context {
         m.put("role", role);
         m.put("content", content);
         return m;
+    }
+
+    private static Map<String, Object> immutableMap(Map<?, ?> source) {
+        Map<String, Object> copy = new LinkedHashMap<>();
+        source.forEach((key, value) -> {
+            if (!(key instanceof String stringKey)) {
+                throw new IllegalStateException("Context message key is not a string: " + key);
+            }
+            copy.put(stringKey, immutableValue(value));
+        });
+        return Collections.unmodifiableMap(copy);
+    }
+
+    private static Object immutableValue(Object value) {
+        if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return value;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return immutableMap(map);
+        }
+        if (value instanceof List<?> list) {
+            List<Object> copy = new ArrayList<>(list.size());
+            for (Object item : list) {
+                copy.add(immutableValue(item));
+            }
+            return Collections.unmodifiableList(copy);
+        }
+        throw new IllegalStateException(
+                "Context message contains unsupported mutable value: " + value.getClass().getName());
     }
 }

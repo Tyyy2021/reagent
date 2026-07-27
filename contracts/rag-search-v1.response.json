@@ -1,0 +1,14 @@
+{
+  "contractVersion": 1,
+  "indexVersion": "v1-0123456789abcdef",
+  "hits": [
+    {
+      "chunkId": "checkout-runbook-pool-exhaustion",
+      "title": "Checkout Incident Runbook",
+      "section": "Connection pool exhaustion",
+      "source": "knowledge/incident-ops/checkout-runbook.md",
+      "score": 0.97,
+      "excerpt": "Compare pool saturation, pending acquisition, and timeout evidence before concluding that the connection pool is exhausted."
+    }
+  ]
+}

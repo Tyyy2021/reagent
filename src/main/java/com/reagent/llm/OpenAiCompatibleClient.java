@@ -12,6 +12,7 @@ import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import org.springframework.stereotype.Component;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.client.RestClient;
 
 import java.io.BufferedReader;
@@ -32,6 +33,11 @@ import java.util.function.Consumer;
  *  - 否则返回普通 content        -> 它认为任务完成   -> Decision.finalAnswer(...)
  */
 @Component
+@ConditionalOnProperty(
+        prefix = "reagent.llm",
+        name = "mode",
+        havingValue = "openai",
+        matchIfMissing = true)
 public class OpenAiCompatibleClient implements LlmClient {
 
     private final RestClient http;

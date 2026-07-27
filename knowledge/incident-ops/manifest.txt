@@ -1,0 +1,5 @@
+runbooks/checkout-db-pool.md
+architecture/checkout-service.md
+incidents/2025-11-checkout-pool.md
+distractors/search-latency.md
+distractors/kafka-consumer-lag.md

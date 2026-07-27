@@ -1,7 +1,11 @@
 package com.reagent.stream;
 
+import com.reagent.core.TaskRunToken;
+import com.reagent.testsupport.MutableClock;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -21,6 +25,23 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  */
 class TaskEventBusReplayTest {
 
+    @Test
+    void runtimeTokenUsesInjectedUtcClock() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-07-18T08:00:00Z"));
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.registerBean(Clock.class, () -> clock);
+            context.registerBean(EventStore.class, FakeEventStore::new);
+            context.register(TaskEventBus.class);
+            context.refresh();
+            TaskRunToken token = new TaskRunToken("clocked-task", "worker-a", 1);
+
+            TaskEvent event = context.getBean(TaskEventBus.class)
+                    .publish(token, TaskEvent.Type.TOKEN, Map.of("text", "clocked"));
+
+            assertEquals(clock.instant(), event.at());
+        }
+    }
+
     /** 内存假 EventStore:全表自增 id;replayAfter 按 taskId + id>游标 过滤、按 id 升序(同 JPA 实现语义)。 */
     private static final class FakeEventStore implements EventStore {
         private record Row(long id, String taskId, TaskEvent.Type type, Object data) { }
@@ -33,6 +54,11 @@ class TaskEventBusReplayTest {
             long id = ++nextId;
             rows.add(new Row(id, taskId, type, data));
             return id;
+        }
+
+        @Override
+        public synchronized long appendFenced(TaskRunToken token, TaskEvent.Type type, Object data) {
+            return append(token.taskId(), type, data);
         }
 
         @Override
@@ -57,7 +83,7 @@ class TaskEventBusReplayTest {
 
     @Test
     void 补播游标之后的历史再无缝转live_顺序与id都对() {
-        TaskEventBus bus = new TaskEventBus(new FakeEventStore());
+        TaskEventBus bus = bus(new FakeEventStore());
         bus.publish("t", TaskEvent.Type.STEP, Map.of("step", 1));   // id 1
         bus.publish("t", TaskEvent.Type.STEP, Map.of("step", 2));   // id 2
         bus.publish("t", TaskEvent.Type.STEP, Map.of("step", 3));   // id 3
@@ -80,7 +106,7 @@ class TaskEventBusReplayTest {
     @Test
     void TOKEN不落库_eventId为null_且不被补播() {
         FakeEventStore store = new FakeEventStore();
-        TaskEventBus bus = new TaskEventBus(store);
+        TaskEventBus bus = bus(store);
 
         List<TaskEvent> live = Collections.synchronizedList(new ArrayList<>());
         bus.subscribeWithReplay("t", "0", e -> {
@@ -107,7 +133,7 @@ class TaskEventBusReplayTest {
     @Test
     void 并发发布与中途重连_不漏不重_恰好覆盖游标之后全部() throws Exception {
         for (int round = 0; round < 30; round++) {       // 反复跑探不同交错
-            TaskEventBus bus = new TaskEventBus(new FakeEventStore());
+            TaskEventBus bus = bus(new FakeEventStore());
             int n = 200;
             List<TaskEvent> got = Collections.synchronizedList(new ArrayList<>());
 
@@ -141,7 +167,7 @@ class TaskEventBusReplayTest {
 
     @Test
     void 补播途中客户端断开_停止补播且不挂live() {
-        TaskEventBus bus = new TaskEventBus(new FakeEventStore());
+        TaskEventBus bus = bus(new FakeEventStore());
         for (int i = 1; i <= 5; i++) {
             bus.publish("t", TaskEvent.Type.STEP, Map.of("i", i));    // id 1..5
         }
@@ -156,5 +182,9 @@ class TaskEventBusReplayTest {
         bus.publish("t", TaskEvent.Type.STEP, Map.of("i", 6));        // 不应到达(没挂 live)
         assertEquals(2, got.size(), "客户端断开 -> 没挂 live sink");
         sub.close();                                                  // no-op,安全
+    }
+
+    private static TaskEventBus bus(EventStore eventStore) {
+        return new TaskEventBus(eventStore, Clock.systemUTC());
     }
 }

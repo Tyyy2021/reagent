@@ -5,7 +5,11 @@ import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.TraceFlags;
 import io.opentelemetry.api.trace.TraceState;
+import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * trace 辅助(M6)——集中三件事,别散在各埋点处:
@@ -28,11 +32,16 @@ public final class Trace {
     public static final AttributeKey<String> TASK_ID = AttributeKey.stringKey("reagent.task.id");
     /** M7:驱动本任务的 worker id —— 失败转移后,同一条 trace 上能看出"从哪个 worker 接管到了哪个"。 */
     public static final AttributeKey<String> WORKER_ID = AttributeKey.stringKey("reagent.worker.id");
+    public static final AttributeKey<Long> WORKER_EPOCH =
+            AttributeKey.longKey("reagent.worker.epoch");
     public static final AttributeKey<String> GOAL = AttributeKey.stringKey("reagent.task.goal");
     public static final AttributeKey<Long> RECOVERY_COUNT = AttributeKey.longKey("reagent.task.recovery_count");
     public static final AttributeKey<String> TASK_STATUS = AttributeKey.stringKey("reagent.task.status");
     public static final AttributeKey<Long> STEP_NUMBER = AttributeKey.longKey("reagent.step.number");
     public static final AttributeKey<Boolean> STEP_PENDING = AttributeKey.booleanKey("reagent.step.pending");
+    public static final String RECOVERY_ATTEMPT = "RECOVERY_ATTEMPT";
+    public static final AttributeKey<String> APPROVAL_DECISION =
+            AttributeKey.stringKey("reagent.approval.decision");
 
     // ===== LLM(对齐 OTel GenAI 语义约定 gen_ai.*)=====
     public static final AttributeKey<String> GENAI_SYSTEM = AttributeKey.stringKey("gen_ai.system");
@@ -47,6 +56,14 @@ public final class Trace {
     public static final AttributeKey<String> TOOL_NAME = AttributeKey.stringKey("gen_ai.tool.name");
     public static final AttributeKey<String> TOOL_CALL_ID = AttributeKey.stringKey("reagent.tool.call_id");
     public static final AttributeKey<String> IDEMPOTENCY = AttributeKey.stringKey("reagent.tool.idempotency_class");
+    public static final AttributeKey<String> TOOL_PROVIDER =
+            AttributeKey.stringKey("reagent.tool.provider");
+    public static final AttributeKey<String> MCP_SERVER =
+            AttributeKey.stringKey("reagent.mcp.server");
+    public static final AttributeKey<String> MCP_ERROR_TYPE =
+            AttributeKey.stringKey("reagent.mcp.error_type");
+    public static final AttributeKey<String> TOOL_OUTCOME =
+            AttributeKey.stringKey("reagent.tool.outcome");
     public static final AttributeKey<String> SANDBOX_TYPE = AttributeKey.stringKey("reagent.sandbox.type");
     public static final AttributeKey<Long> EXIT_CODE = AttributeKey.longKey("reagent.sandbox.exit_code");
     public static final AttributeKey<Boolean> KILLED = AttributeKey.booleanKey("reagent.sandbox.killed");
@@ -80,5 +97,12 @@ public final class Trace {
         SpanContext root = SpanContext.createFromRemoteParent(
                 traceId, spanId, TraceFlags.getSampled(), TraceState.getDefault());
         return Context.root().with(Span.wrap(root));
+    }
+
+    /** Injects the current W3C trace context into a fresh immutable HTTP header map. */
+    public static Map<String, String> currentW3cHeaders() {
+        Map<String, String> headers = new LinkedHashMap<>();
+        W3CTraceContextPropagator.getInstance().inject(Context.current(), headers, Map::put);
+        return Map.copyOf(headers);
     }
 }

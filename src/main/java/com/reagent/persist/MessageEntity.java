@@ -59,14 +59,15 @@ public class MessageEntity {
     }
 
     public MessageEntity(String taskId, int seq, String role,
-                         String content, String toolCallsJson, String toolCallId) {
+                         String content, String toolCallsJson, String toolCallId,
+                         Instant createdAt) {
         this.taskId = taskId;
         this.seq = seq;
         this.role = role;
         this.content = content;
         this.toolCallsJson = toolCallsJson;
         this.toolCallId = toolCallId;
-        this.createdAt = Instant.now();
+        this.createdAt = createdAt;
     }
 
     public Long getId() { return id; }

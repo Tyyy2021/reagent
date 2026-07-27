@@ -1,0 +1,30 @@
+[
+  {
+    "query": "Which metrics and thresholds show that the checkout database connection pool is exhausted?",
+    "expectedDocumentId": "runbooks/checkout-db-pool"
+  },
+  {
+    "query": "What log evidence confirms checkout connection acquisition timeouts?",
+    "expectedDocumentId": "runbooks/checkout-db-pool"
+  },
+  {
+    "query": "What immediate mitigation should stop nonessential batch traffic during checkout database saturation?",
+    "expectedDocumentId": "runbooks/checkout-db-pool"
+  },
+  {
+    "query": "How should operators investigate slow product search caused by broad wildcard queries?",
+    "expectedDocumentId": "distractors/search-latency"
+  },
+  {
+    "query": "How do we recover Kafka consumer lag caused by poison messages and verify offsets advance?",
+    "expectedDocumentId": "distractors/kafka-consumer-lag"
+  },
+  {
+    "query": "What caused the November 2025 checkout failures and queued order creation?",
+    "expectedDocumentId": "incidents/2025-11-checkout-pool"
+  },
+  {
+    "query": "How does the checkout request path use short transactions and a bounded database connection pool?",
+    "expectedDocumentId": "architecture/checkout-service"
+  }
+]

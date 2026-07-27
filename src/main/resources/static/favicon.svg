@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ReAgent">
+  <rect width="64" height="64" rx="12" fill="#08121b"/>
+  <circle cx="32" cy="32" r="20" fill="none" stroke="#263b49" stroke-width="2"/>
+  <path d="M32 8v48M15 23h34M15 41h34" fill="none" stroke="#36c7d6" stroke-width="2"/>
+  <circle cx="32" cy="23" r="5" fill="#f0b44d"/>
+  <circle cx="32" cy="41" r="5" fill="#47c98c"/>
+</svg>

@@ -48,4 +48,9 @@ public interface Tool {
     default IdempotencyClass idempotency() {
         return IdempotencyClass.SIDE_EFFECTFUL;
     }
+
+    /** Approval is independent from replay safety; existing local tools remain immediately executable. */
+    default ApprovalPolicy approvalPolicy() {
+        return ApprovalPolicy.NONE;
+    }
 }

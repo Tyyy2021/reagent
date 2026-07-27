@@ -2,6 +2,9 @@ package com.reagent.stream;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.reagent.core.TaskRunToken;
+import com.reagent.persist.TaskRepository;
+import com.reagent.persist.TaskStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,8 +17,8 @@ import org.springframework.data.redis.connection.stream.StreamReadOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
+import java.time.Clock;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -49,16 +52,21 @@ public class RedisStreamTransport implements StreamTransport {
 
     private final StringRedisTemplate redis;
     private final EventStore eventStore;
+    private final TaskRepository taskRepository;
     private final ObjectMapper mapper;
+    private final Clock clock;
     private final long ttlSec;
     /** 每个 SSE 订阅一根虚拟线程跑 XREAD-BLOCK 自旋(阻塞读不占平台线程)。 */
     private final ExecutorService readers = Executors.newVirtualThreadPerTaskExecutor();
 
-    public RedisStreamTransport(StringRedisTemplate redis, EventStore eventStore, ObjectMapper mapper,
+    public RedisStreamTransport(StringRedisTemplate redis, EventStore eventStore,
+                                TaskRepository taskRepository, ObjectMapper mapper, Clock clock,
                                 @Value("${reagent.streaming.redis-stream-ttl-sec:3600}") long ttlSec) {
         this.redis = redis;
         this.eventStore = eventStore;
+        this.taskRepository = taskRepository;
         this.mapper = mapper;
+        this.clock = clock;
         this.ttlSec = ttlSec;
         log.info("事件流传输 = redis(Redis Streams 跨 worker live 总线,stream TTL={}s)", ttlSec);
     }
@@ -69,14 +77,29 @@ public class RedisStreamTransport implements StreamTransport {
 
     @Override
     public TaskEvent publish(String taskId, TaskEvent.Type type, Object data) {
+        return publish(taskId, null, type, data);
+    }
+
+    @Override
+    public TaskEvent publish(TaskRunToken token, TaskEvent.Type type, Object data) {
+        return publish(token.taskId(), token, type, data);
+    }
+
+    private TaskEvent publish(String taskId, TaskRunToken token, TaskEvent.Type type, Object data) {
         // 非 TOKEN 仍落 event 表:长期 durable / CQRS 投影 + stream TTL 过期后的 fallback replay 源
-        String durableId = (type == TaskEvent.Type.TOKEN) ? null : String.valueOf(eventStore.append(taskId, type, data));
+        String durableId = null;
+        if (type != TaskEvent.Type.TOKEN) {
+            long storedId = token == null
+                    ? eventStore.append(taskId, type, data)
+                    : eventStore.appendFenced(token, type, data);
+            durableId = String.valueOf(storedId);
+        }
         // 所有事件(含 TOKEN)进 per-task Stream;XADD 自动生成 stream id 作 SSE 游标(订阅端 XREAD 读到它)
         Map<String, String> fields = Map.of("type", type.name(), "data", toJson(data));
         RecordId rid = redis.opsForStream().add(key(taskId), fields);
         String eventId = (type == TaskEvent.Type.TOKEN) ? null : (rid != null ? rid.getValue() : durableId);
-        TaskEvent event = new TaskEvent(taskId, eventId, type, data, Instant.now());
-        if (event.isTerminal()) {
+        TaskEvent event = new TaskEvent(taskId, eventId, type, data, clock.instant());
+        if (event.isTaskTerminal()) {
             redis.expire(key(taskId), Duration.ofSeconds(ttlSec));   // 任务收尾:给 stream 设 TTL,跑完自动清
         }
         return event;
@@ -85,20 +108,46 @@ public class RedisStreamTransport implements StreamTransport {
     @Override
     public Subscription subscribeWithReplay(String taskId, String cursor, EventSink sink) {
         String key = key(taskId);
-        // stream 不存在(任务老早完成、key 已 TTL 过期)→ 回落 event 表全量补播(老任务无 live),从头给
+        // key 不存在有两种含义:已结束老任务的 stream 过了 TTL,或可继续任务
+        // 尚未来得及第一次/下一次 XADD。以权威 task 状态 + 最后一条 durable 事件共同裁决:
+        // 只有真正终态且历史已收住当前状态才回落 MySQL;其余情况保留 XREAD 等待 key 出现。
         if (Boolean.FALSE.equals(redis.hasKey(key))) {
-            for (TaskEvent past : eventStore.replayAfter(taskId, 0L)) {
-                if (!safeDeliver(sink, past)) {
-                    break;
+            List<TaskEvent> durableHistory = eventStore.replayAfter(taskId, 0L);
+            TaskStatus status = taskRepository.findById(taskId)
+                    .map(task -> task.getStatus())
+                    .orElse(null);
+            if ((status == null || historyEndsCurrentState(status, durableHistory))
+                    && Boolean.FALSE.equals(redis.hasKey(key))) {
+                for (TaskEvent past : durableHistory) {
+                    if (!safeDeliver(sink, past)) {
+                        break;
+                    }
                 }
+                return () -> { };
             }
-            return () -> { };
         }
-        // stream 存在:一根虚拟线程跑 XREAD-from-cursor 连续读(replay 历史 + BLOCK live 同一序列,不漏不重)
+        // stream 已存在,或任务仍在运行而首次 XADD 尚未来得及创建 key:
+        // 一根虚拟线程跑 XREAD-from-cursor;Redis 会让对不存在 key 的 BLOCK 读等待其创建。
         String start = (cursor == null || cursor.isBlank()) ? "0" : cursor.trim();
         AtomicBoolean closed = new AtomicBoolean(false);
         readers.submit(() -> readLoop(key, start, sink, closed));
         return () -> closed.set(true);
+    }
+
+    private static boolean historyEndsCurrentState(
+            TaskStatus status,
+            List<TaskEvent> history
+    ) {
+        if (history.isEmpty()) {
+            return false;
+        }
+        TaskEvent.Type last = history.getLast().type();
+        return switch (status) {
+            case COMPLETED -> last == TaskEvent.Type.COMPLETED;
+            case FAILED -> last == TaskEvent.Type.FAILED;
+            case CANCELLED -> last == TaskEvent.Type.CANCELLED;
+            case RUNNING, WAITING_APPROVAL, PAUSED -> false;
+        };
     }
 
     private void readLoop(String key, String start, EventSink sink, AtomicBoolean closed) {
@@ -131,7 +180,7 @@ public class RedisStreamTransport implements StreamTransport {
         // TOKEN live-only:不带 SSE id(与 in-process 同构);其余用 stream 记录 id 作续播游标
         String eventId = (type == TaskEvent.Type.TOKEN) ? null : r.getId().getValue();
         String taskId = key.substring(KEY_PREFIX.length());
-        return new TaskEvent(taskId, eventId, type, data, Instant.now());
+        return new TaskEvent(taskId, eventId, type, data, clock.instant());
     }
 
     private boolean safeDeliver(EventSink sink, TaskEvent event) {
